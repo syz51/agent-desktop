@@ -1,8 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use desktop_core::ResolvedRef;
+use desktop_core::tree::{
+    AxNodeData, DEFAULT_PRIMARY_FANOUT, RecordOutcome, SnapshotWalkBuilder, WalkBudget,
+    is_decorative_container,
+};
 use desktop_proto::{
     AppInfo, ElementAction, ErrorCode, ReadTextMode, ReadTextResult, Rect, RpcError, Snapshot,
     SnapshotParams, UiNode, WindowInfo, sanitize_text,
@@ -196,50 +200,229 @@ pub fn take_atspi_snapshot(
                 }
             };
 
-        let mut ctx = WalkCtx {
-            conn: &conn,
-            app: app_info.clone(),
-            redact_passwords,
-            max_depth,
-            max_nodes,
-            deadline: Instant::now() + WALK_BUDGET,
-            next_id: 1,
-            total_visited: 0,
-            truncated: false,
-            entries: HashMap::new(),
+        let fallback_root = UiNode {
+            ref_id: "@e1".into(),
+            role: "window".into(),
+            subrole: None,
+            title: window_title.clone(),
+            label: None,
+            value: None,
+            bounds: win_hint.as_ref().map(|w| w.bounds),
+            enabled: true,
+            focused: win_hint.as_ref().is_some_and(|w| w.focused),
+            selected: false,
+            actions: Vec::new(),
+            children: Vec::new(),
         };
 
-        let root = walk_accessible(&mut ctx, &start_bus, &start_path, 0)
-            .await
-            .unwrap_or_else(|| UiNode {
-                ref_id: "@e1".into(),
-                role: "window".into(),
-                subrole: None,
-                title: window_title.clone(),
-                label: None,
-                value: None,
-                bounds: win_hint.as_ref().map(|w| w.bounds),
-                enabled: true,
-                focused: win_hint.as_ref().is_some_and(|w| w.focused),
-                selected: false,
-                actions: Vec::new(),
-                children: Vec::new(),
+        struct LazyChildrenTail {
+            bus: String,
+            path: String,
+            parent_idx: usize,
+            child_depth: usize,
+            next_idx: usize,
+            total: usize,
+        }
+
+        let deadline = Instant::now() + WALK_BUDGET;
+        let mut builder = SnapshotWalkBuilder::new(
+            (start_bus, start_path),
+            WalkBudget::new(max_depth, max_nodes),
+        );
+        // Defer D-Bus `GetChildAtIndex` calls past `DEFAULT_PRIMARY_FANOUT` until shallower panes
+        // finish so wide lists do not burn the 250 ms budget fetching tail items up front.
+        let mut lazy_tails: VecDeque<LazyChildrenTail> = VecDeque::new();
+
+        loop {
+            let pending = match builder.next_pending() {
+                Some(p) => p,
+                None => {
+                    if builder.is_budget_saturated() {
+                        if !lazy_tails.is_empty() {
+                            builder.mark_truncated();
+                        }
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        if !lazy_tails.is_empty() {
+                            builder.mark_truncated();
+                        }
+                        break;
+                    }
+                    let Some(mut tail) = lazy_tails.pop_front() else {
+                        break;
+                    };
+                    if let Ok(p) =
+                        uncached_proxy(&conn, &tail.bus, &tail.path, "org.a11y.atspi.Accessible")
+                            .await
+                    {
+                        let batch_end = (tail.next_idx + DEFAULT_PRIMARY_FANOUT).min(tail.total);
+                        let batch = get_children_range(&p, tail.next_idx, batch_end).await;
+                        builder.enqueue_children_from(
+                            tail.parent_idx,
+                            tail.child_depth,
+                            tail.next_idx,
+                            batch,
+                        );
+                        tail.next_idx = batch_end;
+                        if tail.next_idx < tail.total {
+                            lazy_tails.push_back(tail);
+                        }
+                    }
+                    continue;
+                }
+            };
+            if Instant::now() >= deadline {
+                builder.mark_truncated();
+                break;
+            }
+            let ((bus, path), meta) = pending.into_parts();
+            let depth = meta.depth();
+
+            // Single non-caching Accessible proxy reused for role, name, description, interfaces, and children.
+            let Ok(acc_proxy) =
+                uncached_proxy(&conn, &bus, &path, "org.a11y.atspi.Accessible").await
+            else {
+                continue;
+            };
+
+            let raw_role: String = acc_proxy.call("GetRoleName", &()).await.unwrap_or_default();
+            let (role, is_password) = normalize_atspi_role(&raw_role);
+            let name = acc_proxy
+                .get_property::<String>("Name")
+                .await
+                .ok()
+                .map(|s| sanitize_text(&s, 120))
+                .filter(|s| !s.is_empty());
+            let desc = acc_proxy
+                .get_property::<String>("Description")
+                .await
+                .ok()
+                .map(|s| sanitize_text(&s, 120))
+                .filter(|s| !s.is_empty());
+
+            let interfaces: Vec<String> = acc_proxy
+                .call("GetInterfaces", &())
+                .await
+                .unwrap_or_default();
+            let has_action = interfaces.iter().any(|i| i == "org.a11y.atspi.Action");
+            let has_editable = interfaces
+                .iter()
+                .any(|i| i == "org.a11y.atspi.EditableText");
+            let has_text = interfaces.iter().any(|i| i == "org.a11y.atspi.Text");
+            let has_component = interfaces.iter().any(|i| i == "org.a11y.atspi.Component");
+
+            let mut actions = Vec::new();
+            if has_action {
+                actions.push(ElementAction::Press);
+            }
+            if has_editable {
+                actions.push(ElementAction::SetValue);
+            }
+
+            let value = if is_password && redact_passwords {
+                Some("<redacted>".to_string())
+            } else if has_text
+                && matches!(role.as_str(), "textfield" | "textarea" | "textfield:secure")
+            {
+                get_text_preview(&conn, &bus, &path)
+                    .await
+                    .map(|s| sanitize_text(&s, 120))
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            };
+
+            let decorative = is_decorative_container(
+                depth,
+                &role,
+                name.as_deref(),
+                desc.as_deref(),
+                value.as_deref(),
+                false,
+                false,
+                &actions,
+            );
+
+            // Skip D-Bus Component.GetExtents round-trips on anonymous decorative containers.
+            let bounds = if !decorative && has_component {
+                get_extents(&conn, &bus, &path).await
+            } else {
+                None
+            };
+
+            let entry = (!decorative).then(|| AtSpiRefEntry {
+                ref_id: String::new(),
+                bus_name: bus.clone(),
+                object_path: path.clone(),
+                app: app_info.clone(),
+                bounds,
+                actions: actions.clone(),
+                is_password,
             });
 
-        let emitted = ctx.entries.len().max(1);
+            let data = AxNodeData {
+                role,
+                subrole: None,
+                title: name,
+                label: desc,
+                value,
+                bounds,
+                enabled: true,
+                focused: false,
+                selected: false,
+                actions,
+            };
+
+            match builder.record_node(meta, data, entry) {
+                RecordOutcome::Expand(node_idx) => {
+                    let raw_count: i32 = acc_proxy.get_property("ChildCount").await.unwrap_or(0);
+                    let total = raw_count.clamp(0, 64) as usize;
+                    if raw_count > 64 {
+                        builder.mark_truncated();
+                    }
+                    let first_end = total.min(DEFAULT_PRIMARY_FANOUT);
+                    let first_batch = get_children_range(&acc_proxy, 0, first_end).await;
+                    builder.enqueue_children_from(node_idx, depth + 1, 0, first_batch);
+                    if first_end < total {
+                        lazy_tails.push_back(LazyChildrenTail {
+                            bus,
+                            path,
+                            parent_idx: node_idx,
+                            child_depth: depth + 1,
+                            next_idx: first_end,
+                            total,
+                        });
+                    }
+                }
+                RecordOutcome::CheckChildrenForTruncation => {
+                    let count: i32 = acc_proxy.get_property("ChildCount").await.unwrap_or(0);
+                    if count > 0 {
+                        builder.mark_truncated();
+                    }
+                }
+                RecordOutcome::Done => {}
+            }
+        }
+
+        let mut output = builder.finish(fallback_root);
+        for (ref_id, entry) in &mut output.refs {
+            entry.ref_id.clone_from(ref_id);
+        }
+
         let snapshot = Snapshot {
             snapshot_id: format!("snap_{}", Uuid::new_v4().simple()),
             app: app_info,
             window_id,
             window_title,
-            window_bounds: win_hint.as_ref().map(|w| w.bounds).or(root.bounds),
-            truncated: ctx.truncated,
-            total_nodes: ctx.total_visited.max(emitted),
-            emitted_nodes: emitted,
+            window_bounds: win_hint.as_ref().map(|w| w.bounds).or(output.root.bounds),
+            truncated: output.truncated,
+            total_nodes: output.total_visited,
+            emitted_nodes: output.emitted_nodes,
             elapsed_ms: started.elapsed().as_millis() as u64,
-            root,
+            root: output.root,
         };
-        Ok(Some((snapshot, ctx.entries)))
+        Ok(Some((snapshot, output.refs)))
     })?;
 
     match result {
@@ -638,174 +821,20 @@ async fn find_atspi_target(
     )))
 }
 
-struct WalkCtx<'a> {
-    conn: &'a Connection,
-    app: AppInfo,
-    redact_passwords: bool,
-    max_depth: usize,
-    max_nodes: usize,
-    deadline: Instant,
-    next_id: usize,
-    total_visited: usize,
-    truncated: bool,
-    entries: HashMap<String, AtSpiRefEntry>,
-}
-
-async fn walk_accessible(
-    ctx: &mut WalkCtx<'_>,
-    bus: &str,
-    path: &str,
-    depth: usize,
-) -> Option<UiNode> {
-    if Instant::now() >= ctx.deadline || ctx.entries.len() >= ctx.max_nodes {
-        ctx.truncated = true;
-        return None;
-    }
-    ctx.total_visited += 1;
-
-    // Single non-caching Accessible proxy reused for role, name, description, interfaces, and children.
-    let acc_proxy = uncached_proxy(ctx.conn, bus, path, "org.a11y.atspi.Accessible")
-        .await
-        .ok()?;
-
-    let raw_role: String = acc_proxy.call("GetRoleName", &()).await.unwrap_or_default();
-    let (role, is_password) = normalize_atspi_role(&raw_role);
-    let name = acc_proxy
-        .get_property::<String>("Name")
-        .await
-        .ok()
-        .map(|s| sanitize_text(&s, 120))
-        .filter(|s| !s.is_empty());
-    let desc = acc_proxy
-        .get_property::<String>("Description")
-        .await
-        .ok()
-        .map(|s| sanitize_text(&s, 120))
-        .filter(|s| !s.is_empty());
-
-    let interfaces: Vec<String> = acc_proxy
-        .call("GetInterfaces", &())
-        .await
-        .unwrap_or_default();
-    let has_action = interfaces.iter().any(|i| i == "org.a11y.atspi.Action");
-    let has_editable = interfaces
-        .iter()
-        .any(|i| i == "org.a11y.atspi.EditableText");
-    let has_text = interfaces.iter().any(|i| i == "org.a11y.atspi.Text");
-    let has_component = interfaces.iter().any(|i| i == "org.a11y.atspi.Component");
-
-    let mut actions = Vec::new();
-    if has_action {
-        actions.push(ElementAction::Press);
-    }
-    if has_editable {
-        actions.push(ElementAction::SetValue);
-    }
-
-    let value = if is_password && ctx.redact_passwords {
-        Some("<redacted>".to_string())
-    } else if has_text && matches!(role.as_str(), "textfield" | "textarea" | "textfield:secure") {
-        get_text_preview(ctx.conn, bus, path)
-            .await
-            .map(|s| sanitize_text(&s, 120))
-            .filter(|s| !s.is_empty())
-    } else {
-        None
-    };
-
-    let bounds = if has_component {
-        get_extents(ctx.conn, bus, path).await
-    } else {
-        None
-    };
-
-    let is_anonymous_container = depth > 0
-        && matches!(role.as_str(), "group" | "generic" | "panel" | "filler")
-        && name.is_none()
-        && desc.is_none()
-        && value.is_none()
-        && !has_editable;
-
-    let mut ref_id = None;
-    if !is_anonymous_container {
-        let id = format!("@e{}", ctx.next_id);
-        ctx.next_id += 1;
-        ctx.entries.insert(
-            id.clone(),
-            AtSpiRefEntry {
-                ref_id: id.clone(),
-                bus_name: bus.to_string(),
-                object_path: path.to_string(),
-                app: ctx.app.clone(),
-                bounds,
-                actions: actions.clone(),
-                is_password,
-            },
-        );
-        ref_id = Some(id);
-    }
-
-    let mut children = Vec::new();
-    if depth < ctx.max_depth {
-        for (cbus, cpath) in get_children_via(&acc_proxy).await {
-            if Instant::now() >= ctx.deadline || ctx.entries.len() >= ctx.max_nodes {
-                ctx.truncated = true;
-                break;
-            }
-            if let Some(child_node) = Box::pin(walk_accessible(ctx, &cbus, &cpath, depth + 1)).await
-            {
-                if child_node.ref_id.is_empty() {
-                    children.extend(child_node.children);
-                } else {
-                    children.push(child_node);
-                }
-            }
-        }
-    }
-
-    if is_anonymous_container {
-        if children.is_empty() {
-            return None;
-        }
-        return Some(UiNode {
-            ref_id: String::new(),
-            role,
-            subrole: None,
-            title: None,
-            label: None,
-            value: None,
-            bounds: None,
-            enabled: true,
-            focused: false,
-            selected: false,
-            actions: Vec::new(),
-            children,
-        });
-    }
-
-    Some(UiNode {
-        ref_id: ref_id.unwrap_or_default(),
-        role,
-        subrole: None,
-        title: name,
-        label: desc,
-        value,
-        bounds,
-        enabled: true,
-        focused: false,
-        selected: false,
-        actions,
-        children,
-    })
-}
-
 async fn get_children_via(proxy: &Proxy<'_>) -> Vec<(String, String)> {
     let count: i32 = proxy.get_property("ChildCount").await.unwrap_or(0);
-    let capped = count.clamp(0, 64);
-    let mut out = Vec::with_capacity(capped as usize);
-    for idx in 0..capped {
+    let capped = count.clamp(0, 64) as usize;
+    get_children_range(proxy, 0, capped).await
+}
+
+async fn get_children_range(proxy: &Proxy<'_>, start: usize, end: usize) -> Vec<(String, String)> {
+    if start >= end {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(end - start);
+    for idx in start..end {
         if let Ok((cbus, cpath)) = proxy
-            .call::<_, _, (String, OwnedObjectPath)>("GetChildAtIndex", &(idx,))
+            .call::<_, _, (String, OwnedObjectPath)>("GetChildAtIndex", &(idx as i32,))
             .await
             && !cbus.is_empty()
             && cpath.as_str() != "/org/a11y/atspi/null"
