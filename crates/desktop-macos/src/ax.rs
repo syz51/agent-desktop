@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use desktop_core::ResolvedRef;
+use desktop_core::tree::{
+    AxNodeData, RecordOutcome, SnapshotWalkBuilder, WalkBudget, is_decorative_container,
+};
 use desktop_proto::{
     AppInfo, ElementAction, ErrorCode, FocusMode, ReadTextMode, ReadTextResult, Rect, RpcError,
     Snapshot, SnapshotParams, UiNode,
@@ -486,21 +489,8 @@ fn build_snapshot_from_root(
     let max_nodes = params.max_nodes.unwrap_or(DEFAULT_MAX_NODES);
     let deadline = start + SNAPSHOT_BUDGET;
 
-    let mut ctx = WalkCtx {
-        app: &app,
-        redact_passwords,
-        max_depth,
-        max_nodes,
-        deadline,
-        next_ref: 1,
-        total_visited: 0,
-        emitted: 0,
-        truncated: false,
-        live_refs: HashMap::new(),
-    };
-
     let root_bounds = root_el.bounds();
-    let mut root = walk_element(&root_el, 0, &mut ctx).unwrap_or_else(|| UiNode {
+    let fallback_root = UiNode {
         ref_id: "@e1".into(),
         role: "window".into(),
         subrole: None,
@@ -513,18 +503,102 @@ fn build_snapshot_from_root(
         selected: false,
         actions: vec![],
         children: vec![],
-    });
+    };
 
-    // Reassign ref IDs in clean top-down pre-order (@e1 = root, @e2 = first child, ...) so LLMs
-    // read refs sequentially from top to bottom.
-    let mut pre_refs = HashMap::with_capacity(ctx.live_refs.len());
-    let mut seq = 1usize;
-    renumber_preorder(&mut root, &ctx.live_refs, &mut pre_refs, &mut seq);
+    let mut builder = SnapshotWalkBuilder::new(root_el, WalkBudget::new(max_depth, max_nodes));
 
-    let truncated = ctx.truncated;
-    let total_nodes = ctx.total_visited;
-    let emitted_nodes = ctx.emitted;
-    store.replace_all(pre_refs);
+    while let Some(pending) = builder.next_pending() {
+        if Instant::now() >= deadline {
+            builder.mark_truncated();
+            break;
+        }
+        let (el, meta) = pending.into_parts();
+        let depth = meta.depth();
+
+        let raw_role = el.string_attr("AXRole").unwrap_or_default();
+        let raw_subrole = el.string_attr("AXSubrole");
+        let role = normalize_role(&raw_role);
+        let subrole = raw_subrole
+            .as_deref()
+            .map(normalize_subrole)
+            .filter(|s| !s.is_empty());
+
+        let title = el.string_attr("AXTitle").filter(|s| !s.trim().is_empty());
+        let label = el
+            .string_attr("AXDescription")
+            .or_else(|| el.string_attr("AXHelp"))
+            .filter(|s| !s.trim().is_empty());
+
+        let is_secure =
+            raw_subrole.as_deref() == Some("AXSecureTextField") || raw_role == "AXSecureTextField";
+        let value = if is_secure && redact_passwords {
+            Some("[REDACTED]".into())
+        } else {
+            el.string_attr("AXValue").filter(|s| !s.is_empty())
+        };
+
+        let focused = el.bool_attr("AXFocused").unwrap_or(false);
+        let selected = el.bool_attr("AXSelected").unwrap_or(false);
+        let actions = map_actions(&el.action_names(), &role);
+
+        let decorative = is_decorative_container(
+            depth,
+            &role,
+            title.as_deref(),
+            label.as_deref(),
+            value.as_deref(),
+            focused,
+            selected,
+            &actions,
+        );
+
+        // Skip geometry/enabled IPC round-trips on anonymous decorative containers that will be flattened.
+        let (bounds, enabled, live_ref) = if decorative {
+            (None, true, None)
+        } else {
+            let bounds = if depth == 0 {
+                root_bounds.or_else(|| el.bounds())
+            } else {
+                el.bounds()
+            };
+            let enabled = el.bool_attr("AXEnabled").unwrap_or(true);
+            let live = LiveRef {
+                element: el.clone(),
+                app: app.clone(),
+                actions: actions.clone(),
+            };
+            (bounds, enabled, Some(live))
+        };
+
+        let data = AxNodeData {
+            role,
+            subrole,
+            title,
+            label,
+            value,
+            bounds,
+            enabled,
+            focused,
+            selected,
+            actions,
+        };
+
+        match builder.record_node(meta, data, live_ref) {
+            RecordOutcome::Expand(node_idx) => {
+                let raw_children = el.element_array_attr("AXChildren");
+                builder.enqueue_children(node_idx, depth + 1, raw_children);
+            }
+            RecordOutcome::CheckChildrenForTruncation => {
+                if !el.element_array_attr("AXChildren").is_empty() {
+                    builder.mark_truncated();
+                }
+            }
+            RecordOutcome::Done => {}
+        }
+    }
+
+    let output = builder.finish(fallback_root);
+    store.replace_all(output.refs);
 
     Ok(Snapshot {
         snapshot_id: store.next_snapshot_id(),
@@ -532,149 +606,12 @@ fn build_snapshot_from_root(
         window_id,
         window_title,
         window_bounds: root_bounds,
-        truncated,
-        total_nodes,
-        emitted_nodes,
+        truncated: output.truncated,
+        total_nodes: output.total_visited,
+        emitted_nodes: output.emitted_nodes,
         elapsed_ms: start.elapsed().as_millis() as u64,
-        root,
+        root: output.root,
     })
-}
-
-struct WalkCtx<'a> {
-    app: &'a AppInfo,
-    redact_passwords: bool,
-    max_depth: usize,
-    max_nodes: usize,
-    deadline: Instant,
-    next_ref: usize,
-    total_visited: usize,
-    emitted: usize,
-    truncated: bool,
-    live_refs: HashMap<String, LiveRef>,
-}
-
-fn walk_element(el: &AxElement, depth: usize, ctx: &mut WalkCtx<'_>) -> Option<UiNode> {
-    ctx.total_visited += 1;
-    if ctx.emitted >= ctx.max_nodes || Instant::now() >= ctx.deadline {
-        ctx.truncated = true;
-        return None;
-    }
-
-    let raw_role = el.string_attr("AXRole").unwrap_or_default();
-    let raw_subrole = el.string_attr("AXSubrole");
-    let role = normalize_role(&raw_role);
-    let subrole = raw_subrole
-        .as_deref()
-        .map(normalize_subrole)
-        .filter(|s| !s.is_empty());
-
-    let title = el.string_attr("AXTitle").filter(|s| !s.trim().is_empty());
-    let label = el
-        .string_attr("AXDescription")
-        .or_else(|| el.string_attr("AXHelp"))
-        .filter(|s| !s.trim().is_empty());
-
-    let is_secure =
-        raw_subrole.as_deref() == Some("AXSecureTextField") || raw_role == "AXSecureTextField";
-    let value = if is_secure && ctx.redact_passwords {
-        Some("[REDACTED]".into())
-    } else {
-        el.string_attr("AXValue").filter(|s| !s.is_empty())
-    };
-
-    let bounds = el.bounds();
-    let enabled = el.bool_attr("AXEnabled").unwrap_or(true);
-    let focused = el.bool_attr("AXFocused").unwrap_or(false);
-    let selected = el.bool_attr("AXSelected").unwrap_or(false);
-
-    let actions = map_actions(&el.action_names(), &role);
-
-    let mut children_nodes = Vec::new();
-    if depth < ctx.max_depth {
-        let raw_children = el.element_array_attr("AXChildren");
-        for child in raw_children {
-            if ctx.emitted >= ctx.max_nodes || Instant::now() >= ctx.deadline {
-                ctx.truncated = true;
-                break;
-            }
-            if let Some(child_node) = walk_element(&child, depth + 1, ctx) {
-                children_nodes.push(child_node);
-            }
-        }
-    } else if !el.element_array_attr("AXChildren").is_empty() {
-        ctx.truncated = true;
-    }
-
-    // Collapse anonymous decorative container wrappers (including Chromium/Electron `<div>` AXGroups
-    // that carry generic `AXShowMenu` / `AXPress` handlers but have no semantic title/label/value).
-    let only_generic_container_actions = actions
-        .iter()
-        .all(|a| matches!(a, ElementAction::ShowMenu | ElementAction::Press));
-    let is_decorative_container = depth > 0
-        && matches!(
-            role.as_str(),
-            "group" | "generic" | "scrollarea" | "splitgroup" | "unknown"
-        )
-        && title.is_none()
-        && label.is_none()
-        && value.is_none()
-        && !focused
-        && (actions.is_empty()
-            || (matches!(role.as_str(), "group" | "generic") && only_generic_container_actions));
-
-    if is_decorative_container {
-        if children_nodes.is_empty() {
-            return None;
-        }
-        if children_nodes.len() == 1 {
-            return children_nodes.into_iter().next();
-        }
-    }
-
-    let ref_id = format!("@e{}", ctx.next_ref);
-    ctx.next_ref += 1;
-    ctx.emitted += 1;
-
-    ctx.live_refs.insert(
-        ref_id.clone(),
-        LiveRef {
-            element: el.clone(),
-            app: ctx.app.clone(),
-            actions: actions.clone(),
-        },
-    );
-
-    Some(UiNode {
-        ref_id,
-        role,
-        subrole,
-        title,
-        label,
-        value,
-        bounds,
-        enabled,
-        focused,
-        selected,
-        actions,
-        children: children_nodes,
-    })
-}
-
-fn renumber_preorder(
-    node: &mut UiNode,
-    old_refs: &HashMap<String, LiveRef>,
-    new_refs: &mut HashMap<String, LiveRef>,
-    seq: &mut usize,
-) {
-    let new_id = format!("@e{}", *seq);
-    *seq += 1;
-    if let Some(live) = old_refs.get(&node.ref_id) {
-        new_refs.insert(new_id.clone(), live.clone());
-    }
-    node.ref_id = new_id;
-    for child in &mut node.children {
-        renumber_preorder(child, old_refs, new_refs, seq);
-    }
 }
 
 fn normalize_role(raw: &str) -> String {
