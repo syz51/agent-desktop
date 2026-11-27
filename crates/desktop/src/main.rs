@@ -10,7 +10,7 @@ use desktop::client::{DesktopClient, default_fleet_path, default_socket_path};
 use desktop_proto::{
     ActParams, ActionStep, DEFAULT_REMOTE_PORT, FindParams, FocusMode, ImageFormat,
     ListWindowsParams, MenuParams, PolicyMode, PostAction, ReadTextMode, ReadTextParams, RpcMethod,
-    RpcResult, ScreenshotParams, ScreenshotTarget, SnapshotParams,
+    RpcResult, ScreenshotParams, ScreenshotTarget, SnapshotParams, SnapshotRenderOptions,
 };
 use rand::RngExt as _;
 use tracing_subscriber::EnvFilter;
@@ -70,6 +70,9 @@ enum Command {
         max_nodes: Option<usize>,
         #[arg(long, value_enum, default_value = "auto")]
         focus: CliFocusMode,
+        /// Include per-element `[x,y wxh]` pixel bounds in compact output.
+        #[arg(long)]
+        bounds: bool,
     },
     /// Search UI elements in the Accessibility tree.
     Find {
@@ -144,6 +147,18 @@ enum Command {
         /// Optional app filter for snapshot/find benchmarks.
         #[arg(long)]
         app: Option<String>,
+    },
+    /// Profile read-only MCP token & byte overhead across schema, discovery, perception, and action stages.
+    Profile {
+        /// Optional app filter for list_windows, snapshot, and find profiling.
+        #[arg(long)]
+        app: Option<String>,
+        /// Optional query string for the find stage (default: "New").
+        #[arg(long)]
+        query: Option<String>,
+        /// Also capture a background annotated screenshot to include screenshot metadata & image KB.
+        #[arg(long)]
+        screenshot: bool,
     },
 }
 
@@ -382,6 +397,7 @@ async fn run_cli_command(
             max_depth,
             max_nodes,
             focus,
+            bounds,
         } => {
             let res = client
                 .call(
@@ -393,13 +409,19 @@ async fn run_cli_command(
                         max_depth,
                         max_nodes,
                         focus_mode: focus.into(),
+                        include_bounds: bounds,
                     }),
                 )
                 .await?;
             if json_out {
                 println!("{}", serde_json::to_string_pretty(&res)?);
             } else if let RpcResult::Snapshot(snap) = res {
-                print!("{}", snap.render_compact());
+                print!(
+                    "{}",
+                    snap.render_compact_with_options(SnapshotRenderOptions {
+                        include_bounds: bounds,
+                    })
+                );
             }
         }
         Command::Find {
@@ -683,6 +705,19 @@ async fn run_cli_command(
         }
         Command::Bench { iterations, app } => {
             run_bench(client, host, iterations.clamp(1, 200), app, json_out).await?;
+        }
+        Command::Profile {
+            app,
+            query,
+            screenshot,
+        } => {
+            let report =
+                desktop::profile::run_live_profile(client, host, app, query, screenshot).await?;
+            if json_out {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", desktop::profile::render_report_table(&report));
+            }
         }
     }
 

@@ -107,15 +107,15 @@ Following your existing Rust workspace conventions (Edition 2024, resolver 3, cr
 Agents choose the cheapest perception level that answers their question:
 
 1. **`list_windows` (<10 ms, ~100 tokens)** — Displays + visible windows (`window_id`, app name, bundle ID, title, bounds, focused, minimized, occluded). Zero pixel capture.
-2. **`snapshot` (30–80 ms, ~300–800 text tokens)** — Structured Accessibility tree of the focused window (or a specified `window_id` / `app`), pruned to interactive + informative nodes with short refs `@e1..@eN`:
+2. **`snapshot` (30–80 ms, ~300–800 text tokens)** — Structured Accessibility tree of the focused window (or a specified `window_id` / `app`), pruned to interactive + informative nodes (splicing decorative/same-title wrappers and redundant child text leaves, omitting per-element bounds and implied/noisy actions by default; pass `include_bounds: true` when geometry is needed) with short refs `@e1..@eN`:
    ```text
    snapshot_id: s42 · app: Notes (com.apple.Notes) · window: w108 "Project Ideas" [100,80 900x700]
    @e1 toolbar
-     @e2 button "New Note" [140,95 28x28] actions=[press]
-     @e3 textfield "Search" [680,95 200x24] value="" actions=[focus,set_value]
-   @e4 list "Notes List" [100,130 240x650]
-     @e5 row "Architecture Notes" [104,134 232x52] selected actions=[press]
-   @e7 textarea "Note Body" [345,130 650x650] focused value="Drafting..." actions=[set_value]
+    @e2 button "New Note"
+    @e3 textfield "Search"
+   @e4 list "Notes List"
+    @e5 row "Architecture Notes" selected actions=[press]
+   @e7 textarea "Note Body" focused value="Drafting..."
    ```
    - **Live handle binding**: Each `@eN` holds a live backend handle (`AXUIElement` / AT-SPI object) + attribute fingerprint + bounding rect. If layout shifted slightly, the daemon resolves the live coordinates or reports a stale-ref error instead of misclicking.
    - **Hard traversal budgets**: Default max depth `12`, max emitted nodes `250`, hard wall-clock budget `150 ms`, per-element AX timeout `500 ms`. Returns `truncated: true` + `subtree_ref` hints so the agent can drill down (`snapshot(root_ref: "@e4")`) without stalling on huge DOMs.
@@ -185,10 +185,10 @@ Every tool accepts an optional `host` parameter (default `"local"`).
 2. **`session_start`** (or alias `request_access`) — `(host?, reason?, apps?, wait_for_lease_ms?)` — Acquires the single-writer control lease on `host` (instant in default `open` mode; auto-wakes a sleeping unlocked display if needed; shows optional non-blocking Stop indicator). `apps` is optional (omit = all apps allowed).
 3. **`session_end`** (or alias `release`) — `(host?)` — Releases the lease, drops display-wake assertion, hides Stop indicator.
 4. **`list_windows`** — `(host?, app?, include_displays?)` — Fast window & display inventory.
-5. **`snapshot`** — `(host?, app?, window_id?, root_ref?, max_depth?, max_nodes?)` — Compact pruned AX tree with `@eN` refs.
-6. **`find`** — `(host?, query, role?, app?, window_id?)` — Fast server-side AX search returning matching `@eN` refs.
-7. **`screenshot`** — `(host?, target: {display | window_id | app | region}, annotate?, format?, if_changed_since?)` — Fast in-memory capture with optional `@eN` Set-of-Marks overlay & unchanged short-circuit.
-8. **`act`** — `(host?, steps[], after?: "none" | "snapshot" | "screenshot" | "annotated", expect_snapshot?)` — Atomic 1–25 step action batch with optional post-action perception.
+5. **`snapshot`** — `(host?, app?, window_id?, root_ref?, max_depth?, max_nodes?, focus_mode?, include_bounds?)` — Compact pruned AX tree with `@eN` refs (element bounds omitted by default; pass `include_bounds: true` when needed).
+6. **`find`** — `(host?, query, role?, app?, window_id?, limit?)` — Fast server-side AX search returning matching `@eN` refs.
+7. **`screenshot`** — `(host?, target: {display | window_id | app | region}, annotate?, format?, if_changed_since?, focus_mode?)` — Fast in-memory capture with optional `@eN` Set-of-Marks overlay & unchanged short-circuit.
+8. **`act`** — `(host?, steps[], after?: "none" | "snapshot" | "screenshot" | "annotated", expect_snapshot?, focus_mode?, release_after?)` — Atomic 1–25 step action batch with optional post-action perception and early lease release.
 9. **`read_text`** — `(host?, ref? | window_id?, mode?: "value" | "selection" | "clipboard")` — Direct text/clipboard read.
 10. **`menu`** — `(host?, app, path[])` — Direct native menu-bar invocation.
 11. **`wait`** — `(host?, condition, timeout_ms?)` — Event-driven wait.

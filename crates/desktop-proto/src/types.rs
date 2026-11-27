@@ -474,10 +474,129 @@ pub struct Snapshot {
     pub root: UiNode,
 }
 
+/// Rendering options for [`Snapshot::render_compact_with_options`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SnapshotRenderOptions {
+    /// Emit per-element `[x,y wxh]` pixel bounds (default: `false`; header still includes window bounds).
+    pub include_bounds: bool,
+}
+
+/// Filter raw element actions down to only non-obvious actionable capabilities for compact output.
+///
+/// Omits ubiquitous `show_menu` / `raise`, implied `press` on canonical clickable controls,
+/// Chromium dummy `press` on structural containers and static text/headings, and implied
+/// `set_value` / `focus` on text input roles.
+#[must_use]
+pub fn filter_render_actions(role: &str, actions: &[ElementAction]) -> Vec<ElementAction> {
+    let is_implied_press_role = matches!(
+        role,
+        "button"
+            | "link"
+            | "menuitem"
+            | "tab"
+            | "tabbutton"
+            | "checkbox"
+            | "radio"
+            | "switch"
+            | "popup"
+            | "combobox"
+            | "disclosuretriangle"
+            | "segmentedcontrol"
+    );
+    let is_noisy_container_or_text = matches!(
+        role,
+        "window"
+            | "application"
+            | "webarea"
+            | "scrollarea"
+            | "splitgroup"
+            | "toolbar"
+            | "menubar"
+            | "menu"
+            | "tabgroup"
+            | "list"
+            | "table"
+            | "tree"
+            | "dialog"
+            | "panel"
+            | "filler"
+            | "unknown"
+            | "text"
+            | "heading"
+    );
+    let is_text_input = matches!(
+        role,
+        "textfield" | "textfield:secure" | "textarea" | "searchfield" | "combobox"
+    );
+
+    actions
+        .iter()
+        .copied()
+        .filter(|a| match a {
+            ElementAction::ShowMenu | ElementAction::Raise => false,
+            ElementAction::Press => !is_implied_press_role && !is_noisy_container_or_text,
+            ElementAction::SetValue | ElementAction::Focus => !is_text_input,
+            ElementAction::Confirm | ElementAction::Increment | ElementAction::Decrement => true,
+        })
+        .collect()
+}
+
+/// Returns true for roles whose `value` carries editable/control state that must stay explicit
+/// even when equal to the control's title or label.
+#[must_use]
+pub fn is_input_value_role(role: &str) -> bool {
+    matches!(
+        role,
+        "textfield"
+            | "textfield:secure"
+            | "textarea"
+            | "searchfield"
+            | "combobox"
+            | "slider"
+            | "incrementor"
+            | "stepper"
+    )
+}
+
+/// Extract the sanitized display name (`title`, falling back to `label`, capped to 80 chars).
+#[must_use]
+pub fn rendered_display_name(title: Option<&str>, label: Option<&str>) -> Option<String> {
+    title
+        .map(|s| sanitize_text(s, 80))
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            label
+                .map(|s| sanitize_text(s, 80))
+                .filter(|s| !s.is_empty())
+        })
+}
+
+/// Append ` actions=[...]` for any non-obvious visible actions after filtering noise.
+pub fn write_visible_actions(out: &mut String, role: &str, actions: &[ElementAction]) {
+    let visible = filter_render_actions(role, actions);
+    if visible.is_empty() {
+        return;
+    }
+    out.push_str(" actions=[");
+    for (i, a) in visible.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(a.as_str());
+    }
+    out.push(']');
+}
+
 impl Snapshot {
     /// Render a compact, token-efficient indented representation of the UI tree.
     #[must_use]
     pub fn render_compact(&self) -> String {
+        self.render_compact_with_options(SnapshotRenderOptions::default())
+    }
+
+    /// Render a compact representation of the UI tree with explicit display options.
+    #[must_use]
+    pub fn render_compact_with_options(&self, opts: SnapshotRenderOptions) -> String {
         let mut out = String::with_capacity(1024);
         let _ = write!(
             out,
@@ -510,14 +629,14 @@ impl Snapshot {
             );
         }
         out.push('\n');
-        render_node(&self.root, 0, &mut out);
+        render_node(&self.root, 0, opts, &mut out);
         out
     }
 }
 
-fn render_node(node: &UiNode, depth: usize, out: &mut String) {
+fn render_node(node: &UiNode, depth: usize, opts: SnapshotRenderOptions, out: &mut String) {
     for _ in 0..depth {
-        out.push_str("  ");
+        out.push(' ');
     }
     let _ = write!(out, "{} {}", node.ref_id, node.role);
     if let Some(sub) = &node.subrole
@@ -525,15 +644,27 @@ fn render_node(node: &UiNode, depth: usize, out: &mut String) {
     {
         let _ = write!(out, ":{sub}");
     }
-    let display_name = node
-        .title
+    let display_name = rendered_display_name(node.title.as_deref(), node.label.as_deref());
+    let sanitized_val = node
+        .value
         .as_deref()
-        .filter(|s| !s.is_empty())
-        .or_else(|| node.label.as_deref().filter(|s| !s.is_empty()));
-    if let Some(name) = display_name {
-        let _ = write!(out, " {:?}", sanitize_text(name, 80));
+        .map(|s| sanitize_text(s, 120))
+        .filter(|s| !s.is_empty());
+
+    // Fold plain `text`/`heading` value into positional `"..."` when title/label is absent,
+    // unifying macOS (AXValue) and Linux (Name) while keeping `value=` explicit on inputs.
+    let folded_text_value = display_name.is_none()
+        && matches!(node.role.as_str(), "text" | "heading")
+        && sanitized_val.is_some();
+
+    if let Some(name) = &display_name {
+        let _ = write!(out, " {name:?}");
+    } else if folded_text_value && let Some(val) = &sanitized_val {
+        let _ = write!(out, " {val:?}");
     }
-    if let Some(b) = node.bounds
+
+    if opts.include_bounds
+        && let Some(b) = node.bounds
         && !b.is_empty()
     {
         let _ = write!(
@@ -551,53 +682,76 @@ fn render_node(node: &UiNode, depth: usize, out: &mut String) {
     if node.selected {
         out.push_str(" selected");
     }
-    if let Some(val) = &node.value
-        && !val.is_empty()
-    {
-        let _ = write!(out, " value={:?}", sanitize_text(val, 120));
-    }
-    if !node.actions.is_empty() {
-        out.push_str(" actions=[");
-        for (i, a) in node.actions.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str(a.as_str());
+    if !folded_text_value && let Some(val) = &sanitized_val {
+        let duplicates_name = !is_input_value_role(&node.role)
+            && display_name.as_deref().is_some_and(|n| n == val.as_str());
+        if !duplicates_name {
+            let _ = write!(out, " value={val:?}");
         }
-        out.push(']');
     }
+    write_visible_actions(out, &node.role, &node.actions);
     out.push('\n');
     for child in &node.children {
-        render_node(child, depth + 1, out);
+        render_node(child, depth + 1, opts, out);
     }
 }
 
-/// Strip control and bidirectional override characters and cap text length.
+/// Strip control and bidirectional override characters, collapse whitespace runs, and cap length.
 #[must_use]
 pub fn sanitize_text(raw: &str, max_chars: usize) -> String {
     let mut out = String::new();
     let mut count = 0usize;
+    let mut pending_space = false;
     for ch in raw.chars() {
-        if count >= max_chars {
-            out.push('…');
-            break;
-        }
         if matches!(
             ch,
             '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
         ) {
             continue;
         }
-        if ch.is_control() {
-            if ch == '\n' || ch == '\t' || ch == '\r' {
-                out.push(' ');
-                count += 1;
+        if ch == ' ' || ch == '\n' || ch == '\t' || ch == '\r' {
+            if !out.is_empty() {
+                pending_space = true;
             }
             continue;
+        }
+        if ch.is_control() {
+            continue;
+        }
+        if pending_space {
+            if count >= max_chars {
+                out.push('…');
+                break;
+            }
+            out.push(' ');
+            count += 1;
+            pending_space = false;
+        }
+        if count >= max_chars {
+            out.push('…');
+            break;
         }
         out.push(ch);
         count += 1;
     }
+    out
+}
+
+/// Cap `read_text` output to `max_chars` Unicode scalar values, appending a truncation note when trimmed.
+#[must_use]
+pub fn truncate_read_text(text: String, max_chars: usize) -> String {
+    let total_chars = text.chars().count();
+    if total_chars <= max_chars {
+        return text;
+    }
+    let split_byte = text
+        .char_indices()
+        .nth(max_chars)
+        .map_or(text.len(), |(idx, _)| idx);
+    let dropped = total_chars - max_chars;
+    let mut out = String::with_capacity(split_byte + 32);
+    out.push_str(&text[..split_byte]);
+    let _ = write!(out, "\n... [truncated {dropped} chars]");
     out
 }
 
@@ -945,10 +1099,18 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_text_strips_bidi_and_truncates() {
+    fn sanitize_text_strips_bidi_collapses_whitespace_and_truncates() {
         let dirty = "Hello\u{202E}World\nNext\x07";
         assert_eq!(sanitize_text(dirty, 50), "HelloWorld Next");
+        assert_eq!(sanitize_text("  foo  \n\t  bar  ", 50), "foo bar");
         assert_eq!(sanitize_text("abcdef", 4), "abcd…");
+    }
+
+    #[test]
+    fn truncate_read_text_caps_unicode_chars() {
+        assert_eq!(truncate_read_text("short".into(), 10), "short");
+        let capped = truncate_read_text("你好世界abc".into(), 4);
+        assert!(capped.starts_with("你好世界\n... [truncated 3 chars]"));
     }
 
     #[test]
@@ -1097,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_compact_render_includes_refs_and_actions() {
+    fn snapshot_compact_render_omits_noise_and_supports_opt_in_bounds() {
         let snap = Snapshot {
             snapshot_id: "s1".into(),
             app: AppInfo {
@@ -1116,8 +1278,8 @@ mod tests {
                 height: 600.0,
             }),
             truncated: false,
-            total_nodes: 2,
-            emitted_nodes: 2,
+            total_nodes: 5,
+            emitted_nodes: 5,
             elapsed_ms: 12,
             root: UiNode {
                 ref_id: "@e1".into(),
@@ -1126,34 +1288,105 @@ mod tests {
                 title: Some("Ideas".into()),
                 label: None,
                 value: None,
-                bounds: None,
+                bounds: Some(Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 800.0,
+                    height: 600.0,
+                }),
                 enabled: true,
                 focused: false,
                 selected: false,
-                actions: vec![],
-                children: vec![UiNode {
-                    ref_id: "@e2".into(),
-                    role: "button".into(),
-                    subrole: None,
-                    title: Some("New".into()),
-                    label: None,
-                    value: None,
-                    bounds: Some(Rect {
-                        x: 20.0,
-                        y: 30.0,
-                        width: 40.0,
-                        height: 24.0,
-                    }),
-                    enabled: true,
-                    focused: false,
-                    selected: false,
-                    actions: vec![ElementAction::Press],
-                    children: vec![],
-                }],
+                actions: vec![ElementAction::Raise, ElementAction::ShowMenu],
+                children: vec![
+                    UiNode {
+                        ref_id: "@e2".into(),
+                        role: "button".into(),
+                        subrole: None,
+                        title: Some("New".into()),
+                        label: None,
+                        value: None,
+                        bounds: Some(Rect {
+                            x: 20.0,
+                            y: 30.0,
+                            width: 40.0,
+                            height: 24.0,
+                        }),
+                        enabled: true,
+                        focused: false,
+                        selected: false,
+                        actions: vec![ElementAction::Press, ElementAction::ShowMenu],
+                        children: vec![],
+                    },
+                    UiNode {
+                        ref_id: "@e3".into(),
+                        role: "text".into(),
+                        subrole: None,
+                        title: None,
+                        label: None,
+                        value: Some("  Hello   world  ".into()),
+                        bounds: Some(Rect {
+                            x: 20.0,
+                            y: 60.0,
+                            width: 100.0,
+                            height: 16.0,
+                        }),
+                        enabled: true,
+                        focused: false,
+                        selected: false,
+                        actions: vec![ElementAction::Press, ElementAction::ShowMenu],
+                        children: vec![],
+                    },
+                    UiNode {
+                        ref_id: "@e4".into(),
+                        role: "textfield".into(),
+                        subrole: None,
+                        title: Some("Search".into()),
+                        label: None,
+                        value: Some("Search".into()),
+                        bounds: None,
+                        enabled: true,
+                        focused: false,
+                        selected: false,
+                        actions: vec![ElementAction::SetValue, ElementAction::ShowMenu],
+                        children: vec![],
+                    },
+                    UiNode {
+                        ref_id: "@e5".into(),
+                        role: "group".into(),
+                        subrole: None,
+                        title: Some("Card".into()),
+                        label: None,
+                        value: None,
+                        bounds: None,
+                        enabled: true,
+                        focused: false,
+                        selected: false,
+                        actions: vec![ElementAction::Press, ElementAction::ShowMenu],
+                        children: vec![],
+                    },
+                ],
             },
         };
-        let text = snap.render_compact();
-        assert!(text.contains("snapshot_id: s1"));
-        assert!(text.contains("@e2 button \"New\" [20,30 40x24] actions=[press]"));
+
+        let compact = snap.render_compact();
+        assert!(compact.contains("snapshot_id: s1"));
+        assert!(compact.contains("[10,20 800x600]")); // header keeps window bounds
+        assert!(compact.contains("\n@e1 window \"Ideas\"\n"));
+        assert!(compact.contains("\n @e2 button \"New\"\n"));
+        assert!(compact.contains("\n @e3 text \"Hello world\"\n"));
+        // Input keeps explicit value= even when matching title so caller knows field is non-empty.
+        assert!(compact.contains("\n @e4 textfield \"Search\" value=\"Search\"\n"));
+        // Non-obvious clickable group keeps actions=[press] (without show_menu).
+        assert!(compact.contains("\n @e5 group \"Card\" actions=[press]\n"));
+        assert!(!compact.contains("show_menu"));
+        assert!(!compact.contains("raise"));
+        assert!(!compact.contains("[20,30 40x24]"));
+
+        let with_bounds = snap.render_compact_with_options(SnapshotRenderOptions {
+            include_bounds: true,
+        });
+        assert!(with_bounds.contains("@e2 button \"New\" [20,30 40x24]\n"));
+        assert!(with_bounds.contains("@e3 text \"Hello world\" [20,60 100x16]\n"));
     }
 }

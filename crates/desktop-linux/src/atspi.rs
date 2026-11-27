@@ -641,7 +641,7 @@ pub fn read_atspi_text(
             ),
         };
         Ok(ReadTextResult {
-            text: sanitize_text(&raw, 16_384),
+            text: raw,
             source: source.into(),
         })
     })

@@ -1,6 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 
-use desktop_proto::{ElementAction, FindMatch, Rect, Snapshot, UiNode};
+use desktop_proto::{
+    ElementAction, FindMatch, Rect, Snapshot, UiNode, rendered_display_name, sanitize_text,
+};
 
 use crate::backend::AnnotateBox;
 
@@ -63,6 +65,9 @@ pub fn is_decorative_container(
     selected: bool,
     actions: &[ElementAction],
 ) -> bool {
+    if depth > 0 && matches!(role, "listmarker" | "list_marker") {
+        return true;
+    }
     let only_generic_container_actions = actions.iter().all(|a| {
         matches!(
             a,
@@ -499,6 +504,25 @@ impl<H, R> SnapshotWalkBuilder<H, R> {
             };
         }
 
+        let mut children_of: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (idx, entry) in self.arena.iter().enumerate().skip(1) {
+            if let Some(p) = entry.parent_idx {
+                children_of[p].push(idx);
+            }
+        }
+        for kids in &mut children_of {
+            kids.sort_by_key(|&idx| self.arena[idx].child_order);
+        }
+
+        // Pre-pass A: splice redundant same-title non-leaf structural wrappers (e.g. Electron
+        // `window "Title" -> group "Title" -> webarea "Title"`) before budget selection so they
+        // never consume interactive slots.
+        demote_redundant_wrappers(0, None, &mut self.arena, &children_of);
+
+        // Pre-pass B: prune redundant plain leaf `text` children whose text is already rendered
+        // in their direct semantic parent's label, freeing budget slots for real controls.
+        demote_redundant_child_text(&mut self.arena, &children_of);
+
         let mut kept = vec![false; n];
         kept[0] = true;
         let mut kept_count = 1usize;
@@ -530,16 +554,6 @@ impl<H, R> SnapshotWalkBuilder<H, R> {
 
         let truncated = self.truncated || omitted_non_decorative;
 
-        let mut children_of: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for (idx, entry) in self.arena.iter().enumerate().skip(1) {
-            if let Some(p) = entry.parent_idx {
-                children_of[p].push(idx);
-            }
-        }
-        for kids in &mut children_of {
-            kids.sort_by_key(|&idx| self.arena[idx].child_order);
-        }
-
         let mut refs = HashMap::with_capacity(kept_count);
         let mut seq = 1usize;
         let built = build_subtree(0, &mut self.arena, &children_of, &kept, &mut refs, &mut seq);
@@ -553,6 +567,238 @@ impl<H, R> SnapshotWalkBuilder<H, R> {
             total_visited: self.total_visited.max(emitted_nodes),
             emitted_nodes,
         }
+    }
+}
+
+/// Returns `Some(lowercased_text)` when a leaf `text` node renders at most one text string
+/// (either empty, or only display name, or only value, or identical name & value).
+/// Returns `None` when both display name and a distinct non-empty `value` are rendered, so
+/// redundancy pruning never drops a distinct `value`.
+fn plain_text_leaf_content(data: &AxNodeData) -> Option<String> {
+    let name = rendered_display_name(data.title.as_deref(), data.label.as_deref());
+    let val = data
+        .value
+        .as_deref()
+        .map(|s| sanitize_text(s, 120))
+        .filter(|s| !s.is_empty());
+    match (name, val) {
+        (Some(n), Some(v)) if n != v => None,
+        (Some(n), _) => Some(n.to_lowercase()),
+        (None, Some(v)) => Some(v.to_lowercase()),
+        (None, None) => Some(String::new()),
+    }
+}
+
+fn demote_redundant_wrappers<R>(
+    idx: usize,
+    ancestor_title: Option<&str>,
+    arena: &mut [ArenaEntry<R>],
+    children_of: &[Vec<usize>],
+) {
+    let mut next_ancestor_title: Option<String> = ancestor_title.map(str::to_string);
+
+    if arena[idx].tier != NodeTier::Decorative
+        && let Some(data) = arena[idx].data.as_ref()
+    {
+        let own_title = rendered_display_name(data.title.as_deref(), data.label.as_deref())
+            .map(|s| s.to_lowercase());
+        let is_redundant = idx > 0
+            && has_non_decorative_descendant(idx, arena, children_of)
+            && matches!(
+                data.role.as_str(),
+                "group" | "generic" | "webarea" | "scrollarea" | "splitgroup" | "panel"
+            )
+            && !data.focused
+            && !data.selected
+            && data.enabled
+            && data.value.is_none()
+            && data.actions.iter().all(|a| {
+                matches!(
+                    a,
+                    ElementAction::ShowMenu | ElementAction::Press | ElementAction::Raise
+                )
+            })
+            && own_title.as_deref().is_some()
+            && own_title.as_deref() == ancestor_title;
+
+        if is_redundant {
+            arena[idx].tier = NodeTier::Decorative;
+            arena[idx].stored_ref = None;
+        } else {
+            // Only carry a title to direct non-decorative descendants; unlabeled non-decorative
+            // containers (e.g. `list`/`row`) break ancestor-title inheritance.
+            next_ancestor_title = own_title;
+        }
+    }
+
+    for &child in &children_of[idx] {
+        demote_redundant_wrappers(child, next_ancestor_title.as_deref(), arena, children_of);
+    }
+}
+
+fn is_semantic_label_parent_role(role: &str) -> bool {
+    matches!(
+        role,
+        "button"
+            | "link"
+            | "heading"
+            | "tab"
+            | "tabbutton"
+            | "menuitem"
+            | "checkbox"
+            | "radio"
+            | "switch"
+            | "popup"
+            | "combobox"
+            | "row"
+            | "cell"
+            | "treeitem"
+            | "listitem"
+            | "option"
+            | "group"
+    )
+}
+
+fn collect_direct_non_decorative<R>(
+    parent: usize,
+    arena: &[ArenaEntry<R>],
+    children_of: &[Vec<usize>],
+    out: &mut Vec<usize>,
+) {
+    for &child in &children_of[parent] {
+        if arena[child].tier == NodeTier::Decorative {
+            collect_direct_non_decorative(child, arena, children_of, out);
+        } else {
+            out.push(child);
+        }
+    }
+}
+
+fn has_non_decorative_descendant<R>(
+    idx: usize,
+    arena: &[ArenaEntry<R>],
+    children_of: &[Vec<usize>],
+) -> bool {
+    for &child in &children_of[idx] {
+        if arena[child].tier != NodeTier::Decorative
+            || has_non_decorative_descendant(child, arena, children_of)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn strip_whitespace(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn contains_word_bounded(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    for (pos, _) in haystack.match_indices(needle) {
+        let left_ok = pos == 0
+            || !haystack[..pos]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric);
+        let end = pos + needle.len();
+        let right_ok = end == haystack.len()
+            || !haystack[end..]
+                .chars()
+                .next()
+                .is_some_and(char::is_alphanumeric);
+        if left_ok && right_ok {
+            return true;
+        }
+    }
+    false
+}
+
+fn demote_redundant_child_text<R>(arena: &mut [ArenaEntry<R>], children_of: &[Vec<usize>]) {
+    let n = arena.len();
+    let mut to_demote = Vec::new();
+
+    for p in 0..n {
+        if arena[p].tier == NodeTier::Decorative {
+            continue;
+        }
+        let Some(parent_data) = arena[p].data.as_ref() else {
+            continue;
+        };
+        if !is_semantic_label_parent_role(&parent_data.role) {
+            continue;
+        }
+        let Some(parent_label) =
+            rendered_display_name(parent_data.title.as_deref(), parent_data.label.as_deref())
+                .map(|s| s.to_lowercase())
+        else {
+            continue;
+        };
+
+        let mut direct = Vec::new();
+        collect_direct_non_decorative(p, arena, children_of, &mut direct);
+        if direct.is_empty() {
+            continue;
+        }
+
+        let mut text_leaves: Vec<(usize, String)> = Vec::new();
+        for &c in &direct {
+            let Some(cd) = arena[c].data.as_ref() else {
+                continue;
+            };
+            if cd.role == "text"
+                && !cd.focused
+                && !cd.selected
+                && cd.enabled
+                && !has_explicit_input_action(&cd.actions)
+                && !has_non_decorative_descendant(c, arena, children_of)
+                && let Some(content) = plain_text_leaf_content(cd)
+            {
+                text_leaves.push((c, content));
+            }
+        }
+        if text_leaves.is_empty() {
+            continue;
+        }
+
+        let non_empty: Vec<&str> = text_leaves
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let concat_spaced = non_empty.join(" ");
+        let concat_compact = strip_whitespace(&concat_spaced);
+        let parent_compact = strip_whitespace(&parent_label);
+
+        let all_match_via_concat = !concat_compact.is_empty()
+            && (concat_compact == parent_compact
+                || (concat_compact.chars().count() >= 4
+                    && (contains_word_bounded(&parent_label, &concat_spaced)
+                        || (parent_compact.contains(&concat_compact)
+                            && concat_compact.chars().count() * 2
+                                >= parent_compact.chars().count()))));
+
+        if all_match_via_concat {
+            for (c, _) in text_leaves {
+                to_demote.push(c);
+            }
+        } else {
+            for (c, t) in text_leaves {
+                if t.is_empty()
+                    || t == parent_label
+                    || (t.chars().count() >= 3 && contains_word_bounded(&parent_label, &t))
+                {
+                    to_demote.push(c);
+                }
+            }
+        }
+    }
+
+    for idx in to_demote {
+        arena[idx].tier = NodeTier::Decorative;
+        arena[idx].stored_ref = None;
     }
 }
 
@@ -1864,5 +2110,304 @@ mod tests {
                 "missing live ref handle for {ref_id}"
             );
         }
+    }
+
+    #[test]
+    fn prunes_redundant_wrappers_list_markers_and_child_text_with_guards() {
+        let make_text = |id: usize, val: &str| FakeAxNode {
+            id,
+            data: AxNodeData {
+                role: "text".into(),
+                subrole: None,
+                title: None,
+                label: None,
+                value: Some(val.into()),
+                bounds: Some(rect(10.0, 10.0, 40.0, 14.0)),
+                enabled: true,
+                focused: false,
+                selected: false,
+                actions: vec![ElementAction::ShowMenu],
+            },
+            children: vec![],
+        };
+
+        let long_card_title = format!("{} trailing-detail-past-eighty-chars", "A".repeat(82));
+
+        let root = FakeAxNode {
+            id: 1,
+            data: make_ax(
+                "window",
+                Some("agent-desktop"),
+                Some(rect(0.0, 0.0, 1200.0, 800.0)),
+                vec![ElementAction::Raise],
+            ),
+            children: vec![FakeAxNode {
+                id: 2,
+                // Redundant same-title non-leaf wrapper even with Electron AXPress/AXShowMenu.
+                data: make_ax(
+                    "group",
+                    Some("agent-desktop"),
+                    Some(rect(0.0, 0.0, 1200.0, 800.0)),
+                    vec![ElementAction::Press, ElementAction::ShowMenu],
+                ),
+                children: vec![FakeAxNode {
+                    id: 3,
+                    data: make_ax(
+                        "webarea",
+                        Some("agent-desktop"),
+                        Some(rect(0.0, 0.0, 1200.0, 800.0)),
+                        vec![ElementAction::ShowMenu],
+                    ),
+                    children: vec![
+                        // 1. Button whose 6 child text fragments concatenate to its label -> all 6 dropped.
+                        FakeAxNode {
+                            id: 10,
+                            data: make_ax(
+                                "button",
+                                Some("Changes vs origin/main +0 -0"),
+                                Some(rect(10.0, 10.0, 220.0, 30.0)),
+                                vec![ElementAction::Press, ElementAction::ShowMenu],
+                            ),
+                            children: vec![
+                                make_text(11, "Changes"),
+                                make_text(12, "vs origin/main"),
+                                make_text(13, "+"),
+                                make_text(14, "0"),
+                                make_text(15, "-"),
+                                make_text(16, "0"),
+                            ],
+                        },
+                        // 2. Thread card button: duplicate title & repo dropped, unique timestamp + inner button kept.
+                        FakeAxNode {
+                            id: 20,
+                            data: make_ax(
+                                "button",
+                                Some("Release Checklist Notes, acme/demo"),
+                                Some(rect(10.0, 50.0, 240.0, 70.0)),
+                                vec![ElementAction::Press, ElementAction::ShowMenu],
+                            ),
+                            children: vec![
+                                make_text(21, "acme/demo"),
+                                make_text(22, "14h"),
+                                FakeAxNode {
+                                    id: 23,
+                                    data: make_ax(
+                                        "button",
+                                        Some("Unpin thread"),
+                                        Some(rect(20.0, 55.0, 16.0, 16.0)),
+                                        vec![ElementAction::Press],
+                                    ),
+                                    children: vec![],
+                                },
+                                make_text(24, "Release Checklist Notes"),
+                            ],
+                        },
+                        // 2b. Leaf text with matching title + distinct value, or whitespace title + value: must be KEPT.
+                        FakeAxNode {
+                            id: 25,
+                            data: make_ax(
+                                "group",
+                                Some("Status"),
+                                Some(rect(10.0, 115.0, 200.0, 20.0)),
+                                vec![],
+                            ),
+                            children: vec![
+                                FakeAxNode {
+                                    id: 26,
+                                    data: AxNodeData {
+                                        role: "text".into(),
+                                        subrole: None,
+                                        title: Some("Status".into()),
+                                        label: None,
+                                        value: Some("Error: timeout".into()),
+                                        bounds: None,
+                                        enabled: true,
+                                        focused: false,
+                                        selected: false,
+                                        actions: vec![],
+                                    },
+                                    children: vec![],
+                                },
+                                FakeAxNode {
+                                    id: 27,
+                                    data: AxNodeData {
+                                        role: "text".into(),
+                                        subrole: None,
+                                        title: Some("   ".into()),
+                                        label: None,
+                                        value: Some("Important".into()),
+                                        bounds: None,
+                                        enabled: true,
+                                        focused: false,
+                                        selected: false,
+                                        actions: vec![],
+                                    },
+                                    children: vec![],
+                                },
+                            ],
+                        },
+                        // 3. Long card title (>80 chars): text past char 80 is NOT rendered in parent, must stay.
+                        FakeAxNode {
+                            id: 30,
+                            data: make_ax(
+                                "button",
+                                Some(&long_card_title),
+                                Some(rect(10.0, 130.0, 240.0, 40.0)),
+                                vec![ElementAction::Press],
+                            ),
+                            children: vec![make_text(31, "trailing-detail-past-eighty-chars")],
+                        },
+                        // 4. Short badge "0" inside "Open 10 tabs": must NOT be falsely dropped.
+                        FakeAxNode {
+                            id: 40,
+                            data: make_ax(
+                                "button",
+                                Some("Open 10 tabs"),
+                                Some(rect(10.0, 180.0, 120.0, 24.0)),
+                                vec![ElementAction::Press],
+                            ),
+                            children: vec![make_text(41, "0")],
+                        },
+                        // 5. Unlabeled row inside window "agent-desktop": window title must NOT bleed into row's text.
+                        FakeAxNode {
+                            id: 50,
+                            data: make_ax(
+                                "row",
+                                None,
+                                Some(rect(10.0, 210.0, 200.0, 24.0)),
+                                vec![ElementAction::Press],
+                            ),
+                            children: vec![make_text(51, "agent-desktop")],
+                        },
+                        // 6. List markers (macOS + Linux variants) are dropped as decorative.
+                        FakeAxNode {
+                            id: 60,
+                            data: make_ax("listmarker", Some("•"), None, vec![]),
+                            children: vec![],
+                        },
+                        FakeAxNode {
+                            id: 61,
+                            data: make_ax("list_marker", Some("-"), None, vec![]),
+                            children: vec![],
+                        },
+                        // 7. Leaf clickable group (or group with only decorative children) matching window title must NOT be spliced.
+                        FakeAxNode {
+                            id: 70,
+                            data: make_ax(
+                                "group",
+                                Some("agent-desktop"),
+                                Some(rect(10.0, 250.0, 140.0, 28.0)),
+                                vec![ElementAction::Press],
+                            ),
+                            children: vec![FakeAxNode {
+                                id: 71,
+                                data: make_ax("listmarker", Some("•"), None, vec![]),
+                                children: vec![],
+                            }],
+                        },
+                        // 8. Clickable group inside unlabeled list sharing window title must NOT inherit window title.
+                        FakeAxNode {
+                            id: 72,
+                            data: make_ax(
+                                "list",
+                                None,
+                                Some(rect(10.0, 290.0, 200.0, 40.0)),
+                                vec![],
+                            ),
+                            children: vec![FakeAxNode {
+                                id: 73,
+                                data: make_ax(
+                                    "group",
+                                    Some("agent-desktop"),
+                                    Some(rect(10.0, 290.0, 200.0, 24.0)),
+                                    vec![ElementAction::Press],
+                                ),
+                                children: vec![make_text(74, "branch: main")],
+                            }],
+                        },
+                    ],
+                }],
+            }],
+        };
+
+        let out = walk_fake_tree(root, WalkBudget::new(24, 250));
+        assert!(!out.truncated);
+
+        let snap = Snapshot {
+            snapshot_id: "s1".into(),
+            app: AppInfo {
+                name: "Test".into(),
+                bundle_id: None,
+                pid: None,
+                path: None,
+                running: true,
+            },
+            window_id: Some(1),
+            window_title: Some("agent-desktop".into()),
+            window_bounds: Some(rect(0.0, 0.0, 1200.0, 800.0)),
+            truncated: out.truncated,
+            total_nodes: out.total_visited,
+            emitted_nodes: out.emitted_nodes,
+            elapsed_ms: 1,
+            root: out.root,
+        };
+        let rendered = snap.render_compact();
+
+        // Triple window/group/webarea wrapper collapsed directly to window's children.
+        assert!(!rendered.contains("webarea"));
+        assert!(!rendered.contains("listmarker"));
+        assert!(!rendered.contains("list_marker"));
+
+        // Changes button has zero redundant child text nodes.
+        let changes_btn = snap
+            .root
+            .children
+            .iter()
+            .find(|n| n.title.as_deref() == Some("Changes vs origin/main +0 -0"))
+            .expect("Changes button kept");
+        assert!(changes_btn.children.is_empty());
+
+        // Thread card kept "14h" and "Unpin thread", dropped "acme/demo" and duplicate title.
+        let card_btn = snap
+            .root
+            .children
+            .iter()
+            .find(|n| n.title.as_deref() == Some("Release Checklist Notes, acme/demo"))
+            .expect("Card button kept");
+        let card_child_texts: Vec<String> = card_btn
+            .children
+            .iter()
+            .map(|c| {
+                c.title
+                    .clone()
+                    .or_else(|| c.value.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(card_child_texts, vec!["14h", "Unpin thread"]);
+
+        // Distinct value and whitespace-title leaf text nodes must be kept.
+        assert!(rendered.contains("value=\"Error: timeout\""));
+        assert!(rendered.contains("text \"Important\""));
+
+        // Long card kept child text beyond char 80.
+        assert!(rendered.contains("trailing-detail-past-eighty-chars"));
+        // Short badge "0" kept.
+        assert!(rendered.contains("text \"0\""));
+        // Sidebar row kept "agent-desktop" text (no window-title bleed) and clickable row keeps actions=[press].
+        assert!(rendered.contains("row actions=[press]\n  @e"));
+        assert!(rendered.contains("text \"agent-desktop\""));
+        // Decorative-only-child clickable group and nested group inside unlabeled list both kept.
+        assert_eq!(
+            rendered
+                .matches("group \"agent-desktop\" actions=[press]")
+                .count(),
+            2
+        );
+        assert!(rendered.contains("text \"branch: main\""));
+        // Ref map stays 1:1 with emitted nodes.
+        let mut nodes = Vec::new();
+        collect_titles(&snap.root, &mut nodes);
+        assert_eq!(out.refs.len(), nodes.len());
     }
 }
