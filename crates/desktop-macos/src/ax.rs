@@ -10,7 +10,7 @@ use desktop_core::tree::{
 };
 use desktop_proto::{
     AppInfo, ElementAction, ErrorCode, FocusMode, ReadTextMode, ReadTextResult, Rect, RpcError,
-    Snapshot, SnapshotParams, UiNode,
+    Snapshot, SnapshotParams, UiNode, WindowInfo,
 };
 use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
 
@@ -226,6 +226,7 @@ impl AxElement {
 pub struct LiveRef {
     pub element: AxElement,
     pub app: AppInfo,
+    pub window_id: Option<u32>,
     pub actions: Vec<ElementAction>,
 }
 
@@ -289,6 +290,7 @@ impl AxRefStore {
         Ok(ResolvedRef {
             ref_id: ref_id.to_string(),
             app: live.app,
+            window_id: live.window_id,
             bounds,
             actions: live.actions,
         })
@@ -351,7 +353,7 @@ pub fn take_snapshot(
             store,
             live.element,
             live.app,
-            params.window_id,
+            params.window_id.or(live.window_id),
             None,
             params,
             redact_passwords,
@@ -393,9 +395,7 @@ pub fn take_snapshot(
         if params.focus_mode == FocusMode::Foreground {
             windows::activate_pid(pid as i32);
         }
-        let win = windows::windows(Some(&found.name))
-            .ok()
-            .and_then(|v| v.into_iter().next());
+        let win = resolve_window_for_app(&found);
         (
             found,
             win.as_ref().map(|w| w.id),
@@ -405,9 +405,7 @@ pub fn take_snapshot(
     } else {
         let app = focused_app()?
             .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "no focused application found"))?;
-        let win = windows::windows(Some(&app.name))
-            .ok()
-            .and_then(|v| v.into_iter().next());
+        let win = resolve_window_for_app(&app);
         (
             app,
             win.as_ref().map(|w| w.id),
@@ -456,6 +454,28 @@ pub fn take_snapshot(
         }
         s
     })
+}
+
+fn resolve_window_for_app(app: &AppInfo) -> Option<WindowInfo> {
+    let filter = app
+        .bundle_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&app.name);
+    let wins = windows::windows(Some(filter)).ok()?;
+    pick_primary_window(&wins, app.pid).cloned()
+}
+
+fn pick_primary_window(wins: &[WindowInfo], pid: Option<u32>) -> Option<&WindowInfo> {
+    if let Some(pid) = pid {
+        if let Some(w) = wins.iter().find(|w| w.app.pid == Some(pid) && w.layer == 0) {
+            return Some(w);
+        }
+        if let Some(w) = wins.iter().find(|w| w.app.pid == Some(pid)) {
+            return Some(w);
+        }
+    }
+    wins.iter().find(|w| w.layer == 0).or_else(|| wins.first())
 }
 
 fn pick_ax_window(app_el: &AxElement, title: Option<&str>) -> Option<AxElement> {
@@ -565,6 +585,7 @@ fn build_snapshot_from_root(
             let live = LiveRef {
                 element: el.clone(),
                 app: app.clone(),
+                window_id,
                 actions: actions.clone(),
             };
             (bounds, enabled, Some(live))

@@ -34,6 +34,7 @@ pub struct RawScreenshot {
 pub struct ResolvedRef {
     pub ref_id: String,
     pub app: AppInfo,
+    pub window_id: Option<u32>,
     pub bounds: Option<Rect>,
     pub actions: Vec<ElementAction>,
 }

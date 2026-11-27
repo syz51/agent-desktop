@@ -75,7 +75,11 @@ impl PolicyStore {
 
 /// Evaluate user-configured opt-in policy against an app.
 pub fn check_app_policy(policy: &PolicyConfig, app: &AppInfo) -> Result<bool, RpcError> {
-    if policy.deny_apps.iter().any(|rule| app.matches_query(rule)) {
+    if policy
+        .deny_apps
+        .iter()
+        .any(|rule| app.matches_policy_rule(rule))
+    {
         return Err(RpcError::with_next(
             ErrorCode::PolicyDenied,
             format!("{} is in your policy.toml deny_apps list", app.name),
@@ -86,6 +90,6 @@ pub fn check_app_policy(policy: &PolicyConfig, app: &AppInfo) -> Result<bool, Rp
         || policy
             .confirm_apps
             .iter()
-            .any(|rule| app.matches_query(rule));
+            .any(|rule| app.matches_policy_rule(rule));
     Ok(needs_confirm)
 }

@@ -792,7 +792,7 @@ impl DesktopEngine {
         // Also honor optional caller-requested app scope in `session_start(apps: [...])`.
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(scope) = st.lease.as_ref().and_then(|l| l.scoped_apps.as_ref())
-            && !scope.iter().any(|rule| app.matches_query(rule))
+            && !scope.iter().any(|rule| app.matches_policy_rule(rule))
         {
             return Err(RpcError::with_next(
                 ErrorCode::PolicyDenied,
@@ -807,11 +807,12 @@ impl DesktopEngine {
         &self,
         query: &str,
         policy: &PolicyConfig,
-    ) -> Result<(), RpcError> {
+    ) -> Result<Option<AppInfo>, RpcError> {
         if let Some(app) = self.backend.find_app(query)? {
             self.ensure_app_allowed(&app, policy)?;
+            return Ok(Some(app));
         }
-        Ok(())
+        Ok(None)
     }
 
     fn capture_snapshot(
@@ -977,11 +978,15 @@ impl DesktopEngine {
         Ok((meta, bytes_opt))
     }
 
-    fn resolve_point(&self, target: &Target) -> Result<Point, RpcError> {
+    fn resolve_target_point(
+        &self,
+        target: &Target,
+    ) -> Result<(Point, Option<ActPostTarget>), RpcError> {
         match target {
             Target::Ref { ref_id } => {
                 let resolved = self.backend.resolve_ref(ref_id)?;
-                resolved
+                let post_target = post_target_from_resolved(&resolved);
+                let point = resolved
                     .bounds
                     .filter(|b| !b.is_empty())
                     .map(|b| b.center())
@@ -991,7 +996,8 @@ impl DesktopEngine {
                             format!("{ref_id} has no visible bounding box"),
                             "Take a fresh snapshot or screenshot.",
                         )
-                    })
+                    })?;
+                Ok((point, post_target))
             }
             Target::Point { x, y, display } => {
                 let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -999,13 +1005,9 @@ impl DesktopEngine {
                 if let Some(idx) = idx
                     && let Some(shot) = st.shots_by_display.get(&idx)
                 {
-                    return screenshot_to_global(
-                        shot.display_bounds,
-                        shot.width,
-                        shot.height,
-                        *x,
-                        *y,
-                    );
+                    let pt =
+                        screenshot_to_global(shot.display_bounds, shot.width, shot.height, *x, *y)?;
+                    return Ok((pt, None));
                 }
                 // Fallback: if coordinates are direct display points (e.g. from snapshot bounds),
                 // validate finiteness and pass through directly.
@@ -1015,7 +1017,108 @@ impl DesktopEngine {
                         "point coordinates must be finite numbers",
                     ));
                 }
-                Ok(Point { x: *x, y: *y })
+                Ok((Point { x: *x, y: *y }, None))
+            }
+        }
+    }
+
+    fn capture_post_action(
+        &self,
+        after: PostAction,
+        focus_mode: FocusMode,
+        post_target: Option<&ActPostTarget>,
+        policy: &PolicyConfig,
+    ) -> (Option<Snapshot>, Option<ScreenshotResult>) {
+        let usable_target = match post_target {
+            Some(ActPostTarget::Window(wid)) => Some(ActPostTarget::Window(*wid)),
+            Some(ActPostTarget::App(app)) => {
+                // Only target the tracked app when it currently has at least one visible window
+                // (avoiding empty/application-only snapshots right after launch or Quit).
+                let has_visible = self
+                    .backend
+                    .windows(Some(app))
+                    .ok()
+                    .is_some_and(|wins| wins.iter().any(|w| w.on_screen && !w.minimized));
+                has_visible.then(|| ActPostTarget::App(app.clone()))
+            }
+            None => None,
+        };
+
+        match after {
+            PostAction::None => (None, None),
+            PostAction::Snapshot => {
+                let targeted = match &usable_target {
+                    Some(ActPostTarget::Window(wid)) => Some(self.capture_snapshot(
+                        &SnapshotParams {
+                            window_id: Some(*wid),
+                            focus_mode,
+                            ..SnapshotParams::default()
+                        },
+                        policy,
+                    )),
+                    Some(ActPostTarget::App(app)) => Some(self.capture_snapshot(
+                        &SnapshotParams {
+                            app: Some(app.clone()),
+                            focus_mode,
+                            ..SnapshotParams::default()
+                        },
+                        policy,
+                    )),
+                    None => None,
+                };
+                let snap = match targeted {
+                    Some(Ok(s)) => Some(s),
+                    Some(Err(err)) if err.code == ErrorCode::PolicyDenied => None,
+                    Some(Err(_)) | None => self
+                        .capture_snapshot(
+                            &SnapshotParams {
+                                focus_mode,
+                                ..SnapshotParams::default()
+                            },
+                            policy,
+                        )
+                        .ok(),
+                };
+                (snap, None)
+            }
+            PostAction::Screenshot | PostAction::Annotated => {
+                let annotate = after == PostAction::Annotated;
+                let targeted = match &usable_target {
+                    Some(ActPostTarget::Window(wid)) => Some(self.capture_screenshot(
+                        &ScreenshotParams {
+                            target: ScreenshotTarget::Window { window_id: *wid },
+                            annotate,
+                            focus_mode,
+                            ..ScreenshotParams::default()
+                        },
+                        policy,
+                    )),
+                    Some(ActPostTarget::App(app)) => Some(self.capture_screenshot(
+                        &ScreenshotParams {
+                            target: ScreenshotTarget::App { app: app.clone() },
+                            annotate,
+                            focus_mode,
+                            ..ScreenshotParams::default()
+                        },
+                        policy,
+                    )),
+                    None => None,
+                };
+                let shot = match targeted {
+                    Some(Ok(s)) => Some(s),
+                    Some(Err(err)) if err.code == ErrorCode::PolicyDenied => None,
+                    Some(Err(_)) | None => self
+                        .capture_screenshot(
+                            &ScreenshotParams {
+                                annotate,
+                                focus_mode,
+                                ..ScreenshotParams::default()
+                            },
+                            policy,
+                        )
+                        .ok(),
+                };
+                (None, shot)
             }
         }
     }
@@ -1050,6 +1153,7 @@ impl DesktopEngine {
         let mut stopped_early = false;
         let mut deferred_session_end = false;
         let mut released = false;
+        let mut post_target: Option<ActPostTarget> = None;
 
         for (index, step) in params.steps.into_iter().enumerate() {
             if let Err(err) = self.check_session_not_stopped(active_sid) {
@@ -1069,6 +1173,11 @@ impl DesktopEngine {
                     }
                     if exec.released_session {
                         deferred_session_end = true;
+                    }
+                    match exec.post_target {
+                        PostTargetUpdate::Keep => {}
+                        PostTargetUpdate::Set(target) => post_target = Some(target),
+                        PostTargetUpdate::Clear => post_target = None,
                     }
                     outcomes.push(StepOutcome {
                         index,
@@ -1106,47 +1215,16 @@ impl DesktopEngine {
         }
 
         let completed = outcomes.iter().filter(|s| s.ok).count();
-        let mut snapshot = None;
-        let mut screenshot = None;
-        if failed_error.is_none() {
-            match params.after {
-                PostAction::None => {}
-                PostAction::Snapshot => {
-                    snapshot = self
-                        .capture_snapshot(
-                            &SnapshotParams {
-                                focus_mode: params.focus_mode,
-                                ..SnapshotParams::default()
-                            },
-                            policy,
-                        )
-                        .ok();
-                }
-                PostAction::Screenshot => {
-                    screenshot = self
-                        .capture_screenshot(
-                            &ScreenshotParams {
-                                focus_mode: params.focus_mode,
-                                ..ScreenshotParams::default()
-                            },
-                            policy,
-                        )
-                        .ok();
-                }
-                PostAction::Annotated => {
-                    screenshot = self
-                        .capture_screenshot(
-                            &ScreenshotParams {
-                                annotate: true,
-                                focus_mode: params.focus_mode,
-                                ..ScreenshotParams::default()
-                            },
-                            policy,
-                        )
-                        .ok();
-                }
-            }
-        }
+        let (snapshot, screenshot) = if failed_error.is_none() {
+            self.capture_post_action(
+                params.after,
+                params.focus_mode,
+                post_target.as_ref(),
+                policy,
+            )
+        } else {
+            (None, None)
+        };
 
         self.audit.record(AuditEvent {
             time: self.clock.now(),
@@ -1195,13 +1273,15 @@ impl DesktopEngine {
                     Target::Ref { ref_id } => {
                         let resolved = self.backend.resolve_ref(&ref_id)?;
                         self.ensure_app_allowed(&resolved.app, policy)?;
+                        let post_target = post_target_from_resolved(&resolved);
                         let info = self
                             .backend
                             .click_ref(&ref_id, button, count, mods, mode, focus_mode)?;
-                        Ok(StepRun::mutating(info.detail, info.used_background))
+                        Ok(StepRun::mutating(info.detail, info.used_background)
+                            .with_optional_target(post_target))
                     }
                     point_target @ Target::Point { .. } => {
-                        let p = self.resolve_point(&point_target)?;
+                        let (p, _) = self.resolve_target_point(&point_target)?;
                         if let Some(app) = self.backend.app_at_point(p)? {
                             self.ensure_app_allowed(&app, policy)?;
                         }
@@ -1213,12 +1293,13 @@ impl DesktopEngine {
                 }
             }
             ActionStep::Hover { target } => {
-                let p = self.resolve_point(&target)?;
+                let (p, post_target) = self.resolve_target_point(&target)?;
                 if let Some(app) = self.backend.app_at_point(p)? {
                     self.ensure_app_allowed(&app, policy)?;
                 }
                 let info = self.backend.hover_point(p)?;
-                Ok(StepRun::mutating(info.detail, info.used_background))
+                Ok(StepRun::mutating(info.detail, info.used_background)
+                    .with_optional_target(post_target))
             }
             ActionStep::Drag {
                 from,
@@ -1226,8 +1307,8 @@ impl DesktopEngine {
                 modifiers,
             } => {
                 let mods = parse_modifiers(&modifiers, is_macos)?;
-                let p1 = self.resolve_point(&from)?;
-                let p2 = self.resolve_point(&to)?;
+                let (p1, from_target) = self.resolve_target_point(&from)?;
+                let (p2, to_target) = self.resolve_target_point(&to)?;
                 if let Some(app) = self.backend.app_at_point(p1)? {
                     self.ensure_app_allowed(&app, policy)?;
                 }
@@ -1235,19 +1316,21 @@ impl DesktopEngine {
                     self.ensure_app_allowed(&app, policy)?;
                 }
                 let info = self.backend.drag(p1, p2, mods, focus_mode)?;
-                Ok(StepRun::mutating(info.detail, info.used_background))
+                Ok(StepRun::mutating(info.detail, info.used_background)
+                    .with_optional_target(to_target.or(from_target)))
             }
             ActionStep::Scroll {
                 target,
                 direction,
                 amount,
             } => {
-                let p = self.resolve_point(&target)?;
+                let (p, post_target) = self.resolve_target_point(&target)?;
                 if let Some(app) = self.backend.app_at_point(p)? {
                     self.ensure_app_allowed(&app, policy)?;
                 }
                 let info = self.backend.scroll(p, direction, amount, focus_mode)?;
-                Ok(StepRun::mutating(info.detail, info.used_background))
+                Ok(StepRun::mutating(info.detail, info.used_background)
+                    .with_optional_target(post_target))
             }
             ActionStep::SetText {
                 ref_id,
@@ -1256,9 +1339,11 @@ impl DesktopEngine {
                 submit,
                 method,
             } => {
+                let mut post_target = None;
                 if let Some(r) = &ref_id {
                     let resolved = self.backend.resolve_ref(r)?;
                     self.ensure_app_allowed(&resolved.app, policy)?;
+                    post_target = post_target_from_resolved(&resolved);
                 } else if let Some(app) = self.backend.focused_app()? {
                     self.ensure_app_allowed(&app, policy)?;
                 }
@@ -1270,7 +1355,8 @@ impl DesktopEngine {
                     method,
                     focus_mode,
                 )?;
-                Ok(StepRun::mutating(info.detail, info.used_background))
+                Ok(StepRun::mutating(info.detail, info.used_background)
+                    .with_optional_target(post_target))
             }
             ActionStep::Key { combo, repeat } => {
                 let parsed = parse_key_combo(&combo, is_macos)?;
@@ -1283,6 +1369,7 @@ impl DesktopEngine {
             ActionStep::OpenApp { app } => {
                 self.ensure_app_allowed_by_query(&app, policy)?;
                 let opened = self.backend.open_app(&app, focus_mode)?;
+                let target_app = app_target_key(&opened, &app);
                 let used_background = if is_macos {
                     focus_mode != FocusMode::Foreground
                 } else {
@@ -1293,7 +1380,8 @@ impl DesktopEngine {
                 } else {
                     format!("opened {}", opened.name)
                 };
-                Ok(StepRun::mutating(detail, used_background))
+                Ok(StepRun::mutating(detail, used_background)
+                    .with_target(ActPostTarget::App(target_app)))
             }
             ActionStep::FocusWindow { window_id } => {
                 let win = self.backend.focus_window(window_id)?;
@@ -1301,12 +1389,23 @@ impl DesktopEngine {
                 Ok(StepRun::mutating(
                     format!("focused window w{} ({})", win.id, win.app.name),
                     false,
-                ))
+                )
+                .with_target(ActPostTarget::Window(win.id)))
             }
             ActionStep::Menu { app, path } => {
-                self.ensure_app_allowed_by_query(&app, policy)?;
+                let resolved_app = self.ensure_app_allowed_by_query(&app, policy)?;
                 let detail = self.backend.menu(&app, &path)?;
-                Ok(StepRun::mutating(detail, true))
+                let mut run = StepRun::mutating(detail, true);
+                if is_quit_or_close_menu(&path) {
+                    run.post_target = PostTargetUpdate::Clear;
+                } else {
+                    let target_app = resolved_app
+                        .as_ref()
+                        .map(|info| app_target_key(info, &app))
+                        .unwrap_or_else(|| app.clone());
+                    run.post_target = PostTargetUpdate::Set(ActPostTarget::App(target_app));
+                }
+                Ok(run)
             }
             ActionStep::ReadText {
                 mode,
@@ -1351,6 +1450,7 @@ impl DesktopEngine {
                     text: Some(res.text),
                     released_session: false,
                     mutated_screen: false,
+                    post_target: PostTargetUpdate::Keep,
                 })
             }
             ActionStep::Wait { until, timeout_ms } => {
@@ -1380,6 +1480,7 @@ impl DesktopEngine {
                 text: None,
                 released_session: true,
                 mutated_screen: false,
+                post_target: PostTargetUpdate::Keep,
             }),
         }
     }
@@ -1522,12 +1623,61 @@ fn stopped_by_user_error() -> RpcError {
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActPostTarget {
+    Window(u32),
+    App(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PostTargetUpdate {
+    Keep,
+    Set(ActPostTarget),
+    Clear,
+}
+
+fn app_target_key(app: &AppInfo, fallback: &str) -> String {
+    if let Some(bid) = app.bundle_id.as_deref().filter(|s| !s.trim().is_empty()) {
+        return bid.to_string();
+    }
+    if !app.name.trim().is_empty() {
+        return app.name.clone();
+    }
+    fallback.to_string()
+}
+
+fn post_target_from_resolved(resolved: &crate::backend::ResolvedRef) -> Option<ActPostTarget> {
+    if let Some(wid) = resolved.window_id {
+        return Some(ActPostTarget::Window(wid));
+    }
+    let key = app_target_key(&resolved.app, "");
+    (!key.trim().is_empty()).then_some(ActPostTarget::App(key))
+}
+
+fn is_quit_or_close_menu(path: &[String]) -> bool {
+    let Some(last) = path.last() else {
+        return false;
+    };
+    let label = last.trim().to_lowercase();
+    label == "quit"
+        || label.starts_with("quit ")
+        || label == "exit"
+        || label == "close"
+        || label == "close window"
+        || label == "close all"
+        || label == "close all windows"
+        || label.starts_with("退出")
+        || label == "关闭"
+        || label == "关闭窗口"
+}
+
 struct StepRun {
     detail: String,
     used_background: bool,
     text: Option<String>,
     released_session: bool,
     mutated_screen: bool,
+    post_target: PostTargetUpdate,
 }
 
 impl StepRun {
@@ -1538,7 +1688,20 @@ impl StepRun {
             text: None,
             released_session: false,
             mutated_screen: true,
+            post_target: PostTargetUpdate::Keep,
         }
+    }
+
+    fn with_target(mut self, target: ActPostTarget) -> Self {
+        self.post_target = PostTargetUpdate::Set(target);
+        self
+    }
+
+    fn with_optional_target(mut self, target: Option<ActPostTarget>) -> Self {
+        if let Some(target) = target {
+            self.post_target = PostTargetUpdate::Set(target);
+        }
+        self
     }
 }
 

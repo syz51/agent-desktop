@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use desktop_core::{AnnotateBox, RawScreenshot, StepExecInfo};
 use desktop_proto::{
-    DisplayInfo, ErrorCode, FocusMode, ImageFormat, KeyCombo, Modifiers, MouseButton, Point, Rect,
-    RpcError, ScreenState, ScreenshotTarget, ScrollDirection, WindowInfo, char_to_x11_keysym,
+    AppMatchRank, DisplayInfo, ErrorCode, FocusMode, ImageFormat, KeyCombo, Modifiers, MouseButton,
+    Point, Rect, RpcError, ScreenState, ScreenshotTarget, ScrollDirection, WindowInfo,
+    char_to_x11_keysym,
 };
 use x11rb::CURRENT_TIME;
 use x11rb::connection::Connection as _;
@@ -218,6 +219,11 @@ impl X11Session {
 
     /// List visible top-level windows using EWMH `_NET_CLIENT_LIST_STACKING`, with WM-less fallback.
     pub fn windows(&self, app_filter: Option<&str>) -> Result<Vec<WindowInfo>, RpcError> {
+        if let Some(filter) = app_filter
+            && filter.trim().is_empty()
+        {
+            return Ok(Vec::new());
+        }
         let root = self.root();
         let displays = self.displays()?;
         let active_window = self.active_window_id();
@@ -237,7 +243,7 @@ impl X11Session {
             window_ids = tree.children.into_iter().rev().collect();
         }
 
-        let mut out = Vec::new();
+        let mut ranked_out: Vec<(u8, WindowInfo)> = Vec::new();
         for wid in window_ids {
             let Ok(attrs) = self.conn.get_window_attributes(wid).map(|c| c.reply()) else {
                 continue;
@@ -269,14 +275,24 @@ impl X11Session {
             );
             let title = self.read_window_title(wid).unwrap_or_default();
 
-            if let Some(filter) = app_filter
-                && !app.matches_query(filter)
-                && !title
-                    .to_ascii_lowercase()
-                    .contains(&filter.to_ascii_lowercase())
-            {
-                continue;
-            }
+            let match_score = if let Some(filter) = app_filter {
+                let trimmed = filter.trim();
+                if let Some(rank) = app.match_rank(trimmed) {
+                    match rank {
+                        AppMatchRank::Exact => 4,
+                        AppMatchRank::WordPrefix => 3,
+                        AppMatchRank::Substring => 2,
+                    }
+                } else if !trimmed.ends_with('.')
+                    && title.to_lowercase().contains(&trimmed.to_lowercase())
+                {
+                    1
+                } else {
+                    continue;
+                }
+            } else {
+                4
+            };
 
             let center = bounds.center();
             let display_index = displays
@@ -284,20 +300,30 @@ impl X11Session {
                 .find(|d| d.bounds.contains(center))
                 .map(|d| d.index);
 
-            out.push(WindowInfo {
-                id: wid,
-                app,
-                title,
-                bounds,
-                layer: 0,
-                alpha: 1.0,
-                display_index,
-                focused: active_window == Some(wid),
-                minimized: false,
-                on_screen: true,
-            });
+            ranked_out.push((
+                match_score,
+                WindowInfo {
+                    id: wid,
+                    app,
+                    title,
+                    bounds,
+                    layer: 0,
+                    alpha: 1.0,
+                    display_index,
+                    focused: active_window == Some(wid),
+                    minimized: false,
+                    on_screen: true,
+                },
+            ));
         }
-        Ok(out)
+        if app_filter.is_some() {
+            if ranked_out.iter().any(|(score, _)| *score == 4) {
+                ranked_out.retain(|(score, _)| *score == 4);
+            } else {
+                ranked_out.sort_by(|(a, _), (b, _)| b.cmp(a));
+            }
+        }
+        Ok(ranked_out.into_iter().map(|(_, w)| w).collect())
     }
 
     pub fn focused_window(&self) -> Result<Option<WindowInfo>, RpcError> {

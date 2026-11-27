@@ -5,7 +5,7 @@ use desktop_proto::{
     AppInfo, ClickMode, DisplayInfo, ElementAction, ErrorCode, FocusMode, ImageFormat, KeyCombo,
     Modifiers, MouseButton, PermissionsStatus, Point, ReadTextMode, ReadTextResult, Rect, RpcError,
     ScreenState, ScreenshotTarget, ScrollDirection, Snapshot, SnapshotParams, TextMethod, UiNode,
-    WindowInfo,
+    WindowInfo, best_matching_window, filter_windows_by_app,
 };
 
 use crate::backend::{
@@ -26,6 +26,11 @@ pub struct MockState {
     pub confirm_result: bool,
     pub actions_log: Vec<String>,
     pub open_app_calls: Vec<(String, FocusMode)>,
+    pub snapshot_calls: Vec<SnapshotParams>,
+    pub capture_calls: Vec<(ScreenshotTarget, bool)>,
+    pub extra_windows: Vec<WindowInfo>,
+    pub resolved_ref_app: Option<AppInfo>,
+    pub resolved_ref_window_id: Option<u32>,
     pub screenshot_bytes: Vec<u8>,
     pub snapshot_seq: u64,
     pub focused: Option<AppInfo>,
@@ -88,6 +93,34 @@ fn sample_app() -> AppInfo {
         pid: Some(1234),
         path: Some("/System/Applications/Notes.app".into()),
         running: true,
+    }
+}
+
+fn sample_window() -> WindowInfo {
+    WindowInfo {
+        id: 101,
+        title: "Project Plan".into(),
+        app: sample_app(),
+        bounds: Rect {
+            x: 100.0,
+            y: 80.0,
+            width: 800.0,
+            height: 600.0,
+        },
+        layer: 0,
+        alpha: 1.0,
+        focused: true,
+        minimized: false,
+        on_screen: true,
+        display_index: Some(0),
+    }
+}
+
+impl MockBackend {
+    fn all_windows(&self) -> Vec<WindowInfo> {
+        let mut wins = vec![sample_window()];
+        wins.extend(self.state.lock().unwrap().extra_windows.iter().cloned());
+        wins
     }
 }
 
@@ -179,29 +212,11 @@ impl PlatformBackend for MockBackend {
     }
 
     fn windows(&self, app_filter: Option<&str>) -> Result<Vec<WindowInfo>, RpcError> {
-        let app = sample_app();
-        if let Some(q) = app_filter
-            && !app.matches_query(q)
-        {
-            return Ok(vec![]);
+        let wins = self.all_windows();
+        if let Some(q) = app_filter {
+            return Ok(filter_windows_by_app(wins, q));
         }
-        Ok(vec![WindowInfo {
-            id: 101,
-            title: "Project Plan".into(),
-            app,
-            bounds: Rect {
-                x: 100.0,
-                y: 80.0,
-                width: 800.0,
-                height: 600.0,
-            },
-            layer: 0,
-            alpha: 1.0,
-            focused: true,
-            minimized: false,
-            on_screen: true,
-            display_index: Some(0),
-        }])
+        Ok(wins)
     }
 
     fn focused_app(&self) -> Result<Option<AppInfo>, RpcError> {
@@ -213,9 +228,12 @@ impl PlatformBackend for MockBackend {
     }
 
     fn find_app(&self, query: &str) -> Result<Option<AppInfo>, RpcError> {
-        let app = sample_app();
-        if app.matches_query(query) {
-            return Ok(Some(app));
+        if query.trim().is_empty() {
+            return Ok(None);
+        }
+        let wins = self.all_windows();
+        if let Some(win) = best_matching_window(&wins, query) {
+            return Ok(Some(win.app.clone()));
         }
         Ok(Some(AppInfo {
             name: query.into(),
@@ -227,16 +245,21 @@ impl PlatformBackend for MockBackend {
     }
 
     fn open_app(&self, app: &str, focus_mode: FocusMode) -> Result<AppInfo, RpcError> {
+        let matched = self
+            .all_windows()
+            .into_iter()
+            .find(|w| w.app.matches_query(app))
+            .map(|w| w.app);
         let mut st = self.state.lock().unwrap();
         st.open_app_calls.push((app.to_string(), focus_mode));
         st.actions_log.push(format!("open:{app}:{focus_mode:?}"));
-        Ok(AppInfo {
+        Ok(matched.unwrap_or(AppInfo {
             name: app.into(),
             bundle_id: None,
             pid: Some(999),
             path: None,
             running: true,
-        })
+        }))
     }
 
     fn focus_window(&self, window_id: u32) -> Result<WindowInfo, RpcError> {
@@ -245,6 +268,9 @@ impl PlatformBackend for MockBackend {
             .unwrap()
             .actions_log
             .push(format!("focus:{window_id}"));
+        if let Some(win) = self.all_windows().into_iter().find(|w| w.id == window_id) {
+            return Ok(win);
+        }
         Ok(WindowInfo {
             id: window_id,
             title: "Project Plan".into(),
@@ -266,15 +292,33 @@ impl PlatformBackend for MockBackend {
 
     fn snapshot(
         &self,
-        _params: &SnapshotParams,
+        params: &SnapshotParams,
         redact_passwords: bool,
     ) -> Result<Snapshot, RpcError> {
+        let all_wins = self.all_windows();
         let mut st = self.state.lock().unwrap();
+        st.snapshot_calls.push(params.clone());
         st.snapshot_seq += 1;
         let seq = st.snapshot_seq;
         let gone = st.ref_gone;
         drop(st);
 
+        let target_win = if let Some(wid) = params.window_id {
+            all_wins.into_iter().find(|w| w.id == wid).ok_or_else(|| {
+                RpcError::new(ErrorCode::NotFound, format!("window w{wid} not found"))
+            })?
+        } else if let Some(app_q) = params.app.as_deref() {
+            best_matching_window(&all_wins, app_q)
+                .cloned()
+                .ok_or_else(|| {
+                    RpcError::new(ErrorCode::NotFound, format!("app {app_q:?} not found"))
+                })?
+        } else {
+            sample_window()
+        };
+
+        let wx = target_win.bounds.x;
+        let wy = target_win.bounds.y;
         let mut children = vec![UiNode {
             ref_id: "@e2".into(),
             role: "textfield".into(),
@@ -287,8 +331,8 @@ impl PlatformBackend for MockBackend {
                 "hunter2".into()
             }),
             bounds: Some(Rect {
-                x: 120.0,
-                y: 120.0,
+                x: wx + 20.0,
+                y: wy + 40.0,
                 width: 200.0,
                 height: 28.0,
             }),
@@ -307,8 +351,8 @@ impl PlatformBackend for MockBackend {
                 label: None,
                 value: None,
                 bounds: Some(Rect {
-                    x: 340.0,
-                    y: 120.0,
+                    x: wx + 240.0,
+                    y: wy + 40.0,
                     width: 80.0,
                     height: 28.0,
                 }),
@@ -322,15 +366,10 @@ impl PlatformBackend for MockBackend {
 
         Ok(Snapshot {
             snapshot_id: format!("s{seq}"),
-            app: sample_app(),
-            window_id: Some(101),
-            window_title: Some("Project Plan".into()),
-            window_bounds: Some(Rect {
-                x: 100.0,
-                y: 80.0,
-                width: 800.0,
-                height: 600.0,
-            }),
+            app: target_win.app,
+            window_id: Some(target_win.id),
+            window_title: Some(target_win.title.clone()),
+            window_bounds: Some(target_win.bounds),
             truncated: false,
             total_nodes: children.len() + 1,
             emitted_nodes: children.len() + 1,
@@ -339,17 +378,12 @@ impl PlatformBackend for MockBackend {
                 ref_id: "@e1".into(),
                 role: "window".into(),
                 subrole: None,
-                title: Some("Project Plan".into()),
+                title: Some(target_win.title),
                 label: None,
                 value: None,
-                bounds: Some(Rect {
-                    x: 100.0,
-                    y: 80.0,
-                    width: 800.0,
-                    height: 600.0,
-                }),
+                bounds: Some(target_win.bounds),
                 enabled: true,
-                focused: true,
+                focused: target_win.focused,
                 selected: false,
                 actions: vec![],
                 children,
@@ -367,7 +401,8 @@ impl PlatformBackend for MockBackend {
         }
         Ok(ResolvedRef {
             ref_id: ref_id.into(),
-            app: sample_app(),
+            app: st.resolved_ref_app.clone().unwrap_or_else(sample_app),
+            window_id: st.resolved_ref_window_id.or(Some(101)),
             bounds: Some(Rect {
                 x: 340.0,
                 y: 120.0,
@@ -380,12 +415,34 @@ impl PlatformBackend for MockBackend {
 
     fn capture(
         &self,
-        _target: &ScreenshotTarget,
+        target: &ScreenshotTarget,
         format: ImageFormat,
-        _annotate: &[AnnotateBox],
+        annotate: &[AnnotateBox],
         _focus_mode: FocusMode,
     ) -> Result<RawScreenshot, RpcError> {
-        let bytes = self.state.lock().unwrap().screenshot_bytes.clone();
+        let all_wins = self.all_windows();
+        let mut st = self.state.lock().unwrap();
+        st.capture_calls
+            .push((target.clone(), !annotate.is_empty()));
+        let bytes = st.screenshot_bytes.clone();
+        drop(st);
+        match target {
+            ScreenshotTarget::Window { window_id }
+                if !all_wins.iter().any(|w| w.id == *window_id) =>
+            {
+                return Err(RpcError::new(
+                    ErrorCode::NotFound,
+                    format!("window w{window_id} not found"),
+                ));
+            }
+            ScreenshotTarget::App { app } if best_matching_window(&all_wins, app).is_none() => {
+                return Err(RpcError::new(
+                    ErrorCode::NotFound,
+                    format!("no visible window found for app {app:?}"),
+                ));
+            }
+            _ => {}
+        }
         Ok(RawScreenshot {
             width: 1440,
             height: 900,
@@ -1764,5 +1821,454 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn act_background_open_app_targets_opened_app_and_falls_back_when_no_window() {
+        let (engine, backend, _, _tmp) = make_engine();
+        let calc_app = AppInfo {
+            name: "Calculator".into(),
+            bundle_id: Some("com.apple.calculator".into()),
+            pid: Some(2020),
+            path: Some("/System/Applications/Calculator.app".into()),
+            running: true,
+        };
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .extra_windows
+            .push(WindowInfo {
+                id: 202,
+                title: "Calculator".into(),
+                app: calc_app.clone(),
+                bounds: Rect {
+                    x: 400.0,
+                    y: 200.0,
+                    width: 300.0,
+                    height: 400.0,
+                },
+                layer: 0,
+                alpha: 1.0,
+                focused: false,
+                minimized: false,
+                on_screen: true,
+                display_index: Some(0),
+            });
+
+        // 1. Background open_app("Calculator") + sleep + after=Snapshot must snapshot Calculator,
+        //    NOT the frontmost Notes app.
+        let act_snap = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![
+                        ActionStep::OpenApp {
+                            app: "Calculator".into(),
+                        },
+                        ActionStep::Sleep { ms: 1 },
+                    ],
+                    after: PostAction::Snapshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Background,
+                    release_after: false,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        let snap = act_snap.snapshot.expect("post-action snapshot returned");
+        assert_eq!(snap.app.name, "Calculator");
+        assert_eq!(snap.window_id, Some(202));
+        assert_eq!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .snapshot_calls
+                .last()
+                .and_then(|p| p.app.as_deref()),
+            Some("com.apple.calculator")
+        );
+
+        // 2. Background open_app("Calculator") + after=Screenshot and after=Annotated capture Calculator.
+        let act_shot = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::OpenApp {
+                        app: "Calculator".into(),
+                    }],
+                    after: PostAction::Screenshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Background,
+                    release_after: false,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        assert!(act_shot.screenshot.is_some());
+        assert_eq!(
+            backend.state.lock().unwrap().capture_calls.last(),
+            Some(&(
+                ScreenshotTarget::App {
+                    app: "com.apple.calculator".into()
+                },
+                false
+            ))
+        );
+
+        let act_ann = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::OpenApp {
+                        app: "Calculator".into(),
+                    }],
+                    after: PostAction::Annotated,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Background,
+                    release_after: false,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        let ann_shot = act_ann.screenshot.expect("annotated screenshot returned");
+        assert!(ann_shot.snapshot_id.is_some());
+        assert_eq!(
+            backend.state.lock().unwrap().capture_calls.last(),
+            Some(&(
+                ScreenshotTarget::App {
+                    app: "com.apple.calculator".into()
+                },
+                true
+            ))
+        );
+
+        // 3. Opening an app that has no visible window yet falls back cleanly to frontmost (Notes).
+        let act_no_win = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::OpenApp {
+                        app: "NoWindowApp".into(),
+                    }],
+                    after: PostAction::Snapshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Background,
+                    release_after: false,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        let fallback_snap = act_no_win
+            .snapshot
+            .expect("graceful fallback snapshot when app has no window");
+        assert_eq!(fallback_snap.app.name, "Notes");
+        assert_eq!(fallback_snap.window_id, Some(101));
+
+        // 4. Menu Quit clears the tracked target so post-action snapshot falls back cleanly to Notes.
+        let act_quit = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![
+                        ActionStep::OpenApp {
+                            app: "Calculator".into(),
+                        },
+                        ActionStep::Menu {
+                            app: "Calculator".into(),
+                            path: vec!["Calculator".into(), "Quit Calculator".into()],
+                        },
+                    ],
+                    after: PostAction::Snapshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Background,
+                    release_after: false,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        let quit_snap = act_quit.snapshot.expect("fallback snapshot after quit");
+        assert_eq!(quit_snap.app.name, "Notes");
+        assert_eq!(quit_snap.window_id, Some(101));
+
+        // 5. FocusWindow and ref-targeted Click/SetText target the touched window_id (202).
+        let act_focus = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::FocusWindow { window_id: 202 }],
+                    after: PostAction::Snapshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Auto,
+                    release_after: false,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        let focus_snap = act_focus.snapshot.expect("focus_window post snapshot");
+        assert_eq!(focus_snap.app.name, "Calculator");
+        assert_eq!(focus_snap.window_id, Some(202));
+
+        {
+            let mut st = backend.state.lock().unwrap();
+            st.resolved_ref_app = Some(calc_app);
+            st.resolved_ref_window_id = Some(202);
+        }
+        let act_ref = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::Click {
+                        target: Target::Ref {
+                            ref_id: "@e3".into(),
+                        },
+                        button: MouseButton::Left,
+                        count: 1,
+                        modifiers: vec![],
+                        mode: ClickMode::Auto,
+                    }],
+                    after: PostAction::Snapshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Background,
+                    release_after: false,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        let ref_snap = act_ref.snapshot.expect("click ref post snapshot");
+        assert_eq!(ref_snap.app.name, "Calculator");
+        assert_eq!(ref_snap.window_id, Some(202));
+
+        // 6. FocusWindow on a window ID that disappears before post-action snapshot falls back gracefully.
+        let act_vanished = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::FocusWindow { window_id: 999 }],
+                    after: PostAction::Snapshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Auto,
+                    release_after: false,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        let vanished_snap = act_vanished
+            .snapshot
+            .expect("graceful fallback when targeted window disappears");
+        assert_eq!(vanished_snap.app.name, "Notes");
+        assert_eq!(vanished_snap.window_id, Some(101));
+    }
+
+    #[test]
+    fn list_windows_supports_prefix_substring_ranking_and_keeps_policy_strict() {
+        let (engine, backend, _, _tmp) = make_engine();
+        let t3_beta = AppInfo {
+            name: "T3 Code (Beta)".into(),
+            bundle_id: Some("com.t3tools.t3code".into()),
+            pid: Some(3001),
+            path: Some("/Applications/T3 Code (Beta).app".into()),
+            running: true,
+        };
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .extra_windows
+            .push(WindowInfo {
+                id: 301,
+                title: "agent-desktop".into(),
+                app: t3_beta.clone(),
+                bounds: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1200.0,
+                    height: 800.0,
+                },
+                layer: 0,
+                alpha: 1.0,
+                focused: false,
+                minimized: false,
+                on_screen: true,
+                display_index: Some(0),
+            });
+
+        // Substring / word-prefix lookup finds "T3 Code (Beta)" via app="T3 Code".
+        let wins = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::ListWindows(desktop_proto::ListWindowsParams {
+                    app: Some("T3 Code".into()),
+                    include_displays: false,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Windows { windows, .. } => windows,
+            _ => unreachable!(),
+        };
+        assert_eq!(wins.len(), 1);
+        assert_eq!(wins[0].id, 301);
+        assert_eq!(wins[0].app.name, "T3 Code (Beta)");
+
+        // Empty/whitespace query returns [].
+        let empty = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::ListWindows(desktop_proto::ListWindowsParams {
+                    app: Some("   ".into()),
+                    include_displays: false,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Windows { windows, .. } => windows,
+            _ => unreachable!(),
+        };
+        assert!(empty.is_empty());
+
+        // When an exact "T3 Code" window also exists, exact is preferred over word-prefix.
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .extra_windows
+            .push(WindowInfo {
+                id: 302,
+                title: "Stable".into(),
+                app: AppInfo {
+                    name: "T3 Code".into(),
+                    bundle_id: Some("com.t3tools.t3code.stable".into()),
+                    pid: Some(3002),
+                    path: Some("/Applications/T3 Code.app".into()),
+                    running: true,
+                },
+                bounds: Rect {
+                    x: 10.0,
+                    y: 10.0,
+                    width: 1200.0,
+                    height: 800.0,
+                },
+                layer: 0,
+                alpha: 1.0,
+                focused: false,
+                minimized: false,
+                on_screen: true,
+                display_index: Some(0),
+            });
+        let exact_wins = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::ListWindows(desktop_proto::ListWindowsParams {
+                    app: Some("T3 Code".into()),
+                    include_displays: false,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Windows { windows, .. } => windows,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            exact_wins.iter().map(|w| w.id).collect::<Vec<_>>(),
+            vec![302]
+        );
+
+        // Policy deny_apps = ["Code"] must NOT block "T3 Code (Beta)" (policy stays exact-only).
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::PolicySet(PolicyConfig {
+                    mode: PolicyMode::Open,
+                    deny_apps: vec!["Code".into()],
+                    ..PolicyConfig::default()
+                }),
+            )
+            .unwrap();
+        let snap_allowed = engine.handle(
+            Some(1),
+            None,
+            Some("agent"),
+            RpcMethod::Snapshot(SnapshotParams {
+                window_id: Some(301),
+                ..SnapshotParams::default()
+            }),
+        );
+        assert!(snap_allowed.is_ok());
+
+        // Exact bundle_id in deny_apps DOES block "T3 Code (Beta)".
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::PolicySet(PolicyConfig {
+                    mode: PolicyMode::Open,
+                    deny_apps: vec!["com.t3tools.t3code".into()],
+                    ..PolicyConfig::default()
+                }),
+            )
+            .unwrap();
+        let snap_denied = engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::Snapshot(SnapshotParams {
+                    window_id: Some(301),
+                    ..SnapshotParams::default()
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(snap_denied.code, ErrorCode::PolicyDenied);
     }
 }

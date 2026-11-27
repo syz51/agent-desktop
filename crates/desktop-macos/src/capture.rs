@@ -156,13 +156,17 @@ pub fn capture(
         }
         ScreenshotTarget::App { app } => {
             let wins = windows::windows(Some(app))?;
-            let first = wins.first().ok_or_else(|| {
-                RpcError::with_next(
-                    ErrorCode::NotFound,
-                    format!("no visible window found for app {app:?}"),
-                    "Open the app or call list_windows to inspect available windows.",
-                )
-            })?;
+            let first = wins
+                .iter()
+                .find(|w| w.layer == 0)
+                .or_else(|| wins.first())
+                .ok_or_else(|| {
+                    RpcError::with_next(
+                        ErrorCode::NotFound,
+                        format!("no visible window found for app {app:?}"),
+                        "Open the app or call list_windows to inspect available windows.",
+                    )
+                })?;
             let plan = capture_window_filter(&content, &displays, first.id, focus_mode)?;
             (
                 plan.filter,

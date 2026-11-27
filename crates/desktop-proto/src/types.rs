@@ -121,6 +121,32 @@ pub struct AppInfo {
     pub running: bool,
 }
 
+/// Specificity rank returned by [`AppInfo::match_rank`].
+///
+/// Higher variants represent tighter matches so lookup helpers such as `find_app` and
+/// `list_windows` prefer exact matches over word-prefix matches and general substrings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AppMatchRank {
+    /// Case-insensitive substring match against the app name or `.app` bundle stem.
+    Substring = 1,
+    /// Case-insensitive word-boundary prefix match against the app name or `.app` bundle stem
+    /// (e.g. `"T3 Code"` matching `"T3 Code (Beta)"`).
+    WordPrefix = 2,
+    /// Exact case-insensitive match on app name, `.app` bundle stem, exact bundle ID,
+    /// or explicit trailing-dot bundle ID prefix (e.g. `"com.apple."`).
+    Exact = 3,
+}
+
+fn is_word_prefix(haystack: &str, needle: &str) -> bool {
+    let Some(rest) = haystack.strip_prefix(needle) else {
+        return false;
+    };
+    match rest.chars().next() {
+        None => true,
+        Some(next) => !next.is_alphanumeric(),
+    }
+}
+
 impl AppInfo {
     #[must_use]
     pub fn canonical_key(&self) -> String {
@@ -131,36 +157,133 @@ impl AppInfo {
             .to_ascii_lowercase()
     }
 
+    /// Rank how closely this app matches a caller-supplied lookup query.
+    ///
+    /// Returns `None` for empty, whitespace-only, bare `.app`, or dot-only queries.
+    /// Trailing-dot queries (e.g. `"com.apple."`) match `bundle_id` prefixes only.
+    #[must_use]
+    pub fn match_rank(&self, query: &str) -> Option<AppMatchRank> {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return None;
+        }
+        if q.ends_with('.') {
+            if q.trim_end_matches('.').is_empty() {
+                return None;
+            }
+            return self
+                .bundle_id
+                .as_deref()
+                .is_some_and(|bid| bid.to_lowercase().starts_with(&q))
+                .then_some(AppMatchRank::Exact);
+        }
+
+        let q_no_ext = q.strip_suffix(".app").unwrap_or(&q).trim();
+        if q_no_ext.is_empty() {
+            return None;
+        }
+
+        let name_lc = self.name.to_lowercase();
+        let stem_lc = self
+            .path
+            .as_deref()
+            .and_then(|path| std::path::Path::new(path).file_stem())
+            .and_then(|s| s.to_str())
+            .map(str::to_lowercase);
+
+        // 1. Exact match: name, bundle_id, or non-localized `.app` bundle stem.
+        if name_lc == q || name_lc == q_no_ext {
+            return Some(AppMatchRank::Exact);
+        }
+        if self
+            .bundle_id
+            .as_deref()
+            .is_some_and(|bid| bid.to_lowercase() == q)
+        {
+            return Some(AppMatchRank::Exact);
+        }
+        if stem_lc.as_deref() == Some(q_no_ext) {
+            return Some(AppMatchRank::Exact);
+        }
+
+        // 2. Word-boundary prefix match (e.g. "T3 Code" -> "T3 Code (Beta)").
+        if is_word_prefix(&name_lc, q_no_ext)
+            || stem_lc
+                .as_deref()
+                .is_some_and(|stem| is_word_prefix(stem, q_no_ext))
+        {
+            return Some(AppMatchRank::WordPrefix);
+        }
+
+        // 3. Case-insensitive substring match on name or `.app` bundle stem.
+        if name_lc.contains(q_no_ext)
+            || stem_lc
+                .as_deref()
+                .is_some_and(|stem| stem.contains(q_no_ext))
+        {
+            return Some(AppMatchRank::Substring);
+        }
+
+        None
+    }
+
+    /// Ergonomic lookup matching for `list_windows`, `find_app`, `snapshot(app=...)`, etc.
+    ///
+    /// Matches exact name, bundle ID, `.app` stem, trailing-dot bundle prefix,
+    /// word-prefix, and case-insensitive substring while rejecting empty/whitespace queries.
     #[must_use]
     pub fn matches_query(&self, query: &str) -> bool {
-        let q = query.trim().to_ascii_lowercase();
-        if q.is_empty() {
-            return false;
-        }
-        let q_no_ext = q.strip_suffix(".app").unwrap_or(&q);
-        if self.name.to_ascii_lowercase() == q || self.name.to_ascii_lowercase() == q_no_ext {
-            return true;
-        }
-        if let Some(bid) = &self.bundle_id {
-            let b = bid.to_ascii_lowercase();
-            if q.ends_with('.') {
-                return b.starts_with(&q);
-            }
-            if b == q {
-                return true;
-            }
-        }
-        // Match the non-localized `.app` bundle stem (e.g. "Finder" when localizedName is "访达").
-        if let Some(path) = &self.path
-            && let Some(file_name) = std::path::Path::new(path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-            && file_name.to_ascii_lowercase() == q_no_ext
-        {
-            return true;
-        }
-        false
+        self.match_rank(query).is_some()
     }
+
+    /// Strict policy/scope matching for `deny_apps`, `confirm_apps`, and `session_start(apps=...)`.
+    ///
+    /// Only matches exact app name, exact `.app` bundle stem, exact bundle ID, or an explicit
+    /// trailing-dot bundle ID prefix (e.g. `"com.apple."`), avoiding unintended substring matches.
+    #[must_use]
+    pub fn matches_policy_rule(&self, rule: &str) -> bool {
+        self.match_rank(rule) == Some(AppMatchRank::Exact)
+    }
+}
+
+/// Filter and rank windows against an app query.
+///
+/// If any window matches with [`AppMatchRank::Exact`], only exact matches are returned
+/// (preserving original z-order). Otherwise all matching windows are returned ordered by
+/// specificity (`WordPrefix` before `Substring`), preserving original z-order within each rank.
+#[must_use]
+pub fn filter_windows_by_app(windows: Vec<WindowInfo>, query: &str) -> Vec<WindowInfo> {
+    let mut ranked: Vec<(AppMatchRank, WindowInfo)> = windows
+        .into_iter()
+        .filter_map(|w| w.app.match_rank(query).map(|rank| (rank, w)))
+        .collect();
+    if ranked.iter().any(|(rank, _)| *rank == AppMatchRank::Exact) {
+        ranked.retain(|(rank, _)| *rank == AppMatchRank::Exact);
+    } else {
+        ranked.sort_by(|(a, _), (b, _)| b.cmp(a));
+    }
+    ranked.into_iter().map(|(_, w)| w).collect()
+}
+
+/// Pick the best single window matching an app query, preferring higher [`AppMatchRank`],
+/// normal `layer == 0` windows, and earlier z-order on ties.
+#[must_use]
+pub fn best_matching_window<'a>(windows: &'a [WindowInfo], query: &str) -> Option<&'a WindowInfo> {
+    let mut best: Option<(AppMatchRank, bool, &'a WindowInfo)> = None;
+    for w in windows {
+        let Some(rank) = w.app.match_rank(query) else {
+            continue;
+        };
+        let is_normal_layer = w.layer == 0;
+        let better = match best {
+            None => true,
+            Some((best_rank, best_normal, _)) => (rank, is_normal_layer) > (best_rank, best_normal),
+        };
+        if better {
+            best = Some((rank, is_normal_layer, w));
+        }
+    }
+    best.map(|(_, _, w)| w)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -843,6 +966,134 @@ mod tests {
         assert!(finder.matches_query("com.apple.finder"));
         assert!(finder.matches_query("com.apple."));
         assert!(!finder.matches_query("Safari"));
+        assert!(finder.matches_policy_rule("Finder"));
+        assert!(finder.matches_policy_rule("com.apple.finder"));
+        assert!(finder.matches_policy_rule("com.apple."));
+    }
+
+    #[test]
+    fn app_info_ranks_exact_prefix_substring_and_keeps_policy_strict() {
+        let t3_beta = AppInfo {
+            name: "T3 Code (Beta)".into(),
+            bundle_id: Some("com.t3tools.t3code".into()),
+            pid: Some(42),
+            path: Some("/Applications/T3 Code (Beta).app".into()),
+            running: true,
+        };
+        let t3_exact = AppInfo {
+            name: "T3 Code".into(),
+            bundle_id: Some("com.t3tools.t3code.release".into()),
+            pid: Some(43),
+            path: Some("/Applications/T3 Code.app".into()),
+            running: true,
+        };
+        let other_code = AppInfo {
+            name: "My T3 Code Helper".into(),
+            bundle_id: Some("com.example.helper".into()),
+            pid: Some(44),
+            path: None,
+            running: true,
+        };
+
+        // Lookup matching: exact > word-prefix > substring.
+        assert_eq!(t3_exact.match_rank("T3 Code"), Some(AppMatchRank::Exact));
+        assert_eq!(
+            t3_beta.match_rank("T3 Code"),
+            Some(AppMatchRank::WordPrefix)
+        );
+        assert_eq!(
+            t3_beta.match_rank("t3 code"),
+            Some(AppMatchRank::WordPrefix)
+        );
+        assert_eq!(
+            other_code.match_rank("T3 Code"),
+            Some(AppMatchRank::Substring)
+        );
+        assert_eq!(t3_beta.match_rank("Code"), Some(AppMatchRank::Substring));
+        assert_eq!(
+            t3_beta.match_rank("com.t3tools.t3code"),
+            Some(AppMatchRank::Exact)
+        );
+        assert!(t3_beta.matches_query("T3 Code"));
+        assert!(t3_beta.matches_query("Code"));
+
+        // Policy rules stay exact-only (no unintended substring denials or scope leaks).
+        assert!(t3_beta.matches_policy_rule("T3 Code (Beta)"));
+        assert!(t3_beta.matches_policy_rule("com.t3tools.t3code"));
+        assert!(t3_beta.matches_policy_rule("com.t3tools."));
+        assert!(!t3_beta.matches_policy_rule("T3 Code"));
+        assert!(!t3_beta.matches_policy_rule("Code"));
+
+        // Empty, whitespace, bare `.app`, and dot-only queries must never match.
+        for bad in ["", "   ", ".app", "  .app ", ".", "..."] {
+            assert_eq!(
+                t3_beta.match_rank(bad),
+                None,
+                "query {bad:?} must not match"
+            );
+            assert!(!t3_beta.matches_query(bad));
+            assert!(!t3_beta.matches_policy_rule(bad));
+        }
+        // Trailing-dot bundle prefix queries do not fall back to substring name matching.
+        assert_eq!(t3_beta.match_rank("com.apple."), None);
+
+        // Window filtering prefers exact over word-prefix over substring.
+        let make_win = |id: u32, app: AppInfo, layer: i32| WindowInfo {
+            id,
+            title: app.name.clone(),
+            app,
+            bounds: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            },
+            layer,
+            alpha: 1.0,
+            focused: false,
+            minimized: false,
+            on_screen: true,
+            display_index: Some(0),
+        };
+
+        // When no exact match exists, WordPrefix comes before Substring.
+        let no_exact = filter_windows_by_app(
+            vec![
+                make_win(1, other_code.clone(), 0),
+                make_win(2, t3_beta.clone(), 0),
+            ],
+            "T3 Code",
+        );
+        assert_eq!(
+            no_exact.iter().map(|w| w.id).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+
+        // When an exact match exists, exact wins exclusively.
+        let with_exact = filter_windows_by_app(
+            vec![
+                make_win(1, other_code.clone(), 0),
+                make_win(2, t3_beta.clone(), 0),
+                make_win(3, t3_exact.clone(), 0),
+            ],
+            "T3 Code",
+        );
+        assert_eq!(with_exact.iter().map(|w| w.id).collect::<Vec<_>>(), vec![3]);
+
+        // Empty query returns no windows.
+        assert!(filter_windows_by_app(vec![make_win(2, t3_beta.clone(), 0)], "   ").is_empty());
+
+        // `best_matching_window` prefers higher rank and normal `layer == 0` windows.
+        let wins = vec![
+            make_win(10, t3_beta.clone(), 25),
+            make_win(11, t3_beta.clone(), 0),
+            make_win(12, other_code, 0),
+        ];
+        assert_eq!(
+            best_matching_window(&wins, "T3 Code").map(|w| w.id),
+            Some(11)
+        );
+        assert_eq!(best_matching_window(&wins, ""), None);
     }
 
     #[test]

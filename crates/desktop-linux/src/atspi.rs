@@ -8,8 +8,8 @@ use desktop_core::tree::{
     is_decorative_container,
 };
 use desktop_proto::{
-    AppInfo, ElementAction, ErrorCode, ReadTextMode, ReadTextResult, Rect, RpcError, Snapshot,
-    SnapshotParams, UiNode, WindowInfo, sanitize_text,
+    AppInfo, AppMatchRank, ElementAction, ErrorCode, ReadTextMode, ReadTextResult, Rect, RpcError,
+    Snapshot, SnapshotParams, UiNode, WindowInfo, best_matching_window, sanitize_text,
 };
 use uuid::Uuid;
 use zbus::connection::Builder as ConnBuilder;
@@ -36,6 +36,7 @@ pub struct AtSpiRefEntry {
     pub bus_name: String,
     pub object_path: String,
     pub app: AppInfo,
+    pub window_id: Option<u32>,
     pub bounds: Option<Rect>,
     pub actions: Vec<ElementAction>,
     pub is_password: bool,
@@ -74,6 +75,7 @@ impl LinuxRefStore {
         Ok(ResolvedRef {
             ref_id: entry.ref_id,
             app: entry.app,
+            window_id: entry.window_id,
             bounds: entry.bounds,
             actions: entry.actions,
         })
@@ -191,7 +193,7 @@ pub fn take_atspi_snapshot(
                     root_entry.object_path,
                     root_entry.app,
                     None,
-                    win_hint.as_ref().map(|w| w.id),
+                    win_hint.as_ref().map(|w| w.id).or(root_entry.window_id),
                 )
             } else {
                 match find_atspi_target(&conn, app_filter.as_deref(), win_hint.as_ref()).await? {
@@ -356,6 +358,7 @@ pub fn take_atspi_snapshot(
                 bus_name: bus.clone(),
                 object_path: path.clone(),
                 app: app_info.clone(),
+                window_id,
                 bounds,
                 actions: actions.clone(),
                 is_password,
@@ -448,7 +451,7 @@ pub fn fallback_window_snapshot(
             params
                 .app
                 .as_deref()
-                .and_then(|q| windows.iter().find(|w| w.app.matches_query(q)))
+                .and_then(|q| best_matching_window(windows, q))
         })
         .or_else(|| windows.iter().find(|w| w.focused))
         .or_else(|| windows.first());
@@ -461,6 +464,7 @@ pub fn fallback_window_snapshot(
                 bus_name: String::new(),
                 object_path: String::new(),
                 app: w.app.clone(),
+                window_id: Some(w.id),
                 bounds: Some(w.bounds),
                 actions: vec![ElementAction::Press],
                 is_password: false,
@@ -502,6 +506,7 @@ pub fn fallback_window_snapshot(
                 bus_name: String::new(),
                 object_path: String::new(),
                 app: app.clone(),
+                window_id: None,
                 bounds: None,
                 actions: Vec::new(),
                 is_password: false,
@@ -749,28 +754,72 @@ async fn find_atspi_target(
         return Ok(None);
     }
 
-    let filter_lc = app_filter
-        .map(|s| s.trim().to_ascii_lowercase())
-        .or_else(|| win_hint.map(|w| w.app.name.to_ascii_lowercase()));
+    if let Some(explicit) = app_filter
+        && explicit.trim().is_empty()
+    {
+        return Err(RpcError::with_next(
+            ErrorCode::NotFound,
+            format!("no accessible AT-SPI2 application matching {explicit:?}"),
+            "Open the application or call list_windows to inspect available apps.",
+        ));
+    }
 
-    let mut chosen: Option<(String, String, String)> = None;
+    let mut chosen: Option<(AppMatchRank, String, String, String)> = None;
     for (bus, path) in &apps {
         let Ok(p) = uncached_proxy(conn, bus, path, "org.a11y.atspi.Accessible").await else {
             continue;
         };
         let name: String = p.get_property("Name").await.unwrap_or_default();
-        if let Some(f) = &filter_lc {
-            if name.to_ascii_lowercase().contains(f) {
-                chosen = Some((bus.clone(), path.clone(), name));
-                break;
+        if let Some(explicit) = app_filter {
+            let probe = AppInfo {
+                name: name.clone(),
+                bundle_id: None,
+                pid: None,
+                path: None,
+                running: true,
+            };
+            let rank = probe.match_rank(explicit).or_else(|| {
+                win_hint
+                    .map(|w| w.app.name.as_str())
+                    .and_then(|hint_name| probe.match_rank(hint_name))
+            });
+            if let Some(rank) = rank {
+                let better = chosen
+                    .as_ref()
+                    .is_none_or(|(best_rank, _, _, _)| rank > *best_rank);
+                if better {
+                    chosen = Some((rank, bus.clone(), path.clone(), name));
+                    if rank == AppMatchRank::Exact {
+                        break;
+                    }
+                }
+            }
+        } else if let Some(hint) = win_hint {
+            let probe = AppInfo {
+                name: name.clone(),
+                bundle_id: None,
+                pid: None,
+                path: None,
+                running: true,
+            };
+            if let Some(rank) = probe.match_rank(&hint.app.name) {
+                let better = chosen
+                    .as_ref()
+                    .is_none_or(|(best_rank, _, _, _)| rank > *best_rank);
+                if better {
+                    chosen = Some((rank, bus.clone(), path.clone(), name));
+                    if rank == AppMatchRank::Exact {
+                        break;
+                    }
+                }
             }
         } else if !name.is_empty() {
-            chosen = Some((bus.clone(), path.clone(), name));
+            chosen = Some((AppMatchRank::Exact, bus.clone(), path.clone(), name));
             break;
         }
     }
 
-    let Some((app_bus, app_path, app_name)) = chosen else {
+    let Some((_, app_bus, app_path, app_name)) = chosen else {
         if let Some(explicit) = app_filter {
             return Err(RpcError::with_next(
                 ErrorCode::NotFound,
