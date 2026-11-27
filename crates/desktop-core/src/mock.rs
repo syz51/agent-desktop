@@ -8,13 +8,19 @@ use desktop_proto::{
     WindowInfo,
 };
 
-use crate::backend::{AnnotateBox, PlatformBackend, RawScreenshot, ResolvedRef, StepExecInfo};
+use crate::backend::{
+    AnnotateBox, PlatformBackend, RawScreenshot, ResolvedRef, StepExecInfo, Timestamp,
+};
+use crate::clock::{Clock, SystemClock};
+use crate::kill_switch::EscKillSwitch;
 
 #[derive(Debug, Default)]
 pub struct MockState {
     pub screen_state: Option<ScreenState>,
     pub permissions: Option<PermissionsStatus>,
     pub overlay_history: Vec<Option<String>>,
+    pub control_active: bool,
+    pub control_active_history: Vec<bool>,
     pub display_awake: bool,
     pub woke_count: usize,
     pub confirm_result: bool,
@@ -24,10 +30,13 @@ pub struct MockState {
     pub focused: Option<AppInfo>,
     pub ref_requires_focus: bool,
     pub ref_gone: bool,
+    pub stop_during_drag: bool,
 }
 
 pub struct MockBackend {
     pub stop: Arc<AtomicBool>,
+    pub control_active_flag: Arc<AtomicBool>,
+    pub kill_switch: Arc<EscKillSwitch>,
     pub state: Mutex<MockState>,
 }
 
@@ -40,8 +49,22 @@ impl Default for MockBackend {
 impl MockBackend {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_clock(Arc::new(SystemClock))
+    }
+
+    #[must_use]
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let control_active_flag = Arc::new(AtomicBool::new(false));
+        let kill_switch = Arc::new(EscKillSwitch::with_clock(
+            Arc::clone(&stop),
+            Arc::clone(&control_active_flag),
+            clock,
+        ));
         Self {
-            stop: Arc::new(AtomicBool::new(false)),
+            stop,
+            control_active_flag,
+            kill_switch,
             state: Mutex::new(MockState {
                 screen_state: Some(ScreenState::Unlocked),
                 permissions: Some(PermissionsStatus {
@@ -118,12 +141,23 @@ impl PlatformBackend for MockBackend {
             .push(text.map(str::to_string));
     }
 
+    fn set_control_active(&self, active: bool) {
+        self.kill_switch.set_control_active(active);
+        let mut st = self.state.lock().unwrap();
+        st.control_active = active;
+        st.control_active_history.push(active);
+    }
+
     fn confirm_dialog(&self, _title: &str, _message: &str) -> Result<bool, RpcError> {
         Ok(self.state.lock().unwrap().confirm_result)
     }
 
     fn stop_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.stop)
+    }
+
+    fn take_stop_triggered_at(&self) -> Option<Timestamp> {
+        self.kill_switch.take_triggered_at()
     }
 
     fn displays(&self) -> Result<Vec<DisplayInfo>, RpcError> {
@@ -430,6 +464,9 @@ impl PlatformBackend for MockBackend {
         _mods: Modifiers,
         _focus_mode: FocusMode,
     ) -> Result<StepExecInfo, RpcError> {
+        if self.state.lock().unwrap().stop_during_drag {
+            self.stop.store(true, Ordering::Release);
+        }
         if self.stop.load(Ordering::Acquire) {
             return Err(RpcError::new(ErrorCode::StoppedByUser, "stopped"));
         }
@@ -539,8 +576,8 @@ mod tests {
 
     fn make_engine() -> (DesktopEngine, Arc<MockBackend>, Arc<MockClock>, TempDir) {
         let tmp = TempDir::new().unwrap();
-        let backend = Arc::new(MockBackend::new());
         let clock = Arc::new(MockClock::new(Utc::now()));
+        let backend = Arc::new(MockBackend::with_clock(clock.clone()));
         let policy = PolicyStore::new(tmp.path().join("policy.toml"));
         let audit = AuditLog::new(tmp.path());
         let engine = DesktopEngine::new(backend.clone(), clock.clone(), policy, audit);
@@ -924,5 +961,425 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::PolicyDenied);
+    }
+
+    fn key_act(combo: &str) -> RpcMethod {
+        RpcMethod::Act(ActParams {
+            steps: vec![ActionStep::Key {
+                combo: combo.into(),
+                repeat: 1,
+            }],
+            after: PostAction::None,
+            expect_snapshot: None,
+            focus_mode: FocusMode::Auto,
+        })
+    }
+
+    #[test]
+    fn stale_idle_esc_does_not_poison_next_auto_start() {
+        let (engine, backend, _, _tmp) = make_engine();
+        let t0 = std::time::Instant::now();
+
+        // Physical double-Esc while completely idle must not latch stop_flag.
+        assert!(!backend.kill_switch.on_physical_esc_at(t0));
+        assert!(
+            !backend
+                .kill_switch
+                .on_physical_esc_at(t0 + std::time::Duration::from_millis(100))
+        );
+        assert!(!backend.stop.load(Ordering::Acquire));
+
+        // Even if stop_flag was somehow latched while idle (no active lease and no explicit
+        // stop cooldown), auto-starting a brand-new lease in Open mode clears it and succeeds.
+        backend.stop.store(true, Ordering::Release);
+        let res = engine
+            .handle(Some(1), None, Some("agent"), key_act("Return"))
+            .unwrap();
+        assert!(matches!(res, RpcResult::Act(r) if r.completed == 1));
+        assert!(!backend.stop.load(Ordering::Acquire));
+        assert!(backend.state.lock().unwrap().control_active);
+    }
+
+    #[test]
+    fn read_only_calls_do_not_arm_kill_switch_or_trip_on_idle_esc() {
+        use desktop_proto::{ListWindowsParams, ReadTextParams};
+
+        let (engine, backend, _, _tmp) = make_engine();
+        let t0 = std::time::Instant::now();
+
+        // All read-only observation calls run without arming control_active or showing the pill.
+        assert!(
+            engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("observer"),
+                    RpcMethod::ListWindows(ListWindowsParams::default()),
+                )
+                .is_ok()
+        );
+        assert!(
+            engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("observer"),
+                    RpcMethod::Snapshot(SnapshotParams::default()),
+                )
+                .is_ok()
+        );
+        assert!(!backend.state.lock().unwrap().control_active);
+        assert!(!backend.kill_switch.is_control_active());
+        assert!(backend.state.lock().unwrap().overlay_history.is_empty());
+
+        // Normal user Esc presses (even rapid double-Esc) while an agent is merely observing
+        // must not latch stop_flag or abort find/screenshot/read_text.
+        assert!(!backend.kill_switch.on_physical_esc_at(t0));
+        assert!(
+            !backend
+                .kill_switch
+                .on_physical_esc_at(t0 + std::time::Duration::from_millis(120))
+        );
+        assert!(!backend.stop.load(Ordering::Acquire));
+
+        // Even a stray latched stop_flag does not fail read-only calls while unarmed.
+        backend.stop.store(true, Ordering::Release);
+        assert!(
+            engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("observer"),
+                    RpcMethod::Find(FindParams {
+                        query: "Save".into(),
+                        role: Some("button".into()),
+                        app: None,
+                        window_id: None,
+                        limit: 5,
+                    }),
+                )
+                .is_ok()
+        );
+        assert!(
+            engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("observer"),
+                    RpcMethod::Screenshot(ScreenshotParams::default()),
+                )
+                .is_ok()
+        );
+        assert!(
+            engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("observer"),
+                    RpcMethod::ReadText(ReadTextParams::default()),
+                )
+                .is_ok()
+        );
+        assert!(!backend.state.lock().unwrap().control_active);
+        assert!(backend.state.lock().unwrap().overlay_history.is_empty());
+
+        // Upgrading the same client to a mutating `act` clears the stray flag, arms the
+        // kill-switch, and displays the Stop overlay.
+        assert!(
+            engine
+                .handle(Some(1), None, Some("observer"), key_act("Return"))
+                .is_ok()
+        );
+        assert!(backend.state.lock().unwrap().control_active);
+        assert!(backend.kill_switch.is_control_active());
+        assert!(matches!(
+            backend.state.lock().unwrap().overlay_history.last(),
+            Some(Some(label)) if label.contains("observer controls: desktop")
+        ));
+    }
+
+    #[test]
+    fn single_esc_ignored_and_double_esc_within_450ms_stops_active_lease() {
+        let (engine, backend, _, _tmp) = make_engine();
+        let t0 = std::time::Instant::now();
+
+        // Auto-start a mutating control lease.
+        engine
+            .handle(Some(1), None, Some("driver"), key_act("a"))
+            .unwrap();
+        assert!(backend.kill_switch.is_control_active());
+
+        // Single Esc is ignored; session continues working.
+        assert!(!backend.kill_switch.on_physical_esc_at(t0));
+        engine
+            .handle(Some(1), None, Some("driver"), key_act("b"))
+            .unwrap();
+
+        // Second Esc outside 450 ms (451 ms) does not trigger; starts a new window.
+        let t1 = t0 + std::time::Duration::from_millis(451);
+        assert!(!backend.kill_switch.on_physical_esc_at(t1));
+        engine
+            .handle(Some(1), None, Some("driver"), key_act("c"))
+            .unwrap();
+
+        // Deliberate double-Esc within 450 ms of t1 latches stop_flag and disarms kill-switch.
+        let t2 = t1 + std::time::Duration::from_millis(300);
+        assert!(backend.kill_switch.on_physical_esc_at(t2));
+        assert!(backend.stop.load(Ordering::Acquire));
+
+        // Active lease immediately fails with StoppedByUser and tears down cleanly.
+        let err = engine
+            .handle(Some(1), None, Some("driver"), key_act("d"))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoppedByUser);
+        assert!(!backend.stop.load(Ordering::Acquire));
+        assert!(!backend.state.lock().unwrap().display_awake);
+        assert!(!backend.state.lock().unwrap().control_active);
+        assert_eq!(
+            backend.state.lock().unwrap().overlay_history.last(),
+            Some(&None)
+        );
+    }
+
+    #[test]
+    fn racing_call_after_explicit_stop_does_not_silently_auto_reacquire() {
+        use crate::engine::EXPLICIT_STOP_COOLDOWN_SECS;
+
+        let (engine, backend, clock, _tmp) = make_engine();
+        let t0 = std::time::Instant::now();
+
+        // 1. Explicit stop via double-Esc during active control lease.
+        engine
+            .handle(Some(1), None, Some("driver"), key_act("a"))
+            .unwrap();
+        assert!(!backend.kill_switch.on_physical_esc_at(t0));
+        assert!(
+            backend
+                .kill_switch
+                .on_physical_esc_at(t0 + std::time::Duration::from_millis(200))
+        );
+        let err = engine
+            .handle(Some(1), None, Some("driver"), key_act("b"))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoppedByUser);
+
+        // Racing parallel calls 500 ms later (same or different client) must NOT silently
+        // auto-reacquire a lease in Open mode.
+        clock.advance(Duration::milliseconds(500));
+        let racing_act = engine
+            .handle(Some(1), None, Some("driver"), key_act("c"))
+            .unwrap_err();
+        assert_eq!(racing_act.code, ErrorCode::StoppedByUser);
+        let racing_other = engine
+            .handle(
+                Some(2),
+                None,
+                Some("parallel"),
+                RpcMethod::Snapshot(SnapshotParams::default()),
+            )
+            .unwrap_err();
+        assert_eq!(racing_other.code, ErrorCode::StoppedByUser);
+
+        // Explicit `session_start` clears the cooldown immediately.
+        let started = engine
+            .handle(
+                Some(1),
+                None,
+                Some("driver"),
+                RpcMethod::SessionStart(SessionStartParams::default()),
+            )
+            .unwrap();
+        assert!(matches!(started, RpcResult::Session { .. }));
+        assert!(backend.kill_switch.is_control_active());
+
+        // 2. Explicit stop via floating Stop button.
+        assert!(backend.kill_switch.trigger_stop_button());
+        let err = engine
+            .handle(
+                Some(1),
+                None,
+                Some("driver"),
+                RpcMethod::Snapshot(SnapshotParams::default()),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoppedByUser);
+
+        // Still blocked 500 ms later.
+        clock.advance(Duration::milliseconds(500));
+        assert_eq!(
+            engine
+                .handle(Some(1), None, Some("driver"), key_act("d"))
+                .unwrap_err()
+                .code,
+            ErrorCode::StoppedByUser
+        );
+
+        // After cooldown elapses, auto-start works again without requiring session_start.
+        clock.advance(Duration::seconds(EXPLICIT_STOP_COOLDOWN_SECS));
+        engine
+            .handle(Some(1), None, Some("driver"), key_act("e"))
+            .unwrap();
+
+        // 3. Explicit stop via `desktop stop` RPC (`RpcMethod::Stop`).
+        let stop_res = engine
+            .handle(Some(9), None, Some("cli"), RpcMethod::Stop)
+            .unwrap();
+        assert!(matches!(
+            stop_res,
+            RpcResult::Stopped {
+                had_active_session: true
+            }
+        ));
+        clock.advance(Duration::milliseconds(500));
+        assert_eq!(
+            engine
+                .handle(Some(1), None, Some("driver"), key_act("f"))
+                .unwrap_err()
+                .code,
+            ErrorCode::StoppedByUser
+        );
+        // Explicit `session_start` immediately resumes.
+        assert!(
+            engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("driver"),
+                    RpcMethod::SessionStart(SessionStartParams::default()),
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn mid_batch_backend_stop_tears_down_lease_and_blocks_racing_call() {
+        let (engine, backend, clock, _tmp) = make_engine();
+
+        // Start a session and run a 2-step batch where the 2nd step (drag) hits a mid-step
+        // physical stop inside the backend.
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("driver"),
+                RpcMethod::SessionStart(SessionStartParams::default()),
+            )
+            .unwrap();
+
+        backend.state.lock().unwrap().stop_during_drag = true;
+        let res = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("driver"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![
+                        ActionStep::Key {
+                            combo: "a".into(),
+                            repeat: 1,
+                        },
+                        ActionStep::Drag {
+                            from: Target::Point {
+                                x: 10.0,
+                                y: 10.0,
+                                display: None,
+                            },
+                            to: Target::Point {
+                                x: 50.0,
+                                y: 50.0,
+                                display: None,
+                            },
+                            modifiers: vec![],
+                        },
+                    ],
+                    after: PostAction::None,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Auto,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        assert_eq!(res.completed, 1);
+        assert!(res.stopped_early);
+        assert_eq!(res.error.unwrap().code, ErrorCode::StoppedByUser);
+        assert!(!backend.state.lock().unwrap().control_active);
+        assert!(!backend.state.lock().unwrap().display_awake);
+        assert!(!backend.stop.load(Ordering::Acquire));
+
+        // Racing call 500 ms later must not silently auto-reacquire.
+        clock.advance(Duration::milliseconds(500));
+        assert_eq!(
+            engine
+                .handle(Some(2), None, Some("racer"), key_act("Return"))
+                .unwrap_err()
+                .code,
+            ErrorCode::StoppedByUser
+        );
+    }
+
+    #[test]
+    fn delayed_call_after_unreaped_stop_does_not_inherit_stale_cooldown() {
+        let (engine, backend, clock, _tmp) = make_engine();
+
+        // Client 1 starts a control lease and user triggers Stop at t=1s, then no RPC arrives
+        // for 15 minutes (past both the 5s cooldown and the 10m lease TTL).
+        engine
+            .handle(Some(1), None, Some("driver"), key_act("a"))
+            .unwrap();
+        clock.advance(Duration::seconds(1));
+        assert!(backend.kill_switch.trigger_stop_button());
+
+        clock.advance(Duration::minutes(15));
+        assert!(
+            engine
+                .handle(Some(2), None, Some("fresh"), key_act("b"))
+                .is_ok(),
+            "unrelated call 15 minutes after stop must not fail with a fresh cooldown"
+        );
+
+        // Likewise, 60 seconds after an un-reaped stop (before lease TTL expiry), an unrelated
+        // client should not be blocked by a stale cooldown.
+        assert!(backend.kill_switch.trigger_stop_button());
+        clock.advance(Duration::seconds(60));
+        assert!(
+            engine
+                .handle(Some(3), None, Some("other"), key_act("c"))
+                .is_ok(),
+            "unrelated client 60 seconds after stop should not hit stale cooldown"
+        );
+    }
+
+    #[test]
+    fn session_end_after_stop_preserves_cooldown_and_clears_flag() {
+        let (engine, backend, clock, _tmp) = make_engine();
+
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("driver"),
+                RpcMethod::SessionStart(SessionStartParams::default()),
+            )
+            .unwrap();
+        assert!(backend.kill_switch.trigger_stop_button());
+
+        // Client 1 calls session_end before another RPC sees stop_flag.
+        engine
+            .handle(Some(1), None, Some("driver"), RpcMethod::SessionEnd)
+            .unwrap();
+        assert!(!backend.stop.load(Ordering::Acquire));
+
+        // A racing call 500 ms later must still honor the explicit-stop cooldown.
+        clock.advance(Duration::milliseconds(500));
+        assert_eq!(
+            engine
+                .handle(Some(2), None, Some("racer"), key_act("a"))
+                .unwrap_err()
+                .code,
+            ErrorCode::StoppedByUser
+        );
     }
 }

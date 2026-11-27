@@ -234,7 +234,8 @@ pub struct PolicyConfig {
     /// Optional password-field masking in AX snapshots (`AXSecureTextField`). False by default.
     #[serde(default)]
     pub redact_passwords: bool,
-    /// Show the subtle floating Stop (Esc) status pill while an agent holds the lease. True by default.
+    /// Show the subtle floating `Double-Esc or Stop` status pill while an agent holds an active
+    /// control lease. True by default.
     #[serde(default = "default_true")]
     pub overlay: bool,
 }

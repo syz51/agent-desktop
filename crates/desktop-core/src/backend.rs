@@ -1,6 +1,11 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use chrono::{DateTime, Utc};
+
+/// UTC timestamp type used by `PlatformBackend` and `Clock`.
+pub type Timestamp = DateTime<Utc>;
+
 use desktop_proto::{
     AppInfo, ClickMode, DisplayInfo, ElementAction, FocusMode, ImageFormat, KeyCombo, Modifiers,
     MouseButton, PermissionsStatus, Point, ReadTextMode, ReadTextResult, Rect, RpcError,
@@ -58,12 +63,24 @@ pub trait PlatformBackend: Send + Sync {
     /// Invalidate any backend-side warm capture/window caches after a mutating UI action.
     fn invalidate_caches(&self) {}
 
-    /// Show, update, or hide the floating Stop (Esc) status pill.
+    /// Show, update, or hide the floating status + Stop pill.
     fn set_overlay(&self, text: Option<&str>);
+    /// Notify the backend whether an active mutating/control lease is currently held.
+    ///
+    /// Backends with global physical kill-switches (e.g. macOS double-Esc monitor) must only
+    /// arm the kill-switch while `active` is `true`, so normal user Esc presses when idle or
+    /// during read-only observation never latch `stop_flag`.
+    fn set_control_active(&self, _active: bool) {}
     /// Show a native Allow/Deny confirmation dialog (only used if user opts into Confirm policy).
     fn confirm_dialog(&self, title: &str, message: &str) -> Result<bool, RpcError>;
-    /// Shared in-process kill switch set immediately by physical Esc, Stop button, or `desktop stop`.
+    /// Shared in-process kill switch set immediately by physical double-Esc, Stop button, or `desktop stop`.
     fn stop_flag(&self) -> Arc<AtomicBool>;
+    /// Optional timestamp recorded when the physical kill-switch latched `stop_flag`.
+    /// Consuming this lets the engine measure the explicit-stop cooldown from when the user
+    /// actually pressed double-Esc or clicked Stop rather than when a later RPC lazily reaps it.
+    fn take_stop_triggered_at(&self) -> Option<Timestamp> {
+        None
+    }
 
     fn displays(&self) -> Result<Vec<DisplayInfo>, RpcError>;
     fn windows(&self, app_filter: Option<&str>) -> Result<Vec<WindowInfo>, RpcError>;

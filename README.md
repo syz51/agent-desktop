@@ -13,8 +13,9 @@ Linux desktops locally, headlessly (`Xvfb`), and across a private Tailscale flee
   `SCContentFilter(desktopIndependentWindow:)` and semantic actions without stealing focus
   when supported, and 100% isolated headless `Xvfb` sessions on Linux servers.
 - **Owner-first policy**: runs unrestricted (`PolicyMode::Open`) by default with zero modal
-  nagging, while preserving a physical `Esc` kill-switch, `desktop stop`, JSONL audit trail,
-  and opt-in `deny_apps`, `confirm_apps`, and `redact_passwords` in `policy.toml`.
+  nagging, while preserving a physical double-`Esc` / clickable Stop button kill-switch during
+  active control sessions, `desktop stop`, JSONL audit trail, and opt-in `deny_apps`,
+  `confirm_apps`, and `redact_passwords` in `policy.toml`.
 - **Private Tailscale fleet**: routes CLI and MCP calls seamlessly across your own Macs and
   Linux hosts (`desktop --host <alias> ...`) over `100.64.0.0/10` with constant-time 256-bit
   bearer auth and automatic lease release on disconnect.

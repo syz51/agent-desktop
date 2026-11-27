@@ -208,8 +208,8 @@ Per your preference, **the tool trusts the owner and never blocks you with hardc
   - `deny_apps = []` (optional user-chosen blocklist)
   - `confirm_apps = []` (optional user-chosen dialog list)
   - `redact_passwords = false` (optional `AXSecureTextField` masking; default `false` or `true` — your choice, easily toggled)
-  - `overlay = true` (show subtle floating status + `Stop (Esc)` pill while an agent is actively driving the screen; set `false` for headless/quiet runners)
-- **Physical Esc / Stop kill-switch:** Even in `open` mode, pressing physical `Esc` (distinguished from synthetic agent `Esc` via `MARK = 0x4453_4B54`) or clicking `Stop` (or running `<bin> stop`) immediately aborts the active batch/session via an in-process `AtomicBool`, releases the lease, and returns a clear `stopped_by_user` error to that agent session so you always keep instant physical override without permanent lockouts.
+  - `overlay = true` (show subtle floating status + `Double-Esc or Stop` pill with clickable Stop button while an agent is actively driving the screen; set `false` for headless/quiet runners)
+- **Physical Double-Esc / Stop kill-switch:** Even in `open` mode, pressing physical `Esc` twice within 450 ms while a control lease is active (distinguished from synthetic agent `Esc` via `MARK = 0x4453_4B54`, and ignored while idle or during standalone read-only observation) or clicking `Stop` (or running `<bin> stop`) immediately aborts the active batch/session via an in-process `AtomicBool`, releases the lease, records a short stop cooldown to block racing auto-reacquires, and returns a clear `stopped_by_user` error to that agent session so you always keep instant physical override without accidental single-Esc lockouts.
 - **Connection-bound single-writer lease:** Only one agent drives a machine at a time (optional `wait_for_lease_ms` queue). If an agent crashes or disconnects, the daemon detects socket EOF and immediately frees the lease.
 - **Clean audit log:** `~/.local/state/<bin>/events.jsonl` logs session start/end, caller host/agent, step counts, and stops (never logging typed text or clipboard contents).
 
