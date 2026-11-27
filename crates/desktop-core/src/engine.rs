@@ -8,10 +8,10 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::DateTime;
 use desktop_proto::{
     ActParams, ActResult, ActionStep, AppInfo, ErrorCode, FocusMode, HostStatus, ImageFormat,
-    LeaseInfo, ListWindowsParams, Point, PolicyConfig, PolicyMode, PostAction, Rect, RpcError,
-    RpcMethod, RpcResult, ScreenState, ScreenshotParams, ScreenshotResult, ScreenshotTarget,
-    SessionStartParams, Snapshot, SnapshotParams, StepOutcome, Target, WaitCondition,
-    parse_key_combo, parse_modifiers, screenshot_to_global,
+    LeaseInfo, ListWindowsParams, Point, PolicyConfig, PolicyMode, PostAction, ReadTextMode, Rect,
+    RpcError, RpcMethod, RpcResult, ScreenState, ScreenshotParams, ScreenshotResult,
+    ScreenshotTarget, SessionStartParams, Snapshot, SnapshotParams, StepOutcome, Target,
+    WaitCondition, parse_key_combo, parse_modifiers, screenshot_to_global,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -250,7 +250,7 @@ impl DesktopEngine {
                     &policy,
                     SessionAccess::Control,
                 )?;
-                let result = self.run_act(params, &policy, caller, &active_sid)?;
+                let result = self.run_act(client_id, params, &policy, caller, &active_sid)?;
                 Ok(RpcResult::Act(Box::new(result)))
             }
             RpcMethod::ReadText(params) => {
@@ -1022,6 +1022,7 @@ impl DesktopEngine {
 
     fn run_act(
         &self,
+        client_id: Option<u64>,
         params: ActParams,
         policy: &PolicyConfig,
         caller: Option<&str>,
@@ -1047,34 +1048,40 @@ impl DesktopEngine {
         let mut outcomes = Vec::with_capacity(total);
         let mut failed_error: Option<RpcError> = None;
         let mut stopped_early = false;
+        let mut deferred_session_end = false;
+        let mut released = false;
 
         for (index, step) in params.steps.into_iter().enumerate() {
             if let Err(err) = self.check_session_not_stopped(active_sid) {
                 stopped_early = true;
+                released = true;
                 failed_error = Some(err);
                 break;
             }
             let step_start = Instant::now();
             let op_name = step_op_name(&step).to_string();
             match self.execute_step(step, params.focus_mode, policy, active_sid) {
-                Ok((detail, used_background)) => {
-                    // Always invalidate warm frame caches after every step (including Wait/Sleep)
+                Ok(exec) => {
+                    // Invalidate warm frame caches after steps that may change screen contents
                     // so post-step or post-wait screenshots never return a pre-step cached frame.
-                    self.invalidate_frame_caches();
+                    if exec.mutated_screen {
+                        self.invalidate_frame_caches();
+                    }
+                    if exec.released_session {
+                        deferred_session_end = true;
+                    }
                     outcomes.push(StepOutcome {
                         index,
                         op: op_name,
                         ok: true,
-                        detail,
-                        used_background,
+                        detail: exec.detail,
+                        used_background: exec.used_background,
                         duration_ms: step_start.elapsed().as_millis() as u64,
+                        text: exec.text,
                     });
                 }
                 Err(err) => {
                     let is_stop = err.code == ErrorCode::StoppedByUser;
-                    if is_stop {
-                        self.finalize_user_stop(active_sid);
-                    }
                     outcomes.push(StepOutcome {
                         index,
                         op: op_name,
@@ -1082,8 +1089,16 @@ impl DesktopEngine {
                         detail: err.message.clone(),
                         used_background: false,
                         duration_ms: step_start.elapsed().as_millis() as u64,
+                        text: None,
                     });
-                    stopped_early = is_stop;
+                    if is_stop {
+                        stopped_early = true;
+                        // Ensure lease is torn down, control_active is disarmed, and the
+                        // explicit-stop cooldown is recorded even when a backend step returned
+                        // StoppedByUser directly without going through check_session_not_stopped().
+                        self.finalize_user_stop(active_sid);
+                        released = true;
+                    }
                     failed_error = Some(err);
                     break;
                 }
@@ -1141,6 +1156,11 @@ impl DesktopEngine {
             detail: Some(&format!("{completed}/{total} steps")),
         });
 
+        if (params.release_after || deferred_session_end) && !released {
+            let _ = self.handle_session_end(client_id, Some(active_sid), caller);
+            released = true;
+        }
+
         Ok(ActResult {
             completed,
             total,
@@ -1150,6 +1170,7 @@ impl DesktopEngine {
             steps: outcomes,
             snapshot,
             screenshot,
+            released,
         })
     }
 
@@ -1159,7 +1180,7 @@ impl DesktopEngine {
         focus_mode: FocusMode,
         policy: &PolicyConfig,
         active_sid: &str,
-    ) -> Result<(String, bool), RpcError> {
+    ) -> Result<StepRun, RpcError> {
         let is_macos = self.backend.is_macos();
         match step {
             ActionStep::Click {
@@ -1177,7 +1198,7 @@ impl DesktopEngine {
                         let info = self
                             .backend
                             .click_ref(&ref_id, button, count, mods, mode, focus_mode)?;
-                        Ok((info.detail, info.used_background))
+                        Ok(StepRun::mutating(info.detail, info.used_background))
                     }
                     point_target @ Target::Point { .. } => {
                         let p = self.resolve_point(&point_target)?;
@@ -1187,7 +1208,7 @@ impl DesktopEngine {
                         let info = self
                             .backend
                             .click_point(p, button, count, mods, focus_mode)?;
-                        Ok((info.detail, info.used_background))
+                        Ok(StepRun::mutating(info.detail, info.used_background))
                     }
                 }
             }
@@ -1197,7 +1218,7 @@ impl DesktopEngine {
                     self.ensure_app_allowed(&app, policy)?;
                 }
                 let info = self.backend.hover_point(p)?;
-                Ok((info.detail, info.used_background))
+                Ok(StepRun::mutating(info.detail, info.used_background))
             }
             ActionStep::Drag {
                 from,
@@ -1214,7 +1235,7 @@ impl DesktopEngine {
                     self.ensure_app_allowed(&app, policy)?;
                 }
                 let info = self.backend.drag(p1, p2, mods, focus_mode)?;
-                Ok((info.detail, info.used_background))
+                Ok(StepRun::mutating(info.detail, info.used_background))
             }
             ActionStep::Scroll {
                 target,
@@ -1226,7 +1247,7 @@ impl DesktopEngine {
                     self.ensure_app_allowed(&app, policy)?;
                 }
                 let info = self.backend.scroll(p, direction, amount, focus_mode)?;
-                Ok((info.detail, info.used_background))
+                Ok(StepRun::mutating(info.detail, info.used_background))
             }
             ActionStep::SetText {
                 ref_id,
@@ -1249,7 +1270,7 @@ impl DesktopEngine {
                     method,
                     focus_mode,
                 )?;
-                Ok((info.detail, info.used_background))
+                Ok(StepRun::mutating(info.detail, info.used_background))
             }
             ActionStep::Key { combo, repeat } => {
                 let parsed = parse_key_combo(&combo, is_macos)?;
@@ -1257,17 +1278,27 @@ impl DesktopEngine {
                     self.ensure_app_allowed(&app, policy)?;
                 }
                 let info = self.backend.key(parsed, repeat, focus_mode)?;
-                Ok((info.detail, info.used_background))
+                Ok(StepRun::mutating(info.detail, info.used_background))
             }
             ActionStep::OpenApp { app } => {
                 self.ensure_app_allowed_by_query(&app, policy)?;
-                let opened = self.backend.open_app(&app)?;
-                Ok((format!("opened {}", opened.name), false))
+                let opened = self.backend.open_app(&app, focus_mode)?;
+                let used_background = if is_macos {
+                    focus_mode != FocusMode::Foreground
+                } else {
+                    focus_mode == FocusMode::Background
+                };
+                let detail = if used_background {
+                    format!("opened {} (background)", opened.name)
+                } else {
+                    format!("opened {}", opened.name)
+                };
+                Ok(StepRun::mutating(detail, used_background))
             }
             ActionStep::FocusWindow { window_id } => {
                 let win = self.backend.focus_window(window_id)?;
                 self.ensure_app_allowed(&win.app, policy)?;
-                Ok((
+                Ok(StepRun::mutating(
                     format!("focused window w{} ({})", win.id, win.app.name),
                     false,
                 ))
@@ -1275,7 +1306,52 @@ impl DesktopEngine {
             ActionStep::Menu { app, path } => {
                 self.ensure_app_allowed_by_query(&app, policy)?;
                 let detail = self.backend.menu(&app, &path)?;
-                Ok((detail, true))
+                Ok(StepRun::mutating(detail, true))
+            }
+            ActionStep::ReadText {
+                mode,
+                ref_id,
+                window_id,
+            } => {
+                if mode != ReadTextMode::Clipboard {
+                    if let Some(r) = &ref_id {
+                        let resolved = self.backend.resolve_ref(r)?;
+                        self.ensure_app_allowed(&resolved.app, policy)?;
+                    } else if let Some(wid) = window_id
+                        && let Some(win) = self
+                            .backend
+                            .windows(None)?
+                            .into_iter()
+                            .find(|w| w.id == wid)
+                    {
+                        self.ensure_app_allowed(&win.app, policy)?;
+                    } else if let Some(app) = self.backend.focused_app()? {
+                        self.ensure_app_allowed(&app, policy)?;
+                    }
+                }
+                let res = self.backend.read_text(
+                    ref_id.as_deref(),
+                    window_id,
+                    mode,
+                    policy.redact_passwords,
+                )?;
+                let mode_label = match mode {
+                    ReadTextMode::Value => "value",
+                    ReadTextMode::Selection => "selection",
+                    ReadTextMode::Clipboard => "clipboard",
+                };
+                let detail = if res.text.is_empty() {
+                    format!("read {} ({mode_label}): (empty)", res.source)
+                } else {
+                    format!("read {} ({mode_label}): {}", res.source, res.text)
+                };
+                Ok(StepRun {
+                    detail,
+                    used_background: true,
+                    text: Some(res.text),
+                    released_session: false,
+                    mutated_screen: false,
+                })
             }
             ActionStep::Wait { until, timeout_ms } => {
                 let (matched, elapsed, detail) =
@@ -1287,7 +1363,7 @@ impl DesktopEngine {
                         "Take a snapshot or screenshot to inspect current UI state.",
                     ));
                 }
-                Ok((detail, true))
+                Ok(StepRun::mutating(detail, true))
             }
             ActionStep::Sleep { ms } => {
                 let deadline = Instant::now() + StdDuration::from_millis(ms);
@@ -1296,8 +1372,15 @@ impl DesktopEngine {
                     let rem = deadline.saturating_duration_since(Instant::now());
                     std::thread::sleep(rem.min(StdDuration::from_millis(25)));
                 }
-                Ok((format!("slept {ms} ms"), true))
+                Ok(StepRun::mutating(format!("slept {ms} ms"), true))
             }
+            ActionStep::SessionEnd => Ok(StepRun {
+                detail: "Session released; lease is free.".into(),
+                used_background: true,
+                text: None,
+                released_session: true,
+                mutated_screen: false,
+            }),
         }
     }
 
@@ -1439,6 +1522,26 @@ fn stopped_by_user_error() -> RpcError {
     )
 }
 
+struct StepRun {
+    detail: String,
+    used_background: bool,
+    text: Option<String>,
+    released_session: bool,
+    mutated_screen: bool,
+}
+
+impl StepRun {
+    fn mutating(detail: String, used_background: bool) -> Self {
+        Self {
+            detail,
+            used_background,
+            text: None,
+            released_session: false,
+            mutated_screen: true,
+        }
+    }
+}
+
 fn step_op_name(step: &ActionStep) -> &'static str {
     match step {
         ActionStep::Click { .. } => "click",
@@ -1450,8 +1553,10 @@ fn step_op_name(step: &ActionStep) -> &'static str {
         ActionStep::OpenApp { .. } => "open_app",
         ActionStep::FocusWindow { .. } => "focus_window",
         ActionStep::Menu { .. } => "menu",
+        ActionStep::ReadText { .. } => "read_text",
         ActionStep::Wait { .. } => "wait",
         ActionStep::Sleep { .. } => "sleep",
+        ActionStep::SessionEnd => "session_end",
     }
 }
 

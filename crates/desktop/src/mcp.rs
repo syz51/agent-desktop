@@ -19,10 +19,15 @@ use crate::client::DesktopClient;
 
 const INSTRUCTIONS: &str = "Fast Rust desktop control across your machines. Prefer `snapshot` or \
 `find` (fast Accessibility tree with @eN refs) over `screenshot` when interacting with standard UI \
-controls, and chain multi-step interactions inside one `act` call. Use `focus_mode: \"background\"` \
-to operate on unfocused windows without moving the user's cursor, or `\"auto\"` (default) to try \
-background AX first and fall back to brief focus-and-restore only when needed. Sessions auto-start \
-in open policy mode; call `session_end` when finished to release the control lease early.";
+controls. Collapse multi-turn latency by chaining steps inside one `act` call: e.g., chain \
+`open_app` + `wait` (with `after: \"snapshot\"`) to launch and inspect an app in one turn, and \
+chain `click` + `read_text` + `menu` with `release_after: true` (or a trailing `session_end` step) \
+to act, read back values/clipboard, and release the control lease in a single turn. Use \
+`focus_mode: \"background\"` to operate on unfocused windows without stealing focus or moving the \
+cursor, `\"auto\"` (default) to try background AX first and keep `open_app` in the background \
+(falling back to brief focus-and-restore only when HID input is required), or `\"foreground\"` to \
+explicitly activate/raise windows. Sessions auto-start in open policy mode; set `release_after: true` \
+on your final `act` call or call `session_end` to release the control lease early.";
 
 pub struct DesktopMcp {
     client: Arc<DesktopClient>,
@@ -133,6 +138,9 @@ fn render_result(result: RpcResult) -> Vec<ContentBlock> {
             if act.stopped_early {
                 summary.push_str(" (stopped early)");
             }
+            if act.released {
+                summary.push_str(" · session released");
+            }
             if let Some(err) = &act.error {
                 summary.push_str(&format!("\nerror: {err}"));
             }
@@ -209,7 +217,204 @@ pub fn tools() -> Vec<Tool> {
     let focus_prop = json!({
         "type": "string",
         "enum": ["auto", "background", "foreground"],
-        "description": "auto (try background AX first, brief focus-restore fallback), background (strict zero-focus), or foreground."
+        "description": "auto (default: background AX + background open_app, brief focus-restore fallback only when HID input is required), background (strict zero-focus; never pops windows or moves cursor), or foreground (explicitly activates/raises target window)."
+    });
+    let target_point_or_ref = json!({
+        "type": "object",
+        "description": "Target element or coordinate: either {\"ref\": \"@eN\"} or {\"x\": <number>, \"y\": <number>, \"display\"?: <integer>}.",
+        "properties": {
+            "ref": { "type": "string", "description": "Element ref from snapshot/find (e.g. \"@e12\")." },
+            "x": { "type": "number", "description": "Horizontal pixel coordinate in the latest screenshot (or display point)." },
+            "y": { "type": "number", "description": "Vertical pixel coordinate in the latest screenshot (or display point)." },
+            "display": { "type": "integer", "minimum": 0, "description": "Optional display index for point coordinates." }
+        },
+        "additionalProperties": false
+    });
+    let screenshot_target_schema = json!({
+        "type": "object",
+        "required": ["kind"],
+        "description": "Capture target tagged with \"kind\": {\"kind\":\"display\",\"index\"?:0} | {\"kind\":\"window\",\"window_id\":123} | {\"kind\":\"app\",\"app\":\"Notes\"} | {\"kind\":\"region\",\"x\":0,\"y\":0,\"width\":400,\"height\":300,\"display\"?:0}.",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["display", "window", "app", "region"],
+                "description": "Screenshot target kind."
+            },
+            "index": { "type": "integer", "minimum": 0, "description": "display: optional display index (default: primary display)." },
+            "window_id": { "type": "integer", "minimum": 0, "description": "window: window ID from list_windows/snapshot." },
+            "app": { "type": "string", "description": "app: application name or bundle ID." },
+            "x": { "type": "number", "description": "region: left coordinate." },
+            "y": { "type": "number", "description": "region: top coordinate." },
+            "width": { "type": "number", "description": "region: positive width." },
+            "height": { "type": "number", "description": "region: positive height." },
+            "display": { "type": "integer", "minimum": 0, "description": "region: optional display index." }
+        },
+        "additionalProperties": false
+    });
+    let wait_condition_schema = json!({
+        "type": "object",
+        "required": ["kind"],
+        "description": "Condition tagged with \"kind\": exists {query, role?, app?} | gone {ref?, query?, app?} | focused_app {app} | window_title_contains {text, app?} | visual_change {target?}.",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["exists", "gone", "focused_app", "window_title_contains", "visual_change"],
+                "description": "Condition kind: exists (AX element appears), gone (ref becomes stale or query disappears), focused_app (frontmost app matches), window_title_contains (any window title contains substring), or visual_change (frame diff on target)."
+            },
+            "query": { "type": "string", "description": "exists|gone: case-insensitive text substring to match in the AX tree." },
+            "role": { "type": "string", "description": "exists: optional AX role filter (e.g. \"button\", \"textfield\")." },
+            "ref": { "type": "string", "description": "gone: optional @eN ref to wait until stale/removed." },
+            "app": { "type": "string", "description": "exists|gone|focused_app|window_title_contains: app name or bundle ID (required for focused_app, optional filter for others)." },
+            "text": { "type": "string", "description": "window_title_contains: case-insensitive substring to match in a window title." },
+            "target": screenshot_target_schema
+        },
+        "additionalProperties": false
+    });
+    let action_step_schema = json!({
+        "type": "object",
+        "required": ["op"],
+        "description": "ActionStep tagged with \"op\": \
+            click {ref | (x, y, display?), button?: left|right|middle, count?: 1..3, modifiers?: string[], mode?: auto|semantic|pointer} | \
+            hover {ref | (x, y, display?)} | \
+            drag {from: {ref|(x,y,display?)}, to: {ref|(x,y,display?)}, modifiers?: string[]} | \
+            scroll {ref | (x, y, display?), direction: up|down|left|right, amount?: 1..100} | \
+            set_text {text, ref?, replace?: bool, submit?: bool, method?: auto|ax|paste|type} | \
+            key {combo, repeat?: 1..50} | \
+            open_app {app} | \
+            focus_window {window_id} | \
+            menu {app, path: string[]} | \
+            read_text {mode?: value|selection|clipboard, ref?, window_id?} | \
+            wait {until: WaitCondition, timeout_ms?: 1..15000} | \
+            sleep {ms: 0..5000} | \
+            session_end {} (must be final step).",
+        "properties": {
+            "op": {
+                "type": "string",
+                "enum": [
+                    "click",
+                    "hover",
+                    "drag",
+                    "scroll",
+                    "set_text",
+                    "key",
+                    "open_app",
+                    "focus_window",
+                    "menu",
+                    "read_text",
+                    "wait",
+                    "sleep",
+                    "session_end"
+                ],
+                "description": "Step operation kind."
+            },
+            "ref": {
+                "type": "string",
+                "description": "click|hover|scroll|set_text|read_text: target element ref from snapshot/find (e.g. \"@e3\")."
+            },
+            "x": {
+                "type": "number",
+                "description": "click|hover|scroll: horizontal coordinate (use instead of ref)."
+            },
+            "y": {
+                "type": "number",
+                "description": "click|hover|scroll: vertical coordinate (use instead of ref)."
+            },
+            "display": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "click|hover|scroll: optional display index when using x/y coordinates."
+            },
+            "button": {
+                "type": "string",
+                "enum": ["left", "right", "middle"],
+                "description": "click: mouse button (default: \"left\")."
+            },
+            "count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3,
+                "description": "click: click count 1..=3 (default: 1)."
+            },
+            "modifiers": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "click|drag: optional modifier keys (e.g. [\"shift\"], [\"mod\"], [\"cmd\"], [\"ctrl\"], [\"alt\"])."
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["auto", "semantic", "pointer", "value", "selection", "clipboard"],
+                "description": "click: auto|semantic|pointer (default: \"auto\"). read_text: value|selection|clipboard (default: \"value\")."
+            },
+            "from": target_point_or_ref,
+            "to": target_point_or_ref,
+            "direction": {
+                "type": "string",
+                "enum": ["up", "down", "left", "right"],
+                "description": "scroll: scroll direction (required for scroll)."
+            },
+            "amount": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "scroll: scroll notches 1..=100 (default: 3)."
+            },
+            "text": {
+                "type": "string",
+                "description": "set_text: text to insert or replace (required for set_text)."
+            },
+            "replace": {
+                "type": "boolean",
+                "description": "set_text: replace existing field value instead of appending (default: false)."
+            },
+            "submit": {
+                "type": "boolean",
+                "description": "set_text: press Return after entering text (default: false)."
+            },
+            "method": {
+                "type": "string",
+                "enum": ["auto", "ax", "paste", "type"],
+                "description": "set_text: entry tier — auto (AXSetValue -> paste/type), ax, paste, or type (default: \"auto\")."
+            },
+            "combo": {
+                "type": "string",
+                "description": "key: portable key combo such as \"Return\", \"Escape\", \"mod+s\", \"shift+tab\" (required for key)."
+            },
+            "repeat": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "key: repeat count 1..=50 (default: 1)."
+            },
+            "app": {
+                "type": "string",
+                "description": "open_app|menu: application name or bundle ID (e.g. \"Notes\" or \"com.apple.Notes\"). open_app respects focus_mode (background in auto/background, activates only in foreground)."
+            },
+            "window_id": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "focus_window|read_text: target window ID (required for focus_window, optional for read_text)."
+            },
+            "path": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string" },
+                "description": "menu: menu-bar item path, e.g. [\"File\", \"New Note\"] (required for menu)."
+            },
+            "until": wait_condition_schema,
+            "timeout_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 15000,
+                "description": "wait: timeout in milliseconds 1..=15000 (default: 5000)."
+            },
+            "ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 5000,
+                "description": "sleep: settle delay in milliseconds 0..=5000 (required for sleep)."
+            }
+        },
+        "additionalProperties": false
     });
 
     vec![
@@ -304,10 +509,7 @@ pub fn tools() -> Vec<Tool> {
                 "type": "object",
                 "properties": {
                     "host": host_prop,
-                    "target": {
-                        "type": "object",
-                        "description": "{\"kind\":\"display\",\"index\":0} | {\"kind\":\"window\",\"window_id\":123} | {\"kind\":\"app\",\"app\":\"Notes\"} | {\"kind\":\"region\",\"x\":0,\"y\":0,\"width\":400,\"height\":300}"
-                    },
+                    "target": screenshot_target_schema,
                     "annotate": { "type": "boolean", "default": false, "description": "Draw numbered @eN boxes from the live AX snapshot." },
                     "format": { "type": "string", "enum": ["jpeg", "png"], "default": "jpeg" },
                     "if_changed_since": { "type": "string", "description": "Previous screenshot hash; skips image payload if unchanged." },
@@ -318,7 +520,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         make_tool(
             "act",
-            "Execute 1 to 25 ordered UI steps atomically (click, hover, drag, scroll, set_text, key, open_app, focus_window, menu, wait, sleep) with optional post-action snapshot/screenshot.",
+            "Execute 1 to 25 ordered UI steps atomically in one turn (click, hover, drag, scroll, set_text, key, open_app, focus_window, menu, read_text, wait, sleep, session_end) with optional post-action snapshot/screenshot and release_after.",
             json!({
                 "type": "object",
                 "required": ["steps"],
@@ -328,12 +530,13 @@ pub fn tools() -> Vec<Tool> {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 25,
-                        "items": { "type": "object" },
-                        "description": "Ordered ActionStep objects tagged with \"op\": click|hover|drag|scroll|set_text|key|open_app|focus_window|menu|wait|sleep."
+                        "items": action_step_schema,
+                        "description": "Ordered ActionStep objects. Chain open_app + wait, or click + read_text + menu, to minimize turns."
                     },
-                    "after": { "type": "string", "enum": ["none", "snapshot", "screenshot", "annotated"], "default": "none" },
-                    "expect_snapshot": { "type": "string", "description": "Abort if current snapshot_id differs." },
-                    "focus_mode": focus_prop
+                    "after": { "type": "string", "enum": ["none", "snapshot", "screenshot", "annotated"], "default": "none", "description": "Optional post-batch perception capture." },
+                    "expect_snapshot": { "type": "string", "description": "Abort with stale_ref if current snapshot_id differs." },
+                    "focus_mode": focus_prop,
+                    "release_after": { "type": "boolean", "default": false, "description": "Release the control lease after the batch (and any `after` capture) completes, avoiding an extra session_end turn." }
                 },
                 "additionalProperties": false
             }),
@@ -374,7 +577,7 @@ pub fn tools() -> Vec<Tool> {
                 "required": ["condition"],
                 "properties": {
                     "host": host_prop,
-                    "condition": { "type": "object" },
+                    "condition": wait_condition_schema,
                     "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 15000, "default": 5000 }
                 },
                 "additionalProperties": false
@@ -475,29 +678,193 @@ mod tests {
             .unwrap();
         assert_eq!(shot_blocks.len(), 2);
 
-        // Batched act with post-action snapshot.
+        // Batched act with post-action snapshot, inline read_text, and release_after.
         let act_blocks = mcp
             .dispatch(
                 "act",
                 json!({
                     "steps": [
+                        { "op": "open_app", "app": "Notes" },
                         { "op": "set_text", "ref": "@e2", "text": "hello", "replace": true },
-                        { "op": "click", "ref": "@e3" }
+                        { "op": "click", "ref": "@e3" },
+                        { "op": "read_text", "mode": "value", "ref": "@e2" },
+                        { "op": "menu", "app": "Notes", "path": ["File", "New Note"] }
                     ],
-                    "after": "snapshot"
+                    "after": "snapshot",
+                    "focus_mode": "background",
+                    "release_after": true
                 }),
             )
             .await
             .unwrap();
         let act_txt = format!("{:?}", act_blocks[0]);
-        assert!(act_txt.contains("2/2 steps succeeded"));
+        assert!(act_txt.contains("5/5 steps succeeded"));
+        assert!(act_txt.contains("session released"));
+        assert!(act_txt.contains("mock-Value-@e2"));
         assert!(act_txt.contains("snapshot_id:"));
 
-        // Release lease cleanly.
+        // Explicit session_end remains safe & idempotent after release_after.
         let end_blocks = mcp.dispatch("session_end", json!({})).await.unwrap();
-        assert!(format!("{:?}", end_blocks[0]).contains("released"));
+        assert!(format!("{:?}", end_blocks[0]).contains("No matching active session"));
 
         let _ = tx.send(true);
         let _ = server.await;
+    }
+
+    fn assert_mcp_schema_safe(value: &Value, path: &str) {
+        const DISALLOWED_KEYS: &[&str] =
+            &["$ref", "$defs", "definitions", "oneOf", "anyOf", "allOf"];
+        match value {
+            Value::Object(map) => {
+                for (k, v) in map {
+                    assert!(
+                        !DISALLOWED_KEYS.contains(&k.as_str()),
+                        "schema at {path}.{k} uses unsupported JSON Schema keyword {k:?}"
+                    );
+                    assert_mcp_schema_safe(v, &format!("{path}.{k}"));
+                }
+            }
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    assert_mcp_schema_safe(item, &format!("{path}[{i}]"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn mcp_tools_schema_documents_every_act_op_and_wait_condition() {
+        let all_tools = tools();
+        assert_eq!(all_tools.len(), 12);
+
+        for tool in &all_tools {
+            let schema_val = Value::Object((*tool.input_schema).clone());
+            assert_eq!(
+                schema_val["type"], "object",
+                "tool {} root must be object",
+                tool.name
+            );
+            assert_mcp_schema_safe(&schema_val, tool.name.as_ref());
+        }
+
+        let act = all_tools.iter().find(|t| t.name == "act").unwrap();
+        let act_schema = Value::Object((*act.input_schema).clone());
+        assert_eq!(act_schema["properties"]["release_after"]["type"], "boolean");
+
+        let step_items = &act_schema["properties"]["steps"]["items"];
+        let ops: Vec<&str> = step_items["properties"]["op"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for expected_op in [
+            "click",
+            "hover",
+            "drag",
+            "scroll",
+            "set_text",
+            "key",
+            "open_app",
+            "focus_window",
+            "menu",
+            "read_text",
+            "wait",
+            "sleep",
+            "session_end",
+        ] {
+            assert!(
+                ops.contains(&expected_op),
+                "missing op {expected_op} in act schema"
+            );
+            assert!(
+                step_items["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected_op),
+                "missing op {expected_op} in act step description"
+            );
+        }
+
+        let step_props = step_items["properties"].as_object().unwrap();
+        for expected_field in [
+            "op",
+            "ref",
+            "x",
+            "y",
+            "display",
+            "button",
+            "count",
+            "modifiers",
+            "mode",
+            "from",
+            "to",
+            "direction",
+            "amount",
+            "text",
+            "replace",
+            "submit",
+            "method",
+            "combo",
+            "repeat",
+            "app",
+            "window_id",
+            "path",
+            "until",
+            "timeout_ms",
+            "ms",
+        ] {
+            assert!(
+                step_props.contains_key(expected_field),
+                "missing ActionStep field {expected_field} in act schema"
+            );
+        }
+
+        let screenshot = all_tools.iter().find(|t| t.name == "screenshot").unwrap();
+        let screenshot_schema = Value::Object((*screenshot.input_schema).clone());
+        assert_eq!(
+            screenshot_schema["properties"]["target"]["required"],
+            json!(["kind"])
+        );
+
+        let wait = all_tools.iter().find(|t| t.name == "wait").unwrap();
+        let wait_schema = Value::Object((*wait.input_schema).clone());
+        for cond_schema in [
+            &wait_schema["properties"]["condition"],
+            &step_items["properties"]["until"],
+        ] {
+            let kinds: Vec<&str> = cond_schema["properties"]["kind"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            for expected_kind in [
+                "exists",
+                "gone",
+                "focused_app",
+                "window_title_contains",
+                "visual_change",
+            ] {
+                assert!(
+                    kinds.contains(&expected_kind),
+                    "missing WaitCondition kind {expected_kind}"
+                );
+            }
+            let cond_props = cond_schema["properties"].as_object().unwrap();
+            for field in ["kind", "query", "role", "ref", "app", "text", "target"] {
+                assert!(
+                    cond_props.contains_key(field),
+                    "missing WaitCondition field {field}"
+                );
+            }
+        }
+
+        assert!(INSTRUCTIONS.contains("open_app"));
+        assert!(INSTRUCTIONS.contains("wait"));
+        assert!(INSTRUCTIONS.contains("read_text"));
+        assert!(INSTRUCTIONS.contains("menu"));
+        assert!(INSTRUCTIONS.contains("release_after"));
     }
 }

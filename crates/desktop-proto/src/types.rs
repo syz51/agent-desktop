@@ -669,6 +669,14 @@ pub enum ActionStep {
         app: String,
         path: Vec<String>,
     },
+    ReadText {
+        #[serde(default)]
+        mode: ReadTextMode,
+        #[serde(default, rename = "ref")]
+        ref_id: Option<String>,
+        #[serde(default)]
+        window_id: Option<u32>,
+    },
     Wait {
         until: WaitCondition,
         #[serde(default = "default_wait_ms")]
@@ -677,6 +685,7 @@ pub enum ActionStep {
     Sleep {
         ms: u64,
     },
+    SessionEnd,
 }
 
 fn default_one_u8() -> u8 {
@@ -739,6 +748,12 @@ pub struct StepOutcome {
     pub detail: String,
     pub used_background: bool,
     pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -754,6 +769,8 @@ pub struct ActResult {
     pub snapshot: Option<Snapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screenshot: Option<ScreenshotResult>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub released: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

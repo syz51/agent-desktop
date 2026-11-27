@@ -87,7 +87,7 @@ pub trait PlatformBackend: Send + Sync {
     fn focused_app(&self) -> Result<Option<AppInfo>, RpcError>;
     fn app_at_point(&self, point: Point) -> Result<Option<AppInfo>, RpcError>;
     fn find_app(&self, query: &str) -> Result<Option<AppInfo>, RpcError>;
-    fn open_app(&self, app: &str) -> Result<AppInfo, RpcError>;
+    fn open_app(&self, app: &str, focus_mode: FocusMode) -> Result<AppInfo, RpcError>;
     fn focus_window(&self, window_id: u32) -> Result<WindowInfo, RpcError>;
 
     fn snapshot(

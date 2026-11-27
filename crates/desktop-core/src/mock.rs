@@ -25,12 +25,13 @@ pub struct MockState {
     pub woke_count: usize,
     pub confirm_result: bool,
     pub actions_log: Vec<String>,
+    pub open_app_calls: Vec<(String, FocusMode)>,
     pub screenshot_bytes: Vec<u8>,
     pub snapshot_seq: u64,
     pub focused: Option<AppInfo>,
     pub ref_requires_focus: bool,
     pub ref_gone: bool,
-    pub stop_during_drag: bool,
+    pub stop_on_drag: bool,
 }
 
 pub struct MockBackend {
@@ -225,12 +226,10 @@ impl PlatformBackend for MockBackend {
         }))
     }
 
-    fn open_app(&self, app: &str) -> Result<AppInfo, RpcError> {
-        self.state
-            .lock()
-            .unwrap()
-            .actions_log
-            .push(format!("open:{app}"));
+    fn open_app(&self, app: &str, focus_mode: FocusMode) -> Result<AppInfo, RpcError> {
+        let mut st = self.state.lock().unwrap();
+        st.open_app_calls.push((app.to_string(), focus_mode));
+        st.actions_log.push(format!("open:{app}:{focus_mode:?}"));
         Ok(AppInfo {
             name: app.into(),
             bundle_id: None,
@@ -464,7 +463,7 @@ impl PlatformBackend for MockBackend {
         _mods: Modifiers,
         _focus_mode: FocusMode,
     ) -> Result<StepExecInfo, RpcError> {
-        if self.state.lock().unwrap().stop_during_drag {
+        if self.state.lock().unwrap().stop_on_drag {
             self.stop.store(true, Ordering::Release);
         }
         if self.stop.load(Ordering::Acquire) {
@@ -738,6 +737,7 @@ mod tests {
                     after: PostAction::Snapshot,
                     expect_snapshot: Some(snap.snapshot_id),
                     focus_mode: FocusMode::Auto,
+                    release_after: false,
                 }),
             )
             .unwrap()
@@ -765,6 +765,7 @@ mod tests {
                     after: PostAction::None,
                     expect_snapshot: None,
                     focus_mode: FocusMode::Auto,
+                    release_after: false,
                 }),
             )
             .unwrap_err();
@@ -794,6 +795,7 @@ mod tests {
                     after: PostAction::None,
                     expect_snapshot: None,
                     focus_mode: FocusMode::Background,
+                    release_after: false,
                 }),
             )
             .unwrap()
@@ -972,6 +974,7 @@ mod tests {
             after: PostAction::None,
             expect_snapshot: None,
             focus_mode: FocusMode::Auto,
+            release_after: false,
         })
     }
 
@@ -1266,7 +1269,7 @@ mod tests {
             )
             .unwrap();
 
-        backend.state.lock().unwrap().stop_during_drag = true;
+        backend.state.lock().unwrap().stop_on_drag = true;
         let res = match engine
             .handle(
                 Some(1),
@@ -1295,6 +1298,7 @@ mod tests {
                     after: PostAction::None,
                     expect_snapshot: None,
                     focus_mode: FocusMode::Auto,
+                    release_after: false,
                 }),
             )
             .unwrap()
@@ -1304,6 +1308,7 @@ mod tests {
         };
         assert_eq!(res.completed, 1);
         assert!(res.stopped_early);
+        assert!(res.released);
         assert_eq!(res.error.unwrap().code, ErrorCode::StoppedByUser);
         assert!(!backend.state.lock().unwrap().control_active);
         assert!(!backend.state.lock().unwrap().display_awake);
@@ -1380,6 +1385,384 @@ mod tests {
                 .unwrap_err()
                 .code,
             ErrorCode::StoppedByUser
+        );
+    }
+
+    #[test]
+    fn open_app_passes_focus_mode_and_reports_background_execution() {
+        let (engine, backend, _, _tmp) = make_engine();
+
+        for (mode, expect_bg) in [
+            (FocusMode::Background, true),
+            (FocusMode::Auto, true),
+            (FocusMode::Foreground, false),
+        ] {
+            let act = match engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("agent"),
+                    RpcMethod::Act(ActParams {
+                        steps: vec![ActionStep::OpenApp {
+                            app: "Notes".into(),
+                        }],
+                        after: PostAction::None,
+                        expect_snapshot: None,
+                        focus_mode: mode,
+                        release_after: false,
+                    }),
+                )
+                .unwrap()
+            {
+                RpcResult::Act(r) => r,
+                _ => unreachable!(),
+            };
+            assert_eq!(act.completed, 1);
+            assert_eq!(act.steps[0].op, "open_app");
+            assert_eq!(act.steps[0].used_background, expect_bg);
+        }
+
+        assert_eq!(
+            backend.state.lock().unwrap().open_app_calls,
+            vec![
+                ("Notes".into(), FocusMode::Background),
+                ("Notes".into(), FocusMode::Auto),
+                ("Notes".into(), FocusMode::Foreground),
+            ]
+        );
+    }
+
+    #[test]
+    fn compound_act_read_text_and_release_after() {
+        let (engine, backend, _, _tmp) = make_engine();
+
+        let act = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![
+                        ActionStep::Click {
+                            target: Target::Ref {
+                                ref_id: "@e3".into(),
+                            },
+                            button: MouseButton::Left,
+                            count: 1,
+                            modifiers: vec![],
+                            mode: ClickMode::Auto,
+                        },
+                        ActionStep::ReadText {
+                            mode: ReadTextMode::Value,
+                            ref_id: Some("@e2".into()),
+                            window_id: Some(101),
+                        },
+                        ActionStep::ReadText {
+                            mode: ReadTextMode::Clipboard,
+                            ref_id: None,
+                            window_id: None,
+                        },
+                        ActionStep::Menu {
+                            app: "Notes".into(),
+                            path: vec!["File".into(), "New Note".into()],
+                        },
+                    ],
+                    after: PostAction::Snapshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Auto,
+                    release_after: true,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+
+        assert_eq!(act.completed, 4);
+        assert_eq!(act.total, 4);
+        assert!(act.error.is_none());
+        assert!(act.released);
+        assert!(act.snapshot.is_some());
+        assert_eq!(act.steps[1].op, "read_text");
+        assert!(act.steps[1].used_background);
+        assert_eq!(act.steps[1].text.as_deref(), Some("mock-Value-@e2"));
+        assert!(act.steps[1].detail.contains("mock-Value-@e2"));
+        assert_eq!(act.steps[2].text.as_deref(), Some("mock-Clipboard-focused"));
+        assert!(act.steps[2].detail.contains("mock-Clipboard-focused"));
+
+        // Lease was released cleanly: display_awake and control_active are false and another
+        // client can immediately acquire (no explicit-stop cooldown on clean release_after).
+        assert!(!backend.state.lock().unwrap().display_awake);
+        assert!(!backend.state.lock().unwrap().control_active);
+        assert!(
+            engine
+                .handle(
+                    Some(2),
+                    None,
+                    Some("agent-2"),
+                    RpcMethod::Snapshot(SnapshotParams::default()),
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn act_session_end_step_and_release_after_on_error() {
+        let (engine, backend, _, _tmp) = make_engine();
+
+        // ActionStep::SessionEnd releases the lease inline and is idempotent with release_after.
+        let act = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![
+                        ActionStep::ReadText {
+                            mode: ReadTextMode::Selection,
+                            ref_id: Some("@e2".into()),
+                            window_id: None,
+                        },
+                        ActionStep::SessionEnd,
+                    ],
+                    after: PostAction::None,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Background,
+                    release_after: true,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        assert_eq!(act.completed, 2);
+        assert!(act.released);
+        assert_eq!(act.steps[1].op, "session_end");
+        assert!(act.steps[1].used_background);
+        assert!(!backend.state.lock().unwrap().display_awake);
+        assert!(!backend.state.lock().unwrap().control_active);
+
+        // On mid-batch failure, release_after=true still frees the lease so it never leaks.
+        backend.state.lock().unwrap().ref_requires_focus = true;
+        let failed = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::Click {
+                        target: Target::Ref {
+                            ref_id: "@e3".into(),
+                        },
+                        button: MouseButton::Left,
+                        count: 1,
+                        modifiers: vec![],
+                        mode: ClickMode::Auto,
+                    }],
+                    after: PostAction::None,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Background,
+                    release_after: true,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        assert_eq!(failed.completed, 0);
+        assert!(failed.error.is_some());
+        assert!(failed.released);
+        assert!(!backend.state.lock().unwrap().display_awake);
+        assert!(!backend.state.lock().unwrap().control_active);
+        assert!(
+            engine
+                .handle(
+                    Some(2),
+                    None,
+                    Some("agent-2"),
+                    RpcMethod::Snapshot(SnapshotParams::default()),
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn read_text_enforces_app_policy_without_ref_and_session_end_preserves_after_scope() {
+        let (engine, backend, _, _tmp) = make_engine();
+
+        // Deny Notes: ActionStep::ReadText with no ref (focused app = Notes) must be blocked.
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::PolicySet(PolicyConfig {
+                    mode: PolicyMode::Open,
+                    deny_apps: vec!["com.apple.Notes".into()],
+                    ..PolicyConfig::default()
+                }),
+            )
+            .unwrap();
+        let denied = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::ReadText {
+                        mode: ReadTextMode::Value,
+                        ref_id: None,
+                        window_id: None,
+                    }],
+                    after: PostAction::None,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Background,
+                    release_after: true,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        assert_eq!(denied.completed, 0);
+        assert_eq!(denied.error.unwrap().code, ErrorCode::PolicyDenied);
+        assert!(denied.released);
+        assert!(!backend.state.lock().unwrap().control_active);
+
+        // Reset policy, start a session scoped to Safari (NOT Notes).
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::PolicySet(PolicyConfig::default()),
+            )
+            .unwrap();
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::SessionStart(SessionStartParams {
+                    reason: Some("scoped".into()),
+                    apps: Some(vec!["Safari".into()]),
+                    wait_for_lease_ms: None,
+                }),
+            )
+            .unwrap();
+
+        // Trailing SessionEnd with after=Snapshot must still enforce scoped_apps during after capture,
+        // then release the lease afterward.
+        let scoped = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::SessionEnd],
+                    after: PostAction::Snapshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Background,
+                    release_after: false,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        assert_eq!(scoped.completed, 1);
+        assert!(scoped.released);
+        // Notes is out of the Safari-only scope, so after=Snapshot was rejected by scope before release.
+        assert!(scoped.snapshot.is_none());
+        assert!(!backend.state.lock().unwrap().display_awake);
+        assert!(!backend.state.lock().unwrap().control_active);
+    }
+
+    #[test]
+    fn mid_step_stop_tears_down_lease_and_marks_released() {
+        use crate::engine::EXPLICIT_STOP_COOLDOWN_SECS;
+
+        let (engine, backend, clock, _tmp) = make_engine();
+
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::SessionStart(SessionStartParams::default()),
+            )
+            .unwrap();
+        assert!(backend.state.lock().unwrap().display_awake);
+        assert!(backend.state.lock().unwrap().control_active);
+
+        // Simulate a backend input step returning StoppedByUser mid-step (without check_session_not_stopped).
+        backend.state.lock().unwrap().stop_on_drag = true;
+        let res = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::Drag {
+                        from: Target::Point {
+                            x: 10.0,
+                            y: 10.0,
+                            display: None,
+                        },
+                        to: Target::Point {
+                            x: 50.0,
+                            y: 50.0,
+                            display: None,
+                        },
+                        modifiers: vec![],
+                    }],
+                    after: PostAction::None,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Auto,
+                    release_after: true,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        assert_eq!(res.completed, 0);
+        assert!(res.stopped_early);
+        assert!(res.released);
+        assert_eq!(res.error.unwrap().code, ErrorCode::StoppedByUser);
+        assert!(!backend.state.lock().unwrap().display_awake);
+        assert!(!backend.state.lock().unwrap().control_active);
+
+        // Racing call within cooldown is rejected; after cooldown elapses (or via explicit
+        // session_start), another client can acquire cleanly since the lease was torn down.
+        assert_eq!(
+            engine
+                .handle(
+                    Some(2),
+                    None,
+                    Some("agent-2"),
+                    RpcMethod::Snapshot(SnapshotParams::default()),
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::StoppedByUser
+        );
+        clock.advance(Duration::seconds(EXPLICIT_STOP_COOLDOWN_SECS));
+        assert!(
+            engine
+                .handle(
+                    Some(2),
+                    None,
+                    Some("agent-2"),
+                    RpcMethod::Snapshot(SnapshotParams::default()),
+                )
+                .is_ok()
         );
     }
 }

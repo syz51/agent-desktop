@@ -269,6 +269,10 @@ impl ScreenshotParams {
     }
 }
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActParams {
     pub steps: Vec<ActionStep>,
@@ -278,6 +282,8 @@ pub struct ActParams {
     pub expect_snapshot: Option<String>,
     #[serde(default)]
     pub focus_mode: FocusMode,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub release_after: bool,
 }
 
 impl ActParams {
@@ -289,14 +295,20 @@ impl ActParams {
                 "Split larger sequences into multiple act calls.",
             ));
         }
+        let total = self.steps.len();
         for (idx, step) in self.steps.iter().enumerate() {
-            validate_step(idx, step, is_macos)?;
+            validate_step(idx, total, step, is_macos)?;
         }
         Ok(())
     }
 }
 
-fn validate_step(idx: usize, step: &ActionStep, is_macos: bool) -> Result<(), RpcError> {
+fn validate_step(
+    idx: usize,
+    total: usize,
+    step: &ActionStep,
+    is_macos: bool,
+) -> Result<(), RpcError> {
     match step {
         ActionStep::Click {
             count, modifiers, ..
@@ -369,7 +381,17 @@ fn validate_step(idx: usize, step: &ActionStep, is_macos: bool) -> Result<(), Rp
                 ));
             }
         }
-        ActionStep::Hover { .. } | ActionStep::FocusWindow { .. } => {}
+        ActionStep::SessionEnd => {
+            if idx + 1 != total {
+                return Err(RpcError::with_next(
+                    ErrorCode::InvalidInput,
+                    format!("step {idx}: session_end must be the final step in an act batch"),
+                    "Place session_end as the last step or set release_after: true.",
+                ));
+            }
+        }
+        ActionStep::Hover { .. } | ActionStep::FocusWindow { .. } | ActionStep::ReadText { .. } => {
+        }
     }
     Ok(())
 }
@@ -481,6 +503,7 @@ mod tests {
             after: PostAction::None,
             expect_snapshot: None,
             focus_mode: FocusMode::Auto,
+            release_after: false,
         };
         assert!(empty.validate(true).is_err());
 
@@ -497,6 +520,7 @@ mod tests {
             after: PostAction::Snapshot,
             expect_snapshot: None,
             focus_mode: FocusMode::Background,
+            release_after: false,
         };
         assert!(ok.validate(true).is_ok());
 
@@ -507,7 +531,76 @@ mod tests {
             after: PostAction::None,
             expect_snapshot: None,
             focus_mode: FocusMode::Auto,
+            release_after: false,
         };
         assert!(too_long_sleep.validate(true).is_err());
+    }
+
+    #[test]
+    fn validates_compound_act_steps_and_v1_backward_compat() {
+        // Legacy /v1 ActParams without release_after still deserializes cleanly.
+        let legacy_act: ActParams =
+            serde_json::from_str(r#"{"steps":[{"op":"open_app","app":"Notes"}]}"#).unwrap();
+        assert!(!legacy_act.release_after);
+        assert_eq!(legacy_act.focus_mode, FocusMode::Auto);
+        assert!(legacy_act.validate(true).is_ok());
+        // Default release_after=false is omitted on the wire for older daemons.
+        let encoded_legacy = serde_json::to_value(&legacy_act).unwrap();
+        assert!(encoded_legacy.get("release_after").is_none());
+
+        // Compound batch: read_text (default + explicit) + session_end at the end.
+        let compound: ActParams = serde_json::from_str(
+            r#"{
+                "steps": [
+                    {"op": "read_text"},
+                    {"op": "read_text", "mode": "clipboard"},
+                    {"op": "read_text", "mode": "selection", "ref": "@e2", "window_id": 42},
+                    {"op": "session_end"}
+                ],
+                "release_after": true
+            }"#,
+        )
+        .unwrap();
+        assert!(compound.release_after);
+        assert!(compound.validate(true).is_ok());
+        let roundtrip: ActParams =
+            serde_json::from_str(&serde_json::to_string(&compound).unwrap()).unwrap();
+        assert_eq!(roundtrip, compound);
+
+        // session_end must be the final step in a batch.
+        let mid_end = ActParams {
+            steps: vec![ActionStep::SessionEnd, ActionStep::Sleep { ms: 10 }],
+            after: PostAction::None,
+            expect_snapshot: None,
+            focus_mode: FocusMode::Auto,
+            release_after: false,
+        };
+        let err = mid_end.validate(true).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.next.is_some());
+
+        // Legacy /v1 ActResult & StepOutcome without text/released still deserialize cleanly.
+        let legacy_result: ActResult = serde_json::from_str(
+            r#"{
+                "completed": 1,
+                "total": 1,
+                "stopped_early": false,
+                "duration_ms": 5,
+                "steps": [{
+                    "index": 0,
+                    "op": "click",
+                    "ok": true,
+                    "detail": "pressed @e1",
+                    "used_background": true,
+                    "duration_ms": 5
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert!(!legacy_result.released);
+        assert!(legacy_result.steps[0].text.is_none());
+        let encoded_res = serde_json::to_value(&legacy_result).unwrap();
+        assert!(encoded_res.get("released").is_none());
+        assert!(encoded_res["steps"][0].get("text").is_none());
     }
 }

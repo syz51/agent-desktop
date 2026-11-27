@@ -87,7 +87,7 @@ async fn compiled_desktop_mcp_binary_full_jsonrpc_flow() {
     stdin.write_all(&notif).await.unwrap();
     stdin.flush().await.unwrap();
 
-    // 3. tools/list returns all 12 tools.
+    // 3. tools/list returns all 12 tools with rich schemas for act and wait.
     let list = rpc_roundtrip(
         &mut stdin,
         &mut stdout,
@@ -96,6 +96,34 @@ async fn compiled_desktop_mcp_binary_full_jsonrpc_flow() {
     .await;
     let tools = list["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 12);
+
+    let act_tool = tools.iter().find(|t| t["name"] == "act").unwrap();
+    let act_ops: Vec<&str> = act_tool["inputSchema"]["properties"]["steps"]["items"]["properties"]
+        ["op"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(act_ops.len(), 13);
+    assert!(act_ops.contains(&"read_text"));
+    assert!(act_ops.contains(&"session_end"));
+    assert_eq!(
+        act_tool["inputSchema"]["properties"]["release_after"]["type"],
+        "boolean"
+    );
+
+    let wait_tool = tools.iter().find(|t| t["name"] == "wait").unwrap();
+    let wait_kinds: Vec<&str> =
+        wait_tool["inputSchema"]["properties"]["condition"]["properties"]["kind"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+    assert_eq!(wait_kinds.len(), 5);
+    assert!(wait_kinds.contains(&"window_title_contains"));
+    assert!(wait_kinds.contains(&"visual_change"));
 
     // 4. Call status.
     let status = rpc_roundtrip(
@@ -147,17 +175,23 @@ async fn compiled_desktop_mcp_binary_full_jsonrpc_flow() {
                 "name": "act",
                 "arguments": {
                     "steps": [
+                        { "op": "open_app", "app": "Notes" },
                         { "op": "set_text", "ref": "@e2", "text": "fast rust", "replace": true },
-                        { "op": "click", "ref": "@e3" }
+                        { "op": "click", "ref": "@e3" },
+                        { "op": "read_text", "mode": "value", "ref": "@e2" },
+                        { "op": "menu", "app": "Notes", "path": ["File", "New Note"] }
                     ],
-                    "after": "snapshot"
+                    "after": "snapshot",
+                    "release_after": true
                 }
             }
         }),
     )
     .await;
     let act_text = act["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(act_text.contains("2/2 steps succeeded"));
+    assert!(act_text.contains("5/5 steps succeeded"));
+    assert!(act_text.contains("mock-Value-@e2"));
+    assert!(act_text.contains("session released"));
 
     let shot = rpc_roundtrip(
         &mut stdin,

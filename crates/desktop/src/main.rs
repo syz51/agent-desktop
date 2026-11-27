@@ -108,6 +108,9 @@ enum Command {
         after: CliPostAction,
         #[arg(long, value_enum, default_value = "auto")]
         focus: CliFocusMode,
+        /// Release the control lease after the batch completes.
+        #[arg(long)]
+        release_after: bool,
     },
     /// Read text from an element ref, selection, or clipboard.
     ReadText {
@@ -497,6 +500,7 @@ async fn run_cli_command(
             steps_json,
             after,
             focus,
+            release_after,
         } => {
             let steps: Vec<ActionStep> =
                 serde_json::from_str(&steps_json).context("parse steps JSON array")?;
@@ -508,6 +512,7 @@ async fn run_cli_command(
                         after: after.into(),
                         expect_snapshot: None,
                         focus_mode: focus.into(),
+                        release_after,
                     }),
                 )
                 .await?;
