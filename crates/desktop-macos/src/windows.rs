@@ -2,9 +2,13 @@ use std::path::Path;
 use std::ptr;
 
 use desktop_proto::{
-    AppInfo, DisplayInfo, ErrorCode, FocusMode, Point, Rect, RpcError, WindowInfo,
+    AppInfo, AppMatchRank, DisplayInfo, ErrorCode, FocusMode, Point, Rect, RpcError, WindowInfo,
+    filter_windows_by_app,
 };
-use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
+use objc2_app_kit::{
+    NSApplicationActivationOptions, NSApplicationActivationPolicy, NSRunningApplication,
+    NSWorkspace,
+};
 use objc2_foundation::{NSBundle, NSString, NSURL};
 
 use crate::ffi::{
@@ -157,6 +161,43 @@ fn bundle_info_from_path(path: &Path) -> Option<AppInfo> {
     })
 }
 
+fn activation_policy_priority(policy: NSApplicationActivationPolicy) -> u8 {
+    if policy == NSApplicationActivationPolicy::Regular {
+        2
+    } else if policy == NSApplicationActivationPolicy::Accessory {
+        1
+    } else {
+        0
+    }
+}
+
+pub(crate) fn select_best_app_candidate<I>(
+    candidates: I,
+    query: &str,
+) -> Option<(AppMatchRank, AppInfo)>
+where
+    I: IntoIterator<Item = (AppInfo, u8)>,
+{
+    let mut best: Option<(AppMatchRank, u8, usize, AppInfo)> = None;
+    for (info, policy_priority) in candidates {
+        let Some(rank) = info.match_rank(query) else {
+            continue;
+        };
+        let name_len = info.name.len();
+        let better = match &best {
+            None => true,
+            Some((best_rank, best_priority, best_len, _)) => {
+                (rank, policy_priority, std::cmp::Reverse(name_len))
+                    > (*best_rank, *best_priority, std::cmp::Reverse(*best_len))
+            }
+        };
+        if better {
+            best = Some((rank, policy_priority, name_len, info));
+        }
+    }
+    best.map(|(rank, _, _, info)| (rank, info))
+}
+
 pub fn find_app(query: &str) -> Option<AppInfo> {
     let q = query.trim();
     if q.is_empty() {
@@ -164,14 +205,18 @@ pub fn find_app(query: &str) -> Option<AppInfo> {
     }
     let ws = NSWorkspace::sharedWorkspace();
     let running = ws.runningApplications();
-    for app in running.iter() {
-        let info = app_info_from_running(&app);
-        if info.matches_query(q) {
-            return Some(info);
-        }
+    let best_running = select_best_app_candidate(
+        running.iter().map(|app| {
+            let prio = activation_policy_priority(app.activationPolicy());
+            (app_info_from_running(&app), prio)
+        }),
+        q,
+    );
+    if let Some((AppMatchRank::Exact, info)) = best_running {
+        return Some(info);
     }
 
-    // Try bundle ID lookup via NSWorkspace.
+    // Try exact bundle ID lookup via NSWorkspace before settling for a non-exact running match.
     let ns_bid = NSString::from_str(q);
     if let Some(url) = ws.URLForApplicationWithBundleIdentifier(&ns_bid)
         && let Some(p) = url.path()
@@ -180,7 +225,7 @@ pub fn find_app(query: &str) -> Option<AppInfo> {
         return Some(info);
     }
 
-    // Scan standard application directories by app name (including CoreServices for Finder, etc.).
+    // Scan standard application directories by exact `.app` name (including CoreServices for Finder, etc.).
     let home = std::env::var("HOME").unwrap_or_default();
     let dirs = [
         "/Applications".to_string(),
@@ -194,15 +239,49 @@ pub fn find_app(query: &str) -> Option<AppInfo> {
     } else {
         format!("{q}.app")
     };
-    for dir in dirs {
-        let candidate = Path::new(&dir).join(&file_name);
+    for dir in &dirs {
+        let candidate = Path::new(dir).join(&file_name);
         if candidate.exists()
             && let Some(info) = bundle_info_from_path(&candidate)
         {
             return Some(info);
         }
     }
-    None
+
+    // If a running app matched by word-prefix or substring, prefer it over launching an uninstalled/stopped bundle.
+    if let Some((_, info)) = best_running {
+        return Some(info);
+    }
+
+    // Fallback: match installed `.app` bundles on disk by word-prefix or substring (e.g. "T3 Code" -> "T3 Code (Beta).app").
+    let mut disk_candidates = Vec::new();
+    for dir in &dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("app") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let probe = AppInfo {
+                name: stem.to_string(),
+                bundle_id: None,
+                pid: None,
+                path: Some(path.to_string_lossy().into_owned()),
+                running: false,
+            };
+            if probe.match_rank(q).is_some()
+                && let Some(info) = bundle_info_from_path(&path)
+            {
+                disk_candidates.push((info, 0));
+            }
+        }
+    }
+    select_best_app_candidate(disk_candidates, q).map(|(_, info)| info)
 }
 
 pub(crate) fn should_activate_running(focus_mode: FocusMode) -> bool {
@@ -259,6 +338,11 @@ pub fn open_app(query: &str, focus_mode: FocusMode) -> Result<AppInfo, RpcError>
 }
 
 pub fn windows(app_filter: Option<&str>) -> Result<Vec<WindowInfo>, RpcError> {
+    if let Some(filter) = app_filter
+        && filter.trim().is_empty()
+    {
+        return Ok(Vec::new());
+    }
     let displays = displays()?;
     let front_pid = frontmost_pid();
 
@@ -339,6 +423,9 @@ pub fn windows(app_filter: Option<&str>) -> Result<Vec<WindowInfo>, RpcError> {
             on_screen: true,
             display_index,
         });
+    }
+    if let Some(filter) = app_filter {
+        return Ok(filter_windows_by_app(out, filter));
     }
     Ok(out)
 }
@@ -469,5 +556,53 @@ mod tests {
         if before != finder.pid.map(|p| p as i32) {
             assert_eq!(frontmost_pid(), before);
         }
+    }
+
+    #[test]
+    fn select_best_app_candidate_prefers_exact_and_regular_gui_app_over_helpers() {
+        let helper = AppInfo {
+            name: "T3 Code (Beta) Helper (Renderer)".into(),
+            bundle_id: Some("com.t3tools.t3code.helper.renderer".into()),
+            pid: Some(101),
+            path: None,
+            running: true,
+        };
+        let main_beta = AppInfo {
+            name: "T3 Code (Beta)".into(),
+            bundle_id: Some("com.t3tools.t3code".into()),
+            pid: Some(100),
+            path: Some("/Applications/T3 Code (Beta).app".into()),
+            running: true,
+        };
+        let exact_app = AppInfo {
+            name: "T3 Code".into(),
+            bundle_id: Some("com.t3tools.t3code.stable".into()),
+            pid: Some(102),
+            path: Some("/Applications/T3 Code.app".into()),
+            running: true,
+        };
+
+        // Helper appears first in the list, yet the Regular GUI app wins over Prohibited helper.
+        let chosen =
+            select_best_app_candidate(vec![(helper.clone(), 0), (main_beta.clone(), 2)], "T3 Code")
+                .unwrap();
+        assert_eq!(chosen.0, AppMatchRank::WordPrefix);
+        assert_eq!(chosen.1.name, "T3 Code (Beta)");
+
+        // Even with equal activation priority, shorter name ("T3 Code (Beta)") beats longer helper.
+        let chosen_same_prio =
+            select_best_app_candidate(vec![(helper.clone(), 2), (main_beta.clone(), 2)], "T3 Code")
+                .unwrap();
+        assert_eq!(chosen_same_prio.1.name, "T3 Code (Beta)");
+
+        // Exact match always beats word-prefix even if listed last.
+        let chosen_exact =
+            select_best_app_candidate(vec![(helper, 0), (main_beta, 2), (exact_app, 2)], "T3 Code")
+                .unwrap();
+        assert_eq!(chosen_exact.0, AppMatchRank::Exact);
+        assert_eq!(chosen_exact.1.name, "T3 Code");
+
+        // Empty query returns None.
+        assert!(select_best_app_candidate(Vec::<(AppInfo, u8)>::new(), "").is_none());
     }
 }

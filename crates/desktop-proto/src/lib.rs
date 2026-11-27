@@ -21,9 +21,10 @@ pub use rpc::{
     SnapshotParams, WaitParams,
 };
 pub use types::{
-    ActResult, ActionStep, AppInfo, ClickMode, DisplayInfo, ElementAction, FindMatch, FocusMode,
-    HostStatus, ImageFormat, LeaseInfo, MouseButton, PermissionsStatus, Point, PolicyConfig,
-    PolicyMode, PostAction, ReadTextMode, ReadTextResult, Rect, ScreenState, ScreenshotResult,
-    ScreenshotTarget, ScrollDirection, Snapshot, StepOutcome, Target, TextMethod, UiNode,
-    WaitCondition, WindowInfo, fit_screenshot, sanitize_text, screenshot_to_global,
+    ActResult, ActionStep, AppInfo, AppMatchRank, ClickMode, DisplayInfo, ElementAction, FindMatch,
+    FocusMode, HostStatus, ImageFormat, LeaseInfo, MouseButton, PermissionsStatus, Point,
+    PolicyConfig, PolicyMode, PostAction, ReadTextMode, ReadTextResult, Rect, ScreenState,
+    ScreenshotResult, ScreenshotTarget, ScrollDirection, Snapshot, StepOutcome, Target, TextMethod,
+    UiNode, WaitCondition, WindowInfo, best_matching_window, filter_windows_by_app, fit_screenshot,
+    sanitize_text, screenshot_to_global,
 };

@@ -464,7 +464,7 @@ impl PlatformBackend for LinuxBackend {
                 params
                     .app
                     .as_deref()
-                    .and_then(|q| wins.iter().find(|w| w.app.matches_query(q)))
+                    .and_then(|q| desktop_proto::best_matching_window(&wins, q))
             })
             .or_else(|| wins.iter().find(|w| w.focused))
             .or_else(|| wins.first());
