@@ -9,6 +9,7 @@ use desktop_proto::{
 };
 use uuid::Uuid;
 use zbus::connection::Builder as ConnBuilder;
+use zbus::proxy::{Builder as ProxyBuilder, CacheProperties};
 use zbus::{Connection, OwnedObjectPath, Proxy};
 
 const DEFAULT_MAX_DEPTH: usize = 24;
@@ -16,6 +17,13 @@ const DEFAULT_MAX_NODES: usize = 250;
 const WALK_BUDGET: Duration = Duration::from_millis(250);
 const ATSPI_REGISTRY_DEST: &str = "org.a11y.atspi.Registry";
 const ATSPI_ROOT_PATH: &str = "/org/a11y/atspi/accessible/root";
+
+/// Outcome of an AT-SPI2 snapshot attempt so callers only fall back when the bus is unavailable.
+pub enum AtSpiSnapshotResult {
+    Snapshot(Box<Snapshot>),
+    /// AT-SPI2 bus is not running or has no registered accessible applications.
+    Unavailable,
+}
 
 /// Stored AT-SPI2 reference handle mapped to an `@eN` ID.
 #[derive(Debug, Clone)]
@@ -85,6 +93,23 @@ where
     }
 }
 
+/// Build a non-caching D-Bus proxy (`CacheProperties::No`) to avoid `AddMatch`/`GetAll` overhead.
+pub(crate) async fn uncached_proxy<'a>(
+    conn: &'a Connection,
+    dest: &'a str,
+    path: &'a str,
+    iface: &'a str,
+) -> Result<Proxy<'a>, RpcError> {
+    ProxyBuilder::new(conn)
+        .destination(dest)
+        .path(path)
+        .interface(iface)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .map_err(|e| RpcError::new(ErrorCode::BackendError, format!("D-Bus proxy build: {e}")))
+}
+
 /// Probe whether the AT-SPI2 accessibility D-Bus is reachable.
 #[must_use]
 pub fn is_atspi_available() -> bool {
@@ -107,9 +132,7 @@ async fn connect_atspi_bus() -> Result<Connection, RpcError> {
             format!("session D-Bus unavailable: {e}"),
         )
     })?;
-    let proxy = Proxy::new(&session, "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus")
-        .await
-        .map_err(|e| RpcError::new(ErrorCode::BackendError, format!("org.a11y.Bus proxy: {e}")))?;
+    let proxy = uncached_proxy(&session, "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus").await?;
     let addr: String = proxy.call("GetAddress", &()).await.map_err(|e| {
         RpcError::new(
             ErrorCode::BackendError,
@@ -128,30 +151,37 @@ async fn connect_atspi_bus() -> Result<Connection, RpcError> {
         .map_err(|e| RpcError::new(ErrorCode::BackendError, format!("AT-SPI connect: {e}")))
 }
 
-/// Take an AT-SPI2 accessibility snapshot; returns `Err` if AT-SPI2 is unavailable so caller
-/// can fall back cleanly to window-level X11 snapshot.
+/// Take an AT-SPI2 accessibility snapshot.
+///
+/// Propagates caller errors (`StaleRef`, explicit app `NotFound`) rather than clobbering `store`;
+/// returns `Ok(AtSpiSnapshotResult::Unavailable)` only when the AT-SPI2 bus itself is unavailable.
 pub fn take_atspi_snapshot(
     store: &LinuxRefStore,
     params: &SnapshotParams,
     fallback_window: Option<&WindowInfo>,
     redact_passwords: bool,
-) -> Result<Snapshot, RpcError> {
+) -> Result<AtSpiSnapshotResult, RpcError> {
     let started = Instant::now();
     let max_depth = params.max_depth.unwrap_or(DEFAULT_MAX_DEPTH).min(48);
     let max_nodes = params.max_nodes.unwrap_or(DEFAULT_MAX_NODES).min(1000);
     let app_filter = params.app.clone();
-    let root_ref = params.root_ref.clone();
-    let existing_root = match root_ref.as_deref() {
+    // Validate `root_ref` up-front so expired refs always return `StaleRef`.
+    let existing_root = match params.root_ref.as_deref() {
         Some(r) => Some(store.get(r)?),
         None => None,
     };
     let win_hint = fallback_window.cloned();
 
-    let (snapshot, entries) = block_on_dbus(async move {
-        let conn = connect_atspi_bus().await?;
+    let result = block_on_dbus(async move {
+        let Ok(conn) = connect_atspi_bus().await else {
+            return Ok(None);
+        };
 
         let (start_bus, start_path, app_info, window_title, window_id) =
             if let Some(root_entry) = existing_root {
+                if root_entry.bus_name.is_empty() || root_entry.object_path.is_empty() {
+                    return Ok(None);
+                }
                 (
                     root_entry.bus_name,
                     root_entry.object_path,
@@ -160,7 +190,10 @@ pub fn take_atspi_snapshot(
                     win_hint.as_ref().map(|w| w.id),
                 )
             } else {
-                find_atspi_target(&conn, app_filter.as_deref(), win_hint.as_ref()).await?
+                match find_atspi_target(&conn, app_filter.as_deref(), win_hint.as_ref()).await? {
+                    Some(target) => target,
+                    None => return Ok(None),
+                }
             };
 
         let mut ctx = WalkCtx {
@@ -206,11 +239,16 @@ pub fn take_atspi_snapshot(
             elapsed_ms: started.elapsed().as_millis() as u64,
             root,
         };
-        Ok((snapshot, ctx.entries))
+        Ok(Some((snapshot, ctx.entries)))
     })?;
 
-    store.replace(entries);
-    Ok(snapshot)
+    match result {
+        Some((snapshot, entries)) => {
+            store.replace(entries);
+            Ok(AtSpiSnapshotResult::Snapshot(Box::new(snapshot)))
+        }
+        None => Ok(AtSpiSnapshotResult::Unavailable),
+    }
 }
 
 /// Build a clean fallback snapshot from X11 windows when AT-SPI2 is absent (e.g. minimal Xvfb).
@@ -327,9 +365,8 @@ pub fn do_action(entry: &AtSpiRefEntry) -> Result<bool, RpcError> {
     let path = entry.object_path.clone();
     block_on_dbus(async move {
         let conn = connect_atspi_bus().await?;
-        let proxy = Proxy::new(&conn, bus.as_str(), path.as_str(), "org.a11y.atspi.Action")
-            .await
-            .map_err(|e| RpcError::new(ErrorCode::BackendError, format!("Action proxy: {e}")))?;
+        let proxy =
+            uncached_proxy(&conn, bus.as_str(), path.as_str(), "org.a11y.atspi.Action").await?;
         let ok: bool = proxy
             .call("DoAction", &(0i32,))
             .await
@@ -348,14 +385,13 @@ pub fn set_editable_text(entry: &AtSpiRefEntry, text: &str) -> Result<bool, RpcE
     let text_owned = text.to_string();
     block_on_dbus(async move {
         let conn = connect_atspi_bus().await?;
-        let proxy = Proxy::new(
+        let proxy = uncached_proxy(
             &conn,
             bus.as_str(),
             path.as_str(),
             "org.a11y.atspi.EditableText",
         )
-        .await
-        .map_err(|e| RpcError::new(ErrorCode::BackendError, format!("EditableText proxy: {e}")))?;
+        .await?;
         let ok: bool = proxy
             .call("SetTextContents", &(text_owned,))
             .await
@@ -392,9 +428,8 @@ pub fn read_atspi_text(
     let path = entry.object_path.clone();
     block_on_dbus(async move {
         let conn = connect_atspi_bus().await?;
-        let proxy = Proxy::new(&conn, bus.as_str(), path.as_str(), "org.a11y.atspi.Text")
-            .await
-            .map_err(|e| RpcError::new(ErrorCode::BackendError, format!("Text proxy: {e}")))?;
+        let proxy =
+            uncached_proxy(&conn, bus.as_str(), path.as_str(), "org.a11y.atspi.Text").await?;
         let (raw, source): (String, &str) = match mode {
             ReadTextMode::Selection => {
                 let (start, end): (i32, i32) =
@@ -436,7 +471,15 @@ pub fn invoke_menu(app: &str, path: &[String]) -> Result<String, RpcError> {
     let path_owned = path.to_vec();
     block_on_dbus(async move {
         let conn = connect_atspi_bus().await?;
-        let (bus, root_path, _, _, _) = find_atspi_target(&conn, Some(&app_owned), None).await?;
+        let Some((bus, root_path, _, _, _)) =
+            find_atspi_target(&conn, Some(&app_owned), None).await?
+        else {
+            return Err(RpcError::with_next(
+                ErrorCode::NotFound,
+                format!("no accessible application found for {app_owned:?}"),
+                "Ensure at-spi2-core is running and the target app is open.",
+            ));
+        };
 
         let mut current = (bus, root_path);
         for segment in &path_owned {
@@ -451,14 +494,13 @@ pub fn invoke_menu(app: &str, path: &[String]) -> Result<String, RpcError> {
             };
             current = found;
         }
-        let proxy = Proxy::new(
+        let proxy = uncached_proxy(
             &conn,
             current.0.as_str(),
             current.1.as_str(),
             "org.a11y.atspi.Action",
         )
-        .await
-        .map_err(|e| RpcError::new(ErrorCode::BackendError, format!("Action proxy: {e}")))?;
+        .await?;
         let _: bool = proxy.call("DoAction", &(0i32,)).await.map_err(|e| {
             RpcError::new(
                 ErrorCode::BackendError,
@@ -483,11 +525,16 @@ async fn find_menu_child(
     if depth == 0 {
         return None;
     }
-    let children = get_children(conn, bus, path).await;
+    let Ok(proxy) = uncached_proxy(conn, bus, path, "org.a11y.atspi.Accessible").await else {
+        return None;
+    };
+    let children = get_children_via(&proxy).await;
     for (cbus, cpath) in children {
-        let name = get_string_prop(conn, &cbus, &cpath, "Name")
-            .await
-            .unwrap_or_default();
+        let Ok(cproxy) = uncached_proxy(conn, &cbus, &cpath, "org.a11y.atspi.Accessible").await
+        else {
+            continue;
+        };
+        let name: String = cproxy.get_property("Name").await.unwrap_or_default();
         if !name.is_empty() && name.trim().to_ascii_lowercase() == needle {
             return Some((cbus, cpath));
         }
@@ -503,13 +550,20 @@ async fn find_atspi_target(
     conn: &Connection,
     app_filter: Option<&str>,
     win_hint: Option<&WindowInfo>,
-) -> Result<(String, String, AppInfo, Option<String>, Option<u32>), RpcError> {
-    let apps = get_children(conn, ATSPI_REGISTRY_DEST, ATSPI_ROOT_PATH).await;
+) -> Result<Option<(String, String, AppInfo, Option<String>, Option<u32>)>, RpcError> {
+    let Ok(root_proxy) = uncached_proxy(
+        conn,
+        ATSPI_REGISTRY_DEST,
+        ATSPI_ROOT_PATH,
+        "org.a11y.atspi.Accessible",
+    )
+    .await
+    else {
+        return Ok(None);
+    };
+    let apps = get_children_via(&root_proxy).await;
     if apps.is_empty() {
-        return Err(RpcError::new(
-            ErrorCode::NotFound,
-            "AT-SPI2 registry reports no accessible applications",
-        ));
+        return Ok(None);
     }
 
     let filter_lc = app_filter
@@ -518,9 +572,10 @@ async fn find_atspi_target(
 
     let mut chosen: Option<(String, String, String)> = None;
     for (bus, path) in &apps {
-        let name = get_string_prop(conn, bus, path, "Name")
-            .await
-            .unwrap_or_default();
+        let Ok(p) = uncached_proxy(conn, bus, path, "org.a11y.atspi.Accessible").await else {
+            continue;
+        };
+        let name: String = p.get_property("Name").await.unwrap_or_default();
         if let Some(f) = &filter_lc {
             if name.to_ascii_lowercase().contains(f) {
                 chosen = Some((bus.clone(), path.clone(), name));
@@ -532,9 +587,16 @@ async fn find_atspi_target(
         }
     }
 
-    let (app_bus, app_path, app_name) = chosen.ok_or_else(|| {
-        RpcError::new(ErrorCode::NotFound, "no matching AT-SPI2 application found")
-    })?;
+    let Some((app_bus, app_path, app_name)) = chosen else {
+        if let Some(explicit) = app_filter {
+            return Err(RpcError::with_next(
+                ErrorCode::NotFound,
+                format!("no accessible AT-SPI2 application matching {explicit:?}"),
+                "Open the application or call list_windows to inspect available apps.",
+            ));
+        }
+        return Ok(None);
+    };
 
     let app_info = win_hint.map(|w| w.app.clone()).unwrap_or(AppInfo {
         name: app_name,
@@ -545,13 +607,35 @@ async fn find_atspi_target(
     });
 
     // Prefer first frame/window child of the application so the tree starts at the window.
-    let windows = get_children(conn, &app_bus, &app_path).await;
-    if let Some((wbus, wpath)) = windows.into_iter().next() {
-        let wtitle = get_string_prop(conn, &wbus, &wpath, "Name").await;
-        return Ok((wbus, wpath, app_info, wtitle, win_hint.map(|w| w.id)));
+    if let Ok(app_proxy) =
+        uncached_proxy(conn, &app_bus, &app_path, "org.a11y.atspi.Accessible").await
+    {
+        let windows = get_children_via(&app_proxy).await;
+        if let Some((wbus, wpath)) = windows.into_iter().next() {
+            let wtitle = if let Ok(wp) =
+                uncached_proxy(conn, &wbus, &wpath, "org.a11y.atspi.Accessible").await
+            {
+                wp.get_property::<String>("Name").await.ok()
+            } else {
+                None
+            };
+            return Ok(Some((
+                wbus,
+                wpath,
+                app_info,
+                wtitle,
+                win_hint.map(|w| w.id),
+            )));
+        }
     }
 
-    Ok((app_bus, app_path, app_info, None, win_hint.map(|w| w.id)))
+    Ok(Some((
+        app_bus,
+        app_path,
+        app_info,
+        None,
+        win_hint.map(|w| w.id),
+    )))
 }
 
 struct WalkCtx<'a> {
@@ -579,18 +663,30 @@ async fn walk_accessible(
     }
     ctx.total_visited += 1;
 
-    let raw_role = get_role_name(ctx.conn, bus, path).await.unwrap_or_default();
-    let (role, is_password) = normalize_atspi_role(&raw_role);
-    let name = get_string_prop(ctx.conn, bus, path, "Name")
+    // Single non-caching Accessible proxy reused for role, name, description, interfaces, and children.
+    let acc_proxy = uncached_proxy(ctx.conn, bus, path, "org.a11y.atspi.Accessible")
         .await
+        .ok()?;
+
+    let raw_role: String = acc_proxy.call("GetRoleName", &()).await.unwrap_or_default();
+    let (role, is_password) = normalize_atspi_role(&raw_role);
+    let name = acc_proxy
+        .get_property::<String>("Name")
+        .await
+        .ok()
         .map(|s| sanitize_text(&s, 120))
         .filter(|s| !s.is_empty());
-    let desc = get_string_prop(ctx.conn, bus, path, "Description")
+    let desc = acc_proxy
+        .get_property::<String>("Description")
         .await
+        .ok()
         .map(|s| sanitize_text(&s, 120))
         .filter(|s| !s.is_empty());
 
-    let interfaces = get_interfaces(ctx.conn, bus, path).await;
+    let interfaces: Vec<String> = acc_proxy
+        .call("GetInterfaces", &())
+        .await
+        .unwrap_or_default();
     let has_action = interfaces.iter().any(|i| i == "org.a11y.atspi.Action");
     let has_editable = interfaces
         .iter()
@@ -651,7 +747,7 @@ async fn walk_accessible(
 
     let mut children = Vec::new();
     if depth < ctx.max_depth {
-        for (cbus, cpath) in get_children(ctx.conn, bus, path).await {
+        for (cbus, cpath) in get_children_via(&acc_proxy).await {
             if Instant::now() >= ctx.deadline || ctx.entries.len() >= ctx.max_nodes {
                 ctx.truncated = true;
                 break;
@@ -703,10 +799,7 @@ async fn walk_accessible(
     })
 }
 
-async fn get_children(conn: &Connection, bus: &str, path: &str) -> Vec<(String, String)> {
-    let Ok(proxy) = Proxy::new(conn, bus, path, "org.a11y.atspi.Accessible").await else {
-        return Vec::new();
-    };
+async fn get_children_via(proxy: &Proxy<'_>) -> Vec<(String, String)> {
     let count: i32 = proxy.get_property("ChildCount").await.unwrap_or(0);
     let capped = count.clamp(0, 64);
     let mut out = Vec::with_capacity(capped as usize);
@@ -723,32 +816,8 @@ async fn get_children(conn: &Connection, bus: &str, path: &str) -> Vec<(String, 
     out
 }
 
-async fn get_string_prop(conn: &Connection, bus: &str, path: &str, prop: &str) -> Option<String> {
-    let proxy = Proxy::new(conn, bus, path, "org.a11y.atspi.Accessible")
-        .await
-        .ok()?;
-    proxy.get_property::<String>(prop).await.ok()
-}
-
-async fn get_role_name(conn: &Connection, bus: &str, path: &str) -> Option<String> {
-    let proxy = Proxy::new(conn, bus, path, "org.a11y.atspi.Accessible")
-        .await
-        .ok()?;
-    proxy.call::<_, _, String>("GetRoleName", &()).await.ok()
-}
-
-async fn get_interfaces(conn: &Connection, bus: &str, path: &str) -> Vec<String> {
-    let Ok(proxy) = Proxy::new(conn, bus, path, "org.a11y.atspi.Accessible").await else {
-        return Vec::new();
-    };
-    proxy
-        .call::<_, _, Vec<String>>("GetInterfaces", &())
-        .await
-        .unwrap_or_default()
-}
-
 async fn get_extents(conn: &Connection, bus: &str, path: &str) -> Option<Rect> {
-    let proxy = Proxy::new(conn, bus, path, "org.a11y.atspi.Component")
+    let proxy = uncached_proxy(conn, bus, path, "org.a11y.atspi.Component")
         .await
         .ok()?;
     // coord_type 0 = ATSPI_COORD_TYPE_SCREEN
@@ -765,7 +834,7 @@ async fn get_extents(conn: &Connection, bus: &str, path: &str) -> Option<Rect> {
 }
 
 async fn get_text_preview(conn: &Connection, bus: &str, path: &str) -> Option<String> {
-    let proxy = Proxy::new(conn, bus, path, "org.a11y.atspi.Text")
+    let proxy = uncached_proxy(conn, bus, path, "org.a11y.atspi.Text")
         .await
         .ok()?;
     proxy

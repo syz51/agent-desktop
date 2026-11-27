@@ -7,6 +7,7 @@ pub mod wayland;
 pub mod x11;
 pub mod xvfb;
 
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -20,7 +21,7 @@ use desktop_proto::{
     WindowInfo,
 };
 
-use crate::atspi::LinuxRefStore;
+use crate::atspi::{AtSpiSnapshotResult, LinuxRefStore};
 use crate::session::{SessionKind, command_exists, detect_session, local_host_name};
 use crate::x11::X11Session;
 use crate::xvfb::{ManagedXvfb, XvfbConfig};
@@ -40,12 +41,12 @@ pub struct LinuxConfig {
 ///
 /// Supports:
 /// - Interactive X11 sessions (`x11rb` RandR + EWMH + ZPixmap + XTest)
-/// - Managed 24/7 headless `Xvfb` sessions (`desktopd --xvfb`)
+/// - Managed 24/7 headless `Xvfb` sessions (`desktopd --xvfb`, secured with `0600` Xauthority)
 /// - Semantic accessibility & zero-focus actions via AT-SPI2 over D-Bus (`zbus`)
 /// - Wayland sessions via `grim` / XDG Screenshot portal + `wl-clipboard` / `ydotool` / `wtype`
 pub struct LinuxBackend {
     session: SessionKind,
-    _managed_xvfb: Option<ManagedXvfb>,
+    managed_xvfb: Option<ManagedXvfb>,
     stop_flag: Arc<AtomicBool>,
     refs: LinuxRefStore,
 }
@@ -71,13 +72,14 @@ impl LinuxBackend {
         if let Some(dpy) = session.x11_display()
             && !session.is_wayland()
         {
-            let _ = X11Session::connect(dpy)?;
+            let cookie = managed_xvfb.as_ref().map(|x| x.cookie().as_slice());
+            let _ = X11Session::connect(dpy, cookie)?;
         }
 
         tracing::info!(session = ?session, "initialized LinuxBackend");
         Ok(Self {
             session,
-            _managed_xvfb: managed_xvfb,
+            managed_xvfb,
             stop_flag: Arc::new(AtomicBool::new(false)),
             refs: LinuxRefStore::new(),
         })
@@ -88,6 +90,14 @@ impl LinuxBackend {
         &self.session
     }
 
+    fn xauth_cookie(&self) -> Option<&[u8]> {
+        self.managed_xvfb.as_ref().map(|x| x.cookie().as_slice())
+    }
+
+    fn xauth_path(&self) -> Option<&Path> {
+        self.managed_xvfb.as_ref().map(ManagedXvfb::xauth_path)
+    }
+
     fn x11(&self) -> Result<(X11Session, &str), RpcError> {
         let dpy = self.session.x11_display().ok_or_else(|| {
             RpcError::with_next(
@@ -96,7 +106,7 @@ impl LinuxBackend {
                 "Enable XWayland, use AT-SPI2 semantic actions, or run `desktopd --xvfb`.",
             )
         })?;
-        let conn = X11Session::connect(dpy)?;
+        let conn = X11Session::connect(dpy, self.xauth_cookie())?;
         Ok((conn, dpy))
     }
 
@@ -121,11 +131,13 @@ impl PlatformBackend for LinuxBackend {
     fn permissions(&self) -> PermissionsStatus {
         let screen_ok = match &self.session {
             SessionKind::X11 { display } | SessionKind::HeadlessXvfb { display } => {
-                X11Session::connect(display).is_ok()
+                X11Session::connect(display, self.xauth_cookie()).is_ok()
             }
             SessionKind::Wayland { .. } => {
                 let caps = wayland::WaylandCapabilities::probe();
-                caps.has_grim || self.session.x11_display().is_some()
+                caps.has_grim
+                    || self.session.x11_display().is_some()
+                    || wayland::is_screenshot_portal_available()
             }
         };
         // On Linux there is no TCC gate; accessibility is AT-SPI2 if running, or X11 window fallback.
@@ -164,6 +176,9 @@ impl PlatformBackend for LinuxBackend {
             cmd.args(["--question", "--title", title, "--text", message]);
             if let Some(dpy) = self.launch_env_display() {
                 cmd.env("DISPLAY", dpy);
+            }
+            if let Some(auth) = self.xauth_path() {
+                cmd.env("XAUTHORITY", auth);
             }
             let status = cmd.status().map_err(|e| {
                 RpcError::new(ErrorCode::BackendError, format!("zenity failed: {e}"))
@@ -275,6 +290,9 @@ impl PlatformBackend for LinuxBackend {
         if let Some(dpy) = self.launch_env_display() {
             cmd.env("DISPLAY", dpy);
         }
+        if let Some(auth) = self.xauth_path() {
+            cmd.env("XAUTHORITY", auth);
+        }
         let child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -321,14 +339,14 @@ impl PlatformBackend for LinuxBackend {
             .or_else(|| wins.iter().find(|w| w.focused))
             .or_else(|| wins.first());
 
-        if let Ok(snap) =
-            atspi::take_atspi_snapshot(&self.refs, params, fallback_win, redact_passwords)
-        {
-            return Ok(snap);
+        // Propagate real caller errors (`StaleRef`, explicit app `NotFound`); only fall back when
+        // AT-SPI2 itself is unavailable (e.g. minimal Xvfb container without at-spi2-core).
+        match atspi::take_atspi_snapshot(&self.refs, params, fallback_win, redact_passwords)? {
+            AtSpiSnapshotResult::Snapshot(snap) => Ok(*snap),
+            AtSpiSnapshotResult::Unavailable => {
+                Ok(atspi::fallback_window_snapshot(&self.refs, &wins, params))
+            }
         }
-
-        // Graceful degradation when AT-SPI2 bus is not running (e.g. minimal Xvfb container).
-        Ok(atspi::fallback_window_snapshot(&self.refs, &wins, params))
     }
 
     fn resolve_ref(&self, ref_id: &str) -> Result<ResolvedRef, RpcError> {
@@ -487,20 +505,26 @@ impl PlatformBackend for LinuxBackend {
 
         if self.session.is_wayland() && self.session.x11_display().is_none() {
             if replace {
-                let _ = wayland::wayland_key_combo(KeyCombo {
-                    key: KeyCode::A,
-                    modifiers: Modifiers {
-                        ctrl: true,
-                        ..Modifiers::default()
+                let _ = wayland::wayland_key_combo(
+                    KeyCombo {
+                        key: KeyCode::A,
+                        modifiers: Modifiers {
+                            ctrl: true,
+                            ..Modifiers::default()
+                        },
                     },
-                });
+                    1,
+                );
             }
             let info = wayland::wayland_type_text(text)?;
             if submit {
-                let _ = wayland::wayland_key_combo(KeyCombo {
-                    key: KeyCode::Return,
-                    modifiers: Modifiers::default(),
-                });
+                let _ = wayland::wayland_key_combo(
+                    KeyCombo {
+                        key: KeyCode::Return,
+                        modifiers: Modifiers::default(),
+                    },
+                    1,
+                );
             }
             return Ok(info);
         }
@@ -521,6 +545,7 @@ impl PlatformBackend for LinuxBackend {
             std::thread::sleep(Duration::from_millis(15));
         }
 
+        let xauth = self.xauth_path();
         let is_short_ascii = text.len() <= 16 && text.is_ascii();
         let detail = match method {
             TextMethod::Type => {
@@ -528,7 +553,7 @@ impl PlatformBackend for LinuxBackend {
                 format!("xtest typed {n} chars")
             }
             TextMethod::Paste => {
-                conn.paste_text_via_clipboard(&self.stop_flag, dpy, text)?;
+                conn.paste_text_via_clipboard(&self.stop_flag, dpy, xauth, text)?;
                 format!("clipboard pasted {} chars", text.chars().count())
             }
             TextMethod::Auto | TextMethod::Ax => {
@@ -536,7 +561,7 @@ impl PlatformBackend for LinuxBackend {
                     let n = conn.type_text(&self.stop_flag, text)?;
                     format!("xtest typed {n} chars")
                 } else if conn
-                    .paste_text_via_clipboard(&self.stop_flag, dpy, text)
+                    .paste_text_via_clipboard(&self.stop_flag, dpy, xauth, text)
                     .is_ok()
                 {
                     format!("clipboard pasted {} chars", text.chars().count())
@@ -571,7 +596,7 @@ impl PlatformBackend for LinuxBackend {
         _focus_mode: FocusMode,
     ) -> Result<StepExecInfo, RpcError> {
         if self.session.is_wayland() && self.session.x11_display().is_none() {
-            return wayland::wayland_key_combo(combo);
+            return wayland::wayland_key_combo(combo, repeat);
         }
         let (conn, _) = self.x11()?;
         conn.press_key_combo(&self.stop_flag, combo, repeat)
@@ -594,7 +619,7 @@ impl PlatformBackend for LinuxBackend {
             {
                 wayland::read_wayland_clipboard()?
             } else if let Some(dpy) = self.session.x11_display() {
-                x11::read_x11_clipboard(dpy)?
+                x11::read_x11_clipboard(dpy, self.xauth_path())?
             } else {
                 wayland::read_wayland_clipboard()?
             };
@@ -624,14 +649,14 @@ mod linux_live_tests {
     use desktop_core::{AuditLog, DesktopEngine, PlatformBackend as _, PolicyStore, SystemClock};
     use desktop_proto::{
         ActParams, ActionStep, FocusMode, ImageFormat, PostAction, RpcMethod, RpcResult,
-        ScreenshotParams, ScreenshotTarget, SnapshotParams,
+        ScreenshotParams, ScreenshotTarget, SnapshotParams, Target,
     };
 
     use super::*;
 
-    /// Runs live against `$DISPLAY` (e.g. under `xvfb-run` in CI) or launches a managed `Xvfb`!
+    /// Runs live against `$DISPLAY` (e.g. under `xvfb-run` in CI) and also tests managed `-auth` Xvfb!
     #[test]
-    fn live_x11_or_xvfb_capture_input_and_engine_roundtrip() {
+    fn live_x11_capture_input_and_engine_roundtrip() {
         let cfg = if std::env::var("DISPLAY")
             .ok()
             .filter(|s| !s.is_empty())
@@ -651,7 +676,6 @@ mod linux_live_tests {
                 ..LinuxConfig::default()
             }
         } else {
-            // Skip gracefully on bare Linux boxes with neither DISPLAY nor Xvfb.
             return;
         };
 
@@ -698,7 +722,6 @@ mod linux_live_tests {
             &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
         );
 
-        // Full DesktopEngine round-trip: Status, Snapshot (fallback ok), Screenshot, XTest Hover + Key!
         let tmp = tempfile::tempdir().unwrap();
         let engine = DesktopEngine::new(
             backend,
@@ -707,17 +730,26 @@ mod linux_live_tests {
             AuditLog::new(tmp.path()),
         );
 
-        let st = engine.handle(Some(1), RpcMethod::Status).unwrap();
+        let st = engine
+            .handle(Some(1), None, Some("test"), RpcMethod::Status)
+            .unwrap();
         assert!(matches!(st, RpcResult::Status(s) if s.os == "linux"));
 
         let snap = engine
-            .handle(Some(1), RpcMethod::Snapshot(SnapshotParams::default()))
+            .handle(
+                Some(1),
+                None,
+                Some("test"),
+                RpcMethod::Snapshot(SnapshotParams::default()),
+            )
             .unwrap();
         assert!(matches!(snap, RpcResult::Snapshot(_)));
 
         let shot = engine
             .handle(
                 Some(1),
+                None,
+                Some("test"),
                 RpcMethod::Screenshot(ScreenshotParams {
                     target: ScreenshotTarget::Display { index: None },
                     annotate: true,
@@ -732,12 +764,16 @@ mod linux_live_tests {
         let act = engine
             .handle(
                 Some(1),
+                None,
+                Some("test"),
                 RpcMethod::Act(ActParams {
                     steps: vec![
                         ActionStep::Hover {
-                            x: 100.0,
-                            y: 100.0,
-                            display: None,
+                            target: Target::Point {
+                                x: 100.0,
+                                y: 100.0,
+                                display: None,
+                            },
                         },
                         ActionStep::Key {
                             combo: "Shift+a".into(),
@@ -752,5 +788,39 @@ mod linux_live_tests {
             .unwrap();
         assert!(matches!(act, RpcResult::Act(r) if r.steps.len() == 2));
         engine.on_client_disconnect(1);
+    }
+
+    #[test]
+    fn live_managed_authenticated_xvfb_boots_and_captures() {
+        if !session::command_exists("Xvfb") {
+            return;
+        }
+        let backend = LinuxBackend::connect(LinuxConfig {
+            xvfb: true,
+            xvfb_config: XvfbConfig {
+                width: 800,
+                height: 600,
+                depth: 24,
+                start_wm: false,
+                display_hint: Some(120),
+            },
+            ..LinuxConfig::default()
+        })
+        .expect("start authenticated managed Xvfb");
+
+        let displays = backend.displays().unwrap();
+        assert_eq!(displays[0].pixel_width, 800);
+        assert_eq!(displays[0].pixel_height, 600);
+
+        let shot = backend
+            .capture(
+                &ScreenshotTarget::Display { index: Some(0) },
+                ImageFormat::Png,
+                &[],
+                FocusMode::Auto,
+            )
+            .unwrap();
+        assert_eq!(shot.width, 800);
+        assert_eq!(shot.height, 600);
     }
 }

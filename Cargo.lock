@@ -464,6 +464,7 @@ dependencies = [
  "desktop-proto",
  "futures-util",
  "image",
+ "rand",
  "tempfile",
  "tokio",
  "tracing",

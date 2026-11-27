@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -19,7 +20,7 @@ use x11rb::protocol::xproto::{
     StackMode, Visualid, Window,
 };
 use x11rb::protocol::xtest;
-use x11rb::rust_connection::RustConnection;
+use x11rb::rust_connection::{DefaultStream, RustConnection};
 
 use crate::image_encode::{ZPixmapFormat, encode_rgba_screenshot, zpixmap_to_rgba};
 use crate::session::app_info_from_pid;
@@ -83,14 +84,18 @@ pub struct X11Session {
 }
 
 impl X11Session {
-    pub fn connect(display: &str) -> Result<Self, RpcError> {
-        let (conn, screen_num) = RustConnection::connect(Some(display)).map_err(|err| {
-            RpcError::with_next(
-                ErrorCode::BackendError,
-                format!("failed to connect to X11 display {display:?}: {err}"),
-                "Verify DISPLAY is active or start desktopd with --xvfb for headless operation.",
-            )
-        })?;
+    pub fn connect(display: &str, auth_cookie: Option<&[u8]>) -> Result<Self, RpcError> {
+        let (conn, screen_num) = if let Some(cookie) = auth_cookie {
+            connect_with_cookie(display, cookie)?
+        } else {
+            RustConnection::connect(Some(display)).map_err(|err| {
+                RpcError::with_next(
+                    ErrorCode::BackendError,
+                    format!("failed to connect to X11 display {display:?}: {err}"),
+                    "Verify DISPLAY is active or start desktopd with --xvfb for headless operation.",
+                )
+            })?
+        };
         let atoms = Atoms::intern(&conn)?;
         Ok(Self {
             conn,
@@ -405,21 +410,28 @@ impl X11Session {
                 height,
                 ..
             } => {
-                let rx = x.round() as i16;
-                let ry = y.round() as i16;
-                let rw = width.round().clamp(1.0, f64::from(u16::MAX)) as u16;
-                let rh = height.round().clamp(1.0, f64::from(u16::MAX)) as u16;
+                let screen = self.screen();
+                let req = Rect {
+                    x: *x,
+                    y: *y,
+                    width: *width,
+                    height: *height,
+                };
+                let (rx, ry, rw, rh, clipped) =
+                    clip_rect_to_screen(req, screen.width_in_pixels, screen.height_in_pixels)
+                        .ok_or_else(|| {
+                            RpcError::with_next(
+                                ErrorCode::InvalidInput,
+                                "requested capture region lies completely outside the X11 screen",
+                                "Pass a region overlapping the active display bounds.",
+                            )
+                        })?;
                 let rgba = self.grab_drawable_rgba(root, rx, ry, rw, rh)?;
                 encode_rgba_screenshot(
                     rgba,
                     u32::from(rw),
                     u32::from(rh),
-                    Rect {
-                        x: *x,
-                        y: *y,
-                        width: *width,
-                        height: *height,
-                    },
+                    clipped,
                     format,
                     annotate,
                 )
@@ -465,28 +477,32 @@ impl X11Session {
 
         // Try direct window drawable capture first (works on occluded/background windows when
         // Composite redirection is active!). If X11 returns BadMatch (e.g. partially offscreen
-        // or unredirected window), fall back to cropping the root drawable.
+        // or unredirected window), fall back cleanly to the clipped intersection on root.
         let _ = composite::query_version(&self.conn, 0, 4);
-        let rgba = match self.grab_drawable_rgba(window_id, 0, 0, w, h) {
-            Ok(px) => px,
+        let (rgba, final_w, final_h, final_bounds) = match self
+            .grab_drawable_rgba(window_id, 0, 0, w, h)
+        {
+            Ok(px) => (px, u32::from(w), u32::from(h), bounds),
             Err(_) => {
                 let root = self.root();
                 let screen = self.screen();
-                let x0 = (bounds.x.round() as i32).clamp(0, i32::from(screen.width_in_pixels) - 1);
-                let y0 = (bounds.y.round() as i32).clamp(0, i32::from(screen.height_in_pixels) - 1);
-                let max_w = (i32::from(screen.width_in_pixels) - x0).max(1) as u16;
-                let max_h = (i32::from(screen.height_in_pixels) - y0).max(1) as u16;
-                self.grab_drawable_rgba(root, x0 as i16, y0 as i16, w.min(max_w), h.min(max_h))?
+                let (cx, cy, cw, ch, clipped) =
+                    clip_rect_to_screen(bounds, screen.width_in_pixels, screen.height_in_pixels)
+                        .ok_or_else(|| {
+                            RpcError::with_next(
+                                ErrorCode::NotFound,
+                                format!(
+                                    "window w{window_id} lies completely outside the X11 screen"
+                                ),
+                                "Move or focus the window onto a visible display before capturing.",
+                            )
+                        })?;
+                let px = self.grab_drawable_rgba(root, cx, cy, cw, ch)?;
+                (px, u32::from(cw), u32::from(ch), clipped)
             }
         };
 
-        let px_w = (rgba.len() / 4) as u32 / u32::from(h.max(1));
-        let (final_w, final_h) = if px_w > 0 && px_w * u32::from(h) * 4 == rgba.len() as u32 {
-            (px_w, u32::from(h))
-        } else {
-            (u32::from(w), u32::from(h))
-        };
-        encode_rgba_screenshot(rgba, final_w, final_h, bounds, format, annotate)
+        encode_rgba_screenshot(rgba, final_w, final_h, final_bounds, format, annotate)
     }
 
     fn grab_drawable_rgba(
@@ -585,9 +601,11 @@ impl X11Session {
         let mod_codes = self.resolve_modifier_keycodes(mods)?;
         self.warp_pointer(from)?;
         self.press_keycodes(&mod_codes, true)?;
-        self.fake_button(1, true)?;
-        let steps = 12usize;
+        let mut button_down = false;
         let res = (|| -> Result<(), RpcError> {
+            self.fake_button(1, true)?;
+            button_down = true;
+            let steps = 12usize;
             for i in 1..=steps {
                 check_stopped(stop_flag)?;
                 let t = i as f64 / steps as f64;
@@ -600,7 +618,9 @@ impl X11Session {
             }
             Ok(())
         })();
-        let _ = self.fake_button(1, false);
+        if button_down {
+            let _ = self.fake_button(1, false);
+        }
         let _ = self.press_keycodes_rev(&mod_codes, false);
         res?;
         Ok(StepExecInfo {
@@ -683,7 +703,7 @@ impl X11Session {
         })
     }
 
-    /// Type ASCII/mapped characters directly via XTest key events.
+    /// Type ASCII/mapped characters directly via XTest key events, always releasing Shift on error.
     pub fn type_text(&self, stop_flag: &AtomicBool, text: &str) -> Result<usize, RpcError> {
         let keymap = self.load_keymap()?;
         let shift_code = keymap.lookup(XK_SHIFT_L).map(|(kc, _)| kc);
@@ -700,14 +720,21 @@ impl X11Session {
                     "Install xclip or xsel so agent-desktop can paste Unicode text via clipboard.",
                 ));
             };
-            if needs_shift && let Some(sc) = shift_code {
+            let shift_pressed = if needs_shift && let Some(sc) = shift_code {
                 self.fake_key(sc, true)?;
+                Some(sc)
+            } else {
+                None
+            };
+            let step_res = (|| -> Result<(), RpcError> {
+                self.fake_key(keycode, true)?;
+                self.fake_key(keycode, false)?;
+                Ok(())
+            })();
+            if let Some(sc) = shift_pressed {
+                let _ = self.fake_key(sc, false);
             }
-            self.fake_key(keycode, true)?;
-            self.fake_key(keycode, false)?;
-            if needs_shift && let Some(sc) = shift_code {
-                self.fake_key(sc, false)?;
-            }
+            step_res?;
             typed += 1;
             std::thread::sleep(Duration::from_millis(4));
         }
@@ -719,11 +746,12 @@ impl X11Session {
         &self,
         stop_flag: &AtomicBool,
         display: &str,
+        xauth_path: Option<&Path>,
         text: &str,
     ) -> Result<(), RpcError> {
         check_stopped(stop_flag)?;
-        let prev = read_x11_clipboard(display).ok();
-        write_x11_clipboard(display, text)?;
+        let prev = read_x11_clipboard(display, xauth_path).ok();
+        write_x11_clipboard(display, xauth_path, text)?;
         std::thread::sleep(Duration::from_millis(20));
         let paste_combo = KeyCombo {
             key: desktop_proto::KeyCode::V,
@@ -735,7 +763,7 @@ impl X11Session {
         let res = self.press_key_combo(stop_flag, paste_combo, 1);
         std::thread::sleep(Duration::from_millis(45));
         if let Some(old) = prev {
-            let _ = write_x11_clipboard(display, &old);
+            let _ = write_x11_clipboard(display, xauth_path, &old);
         }
         res.map(|_| ())
     }
@@ -971,16 +999,88 @@ impl X11Session {
     }
 }
 
+/// Connect to an X11 display using an explicit `MIT-MAGIC-COOKIE-1` without mutating process env.
+fn connect_with_cookie(display: &str, cookie: &[u8]) -> Result<(RustConnection, usize), RpcError> {
+    use std::os::unix::net::UnixStream;
+
+    let trimmed = display.trim().trim_start_matches(':');
+    let (dpy_str, screen_str) = trimmed
+        .split_once('.')
+        .map_or((trimmed, "0"), |(d, s)| (d, s));
+    let dpy_num: u32 = dpy_str.parse().map_err(|_| {
+        RpcError::new(
+            ErrorCode::BackendError,
+            format!("invalid X11 display {display:?}"),
+        )
+    })?;
+    let screen: usize = screen_str.parse().unwrap_or(0);
+    let sock_path = format!("/tmp/.X11-unix/X{dpy_num}");
+    let unix = UnixStream::connect(&sock_path).map_err(|err| {
+        RpcError::new(
+            ErrorCode::BackendError,
+            format!("failed to connect to X11 Unix socket {sock_path}: {err}"),
+        )
+    })?;
+    let (stream, _) = DefaultStream::from_unix_stream(unix).map_err(|err| {
+        RpcError::new(
+            ErrorCode::BackendError,
+            format!("failed to wrap X11 Unix stream {sock_path}: {err}"),
+        )
+    })?;
+    let conn = RustConnection::connect_to_stream_with_auth_info(
+        stream,
+        screen,
+        b"MIT-MAGIC-COOKIE-1".to_vec(),
+        cookie.to_vec(),
+    )
+    .map_err(|err| {
+        RpcError::new(
+            ErrorCode::BackendError,
+            format!("X11 auth handshake failed on {display:?}: {err}"),
+        )
+    })?;
+    Ok((conn, screen))
+}
+
+/// Intersect a requested rectangle with the root X11 screen `[0, screen_w) x [0, screen_h)`.
+#[must_use]
+pub fn clip_rect_to_screen(
+    rect: Rect,
+    screen_w: u16,
+    screen_h: u16,
+) -> Option<(i16, i16, u16, u16, Rect)> {
+    let sw = i32::from(screen_w);
+    let sh = i32::from(screen_h);
+    let x0 = (rect.x.round() as i32).clamp(0, sw);
+    let y0 = (rect.y.round() as i32).clamp(0, sh);
+    let x1 = ((rect.x + rect.width).round() as i32).clamp(0, sw);
+    let y1 = ((rect.y + rect.height).round() as i32).clamp(0, sh);
+    let w = x1 - x0;
+    let h = y1 - y0;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let clipped = Rect {
+        x: f64::from(x0),
+        y: f64::from(y0),
+        width: f64::from(w),
+        height: f64::from(h),
+    };
+    Some((x0 as i16, y0 as i16, w as u16, h as u16, clipped))
+}
+
 /// Read X11 clipboard text using `xclip` or `xsel`.
-pub fn read_x11_clipboard(display: &str) -> Result<String, RpcError> {
+pub fn read_x11_clipboard(display: &str, xauth_path: Option<&Path>) -> Result<String, RpcError> {
     for (bin, args) in [
         ("xclip", &["-o", "-selection", "clipboard"][..]),
         ("xsel", &["-ob"][..]),
     ] {
-        if let Ok(out) = Command::new(bin)
-            .args(args)
-            .env("DISPLAY", display)
-            .output()
+        let mut cmd = Command::new(bin);
+        cmd.args(args).env("DISPLAY", display);
+        if let Some(auth) = xauth_path {
+            cmd.env("XAUTHORITY", auth);
+        }
+        if let Ok(out) = cmd.output()
             && out.status.success()
         {
             return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
@@ -994,21 +1094,27 @@ pub fn read_x11_clipboard(display: &str) -> Result<String, RpcError> {
 }
 
 /// Write X11 clipboard text using `xclip` or `xsel`.
-pub fn write_x11_clipboard(display: &str, text: &str) -> Result<(), RpcError> {
+pub fn write_x11_clipboard(
+    display: &str,
+    xauth_path: Option<&Path>,
+    text: &str,
+) -> Result<(), RpcError> {
     use std::io::Write as _;
 
     for (bin, args) in [
         ("xclip", &["-i", "-selection", "clipboard"][..]),
         ("xsel", &["-ib"][..]),
     ] {
-        if let Ok(mut child) = Command::new(bin)
-            .args(args)
+        let mut cmd = Command::new(bin);
+        cmd.args(args)
             .env("DISPLAY", display)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+            .stderr(Stdio::null());
+        if let Some(auth) = xauth_path {
+            cmd.env("XAUTHORITY", auth);
+        }
+        if let Ok(mut child) = cmd.spawn() {
             if let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(text.as_bytes());
             }
@@ -1031,19 +1137,28 @@ struct X11Keymap {
 }
 
 impl X11Keymap {
+    /// Two-pass X11 keymap index: unshifted column-0 always takes precedence over shifted column-1.
     fn from_mapping(min_kc: u8, per_keycode: u8, keysyms: &[u32]) -> Self {
         let mut map = HashMap::new();
         let stride = usize::from(per_keycode.max(1));
+
+        // Pass 1: column 0 (unshifted).
         for (idx, chunk) in keysyms.chunks(stride).enumerate() {
             let Some(kc) = min_kc.checked_add(idx as u8) else {
                 break;
             };
-            // Column 0 = unshifted, Column 1 = shifted.
             if let Some(&sym0) = chunk.first()
                 && sym0 != 0
             {
                 map.entry(sym0).or_insert((kc, false));
             }
+        }
+
+        // Pass 2: column 1 (shifted) only when not already mapped unshifted.
+        for (idx, chunk) in keysyms.chunks(stride).enumerate() {
+            let Some(kc) = min_kc.checked_add(idx as u8) else {
+                break;
+            };
             if let Some(&sym1) = chunk.get(1)
                 && sym1 != 0
             {
@@ -1054,7 +1169,18 @@ impl X11Keymap {
     }
 
     fn lookup(&self, keysym: u32) -> Option<(u8, bool)> {
-        self.map.get(&keysym).copied()
+        if let Some(found) = self.map.get(&keysym).copied() {
+            return Some(found);
+        }
+        // Standard X11 core protocol rule: if a keycode only lists lowercase `[XK_a, 0]`,
+        // Shift + that keycode produces uppercase `XK_A`.
+        if (u32::from(b'A')..=u32::from(b'Z')).contains(&keysym) {
+            let lower = keysym + 32;
+            if let Some((kc, _)) = self.map.get(&lower).copied() {
+                return Some((kc, true));
+            }
+        }
+        None
     }
 
     fn modifier_keycodes(&self, mods: Modifiers) -> Vec<u8> {
@@ -1121,48 +1247,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keymap_maps_unshifted_and_shifted_keysyms() {
-        // Keycode 38 -> 'a' / 'A', keycode 50 -> Shift_L / Shift_L
+    fn keymap_prefers_unshifted_and_handles_implicit_uppercase() {
+        // Keycode 38 -> ['a', 0] (minimal Xvfb style without explicit 'A' in col 1)
+        // Keycode 39 -> ['1', '!']
+        // Keycode 40 -> ['!', '@'] (unshifted '!' on later keycode should win over shifted col 1)
         let km = X11Keymap::from_mapping(
             38,
             2,
             &[
                 u32::from(b'a'),
-                u32::from(b'A'),
                 0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
+                u32::from(b'1'),
+                u32::from(b'!'),
+                u32::from(b'!'),
+                u32::from(b'@'),
                 XK_SHIFT_L,
                 XK_SHIFT_L,
             ],
         );
         assert_eq!(km.lookup(u32::from(b'a')), Some((38, false)));
         assert_eq!(km.lookup(u32::from(b'A')), Some((38, true)));
+        assert_eq!(km.lookup(u32::from(b'!')), Some((40, false)));
+        assert_eq!(km.lookup(u32::from(b'@')), Some((40, true)));
         assert_eq!(
             km.modifier_keycodes(Modifiers {
                 shift: true,
                 ..Modifiers::default()
             }),
-            vec![50]
+            vec![41]
+        );
+    }
+
+    #[test]
+    fn clips_partially_offscreen_and_negative_origin_windows_accurately() {
+        // Partially below bottom edge: 800x600 at y=500 on 1280x800 -> 800x300 at (0,500)
+        let (x, y, w, h, bounds) = clip_rect_to_screen(
+            Rect {
+                x: 0.0,
+                y: 500.0,
+                width: 800.0,
+                height: 600.0,
+            },
+            1280,
+            800,
+        )
+        .unwrap();
+        assert_eq!((x, y, w, h), (0, 500, 800, 300));
+        assert_eq!(bounds.height, 300.0);
+
+        // Negative origin: 400x300 at (-100, -50) -> 300x250 at (0, 0)
+        let (x, y, w, h, bounds) = clip_rect_to_screen(
+            Rect {
+                x: -100.0,
+                y: -50.0,
+                width: 400.0,
+                height: 300.0,
+            },
+            1280,
+            800,
+        )
+        .unwrap();
+        assert_eq!((x, y, w, h), (0, 0, 300, 250));
+        assert_eq!(bounds.x, 0.0);
+        assert_eq!(bounds.width, 300.0);
+
+        // Completely offscreen -> None
+        assert!(
+            clip_rect_to_screen(
+                Rect {
+                    x: 1500.0,
+                    y: 0.0,
+                    width: 200.0,
+                    height: 200.0,
+                },
+                1280,
+                800,
+            )
+            .is_none()
         );
     }
 }

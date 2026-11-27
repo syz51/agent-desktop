@@ -130,7 +130,7 @@ fn main() -> Result<()> {
             AuditLog::new(&state_dir),
         ));
         let rt = tokio::runtime::Runtime::new()?;
-        return rt.block_on(run_with_signals(socket, fleet_path, engine, None));
+        rt.block_on(run_with_signals(socket, fleet_path, engine, None))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

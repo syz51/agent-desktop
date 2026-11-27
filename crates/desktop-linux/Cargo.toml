@@ -12,6 +12,7 @@ desktop-core.workspace = true
 desktop-proto.workspace = true
 futures-util.workspace = true
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+rand.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true

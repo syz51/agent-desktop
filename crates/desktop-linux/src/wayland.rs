@@ -4,13 +4,13 @@ use std::process::{Command, Stdio};
 
 use desktop_core::{AnnotateBox, RawScreenshot, StepExecInfo};
 use desktop_proto::{
-    ErrorCode, ImageFormat, KeyCombo, MouseButton, Point, Rect, RpcError, ScreenshotTarget,
-    ScrollDirection,
+    ErrorCode, ImageFormat, KeyCode, KeyCombo, MouseButton, Point, Rect, RpcError,
+    ScreenshotTarget, ScrollDirection,
 };
 use uuid::Uuid;
-use zbus::{Connection, OwnedObjectPath, Proxy, Variant};
+use zbus::{Connection, OwnedObjectPath, Variant};
 
-use crate::atspi::block_on_dbus;
+use crate::atspi::{block_on_dbus, uncached_proxy};
 use crate::image_encode::{decode_to_rgba, encode_rgba_screenshot};
 use crate::session::command_exists;
 
@@ -33,6 +33,29 @@ impl WaylandCapabilities {
             has_wtype: command_exists("wtype"),
         }
     }
+}
+
+/// Probe whether `org.freedesktop.portal.Desktop` is available on the session D-Bus.
+#[must_use]
+pub fn is_screenshot_portal_available() -> bool {
+    block_on_dbus(async {
+        let conn = Connection::session()
+            .await
+            .map_err(|e| RpcError::new(ErrorCode::BackendError, format!("session bus: {e}")))?;
+        let proxy = uncached_proxy(
+            &conn,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+        )
+        .await?;
+        let has_owner: bool = proxy
+            .call("NameHasOwner", &("org.freedesktop.portal.Desktop",))
+            .await
+            .unwrap_or(false);
+        Ok(has_owner)
+    })
+    .unwrap_or(false)
 }
 
 /// Capture a screenshot on a pure Wayland session via `grim` (wlroots) or XDG Screenshot portal.
@@ -102,6 +125,47 @@ pub fn capture_wayland(
     encode_rgba_screenshot(rgba, w, h, bounds, format, annotate)
 }
 
+/// Compute the deterministic XDG Desktop Portal request object path per the portal spec.
+#[must_use]
+pub fn portal_request_path(unique_name: &str, handle_token: &str) -> String {
+    let sender = unique_name.trim_start_matches(':').replace('.', "_");
+    format!("/org/freedesktop/portal/desktop/request/{sender}/{handle_token}")
+}
+
+/// Decode a `file://` URI (handling percent-encoded UTF-8 bytes such as `%20`).
+#[must_use]
+pub fn decode_file_uri(uri: &str) -> String {
+    let raw = uri
+        .strip_prefix("file://localhost")
+        .or_else(|| uri.strip_prefix("file://"))
+        .unwrap_or(uri);
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn portal_screenshot_bytes() -> Result<Vec<u8>, RpcError> {
     block_on_dbus(async {
         let conn = Connection::session().await.map_err(|e| {
@@ -111,27 +175,47 @@ fn portal_screenshot_bytes() -> Result<Vec<u8>, RpcError> {
                 "Run inside a Wayland session with xdg-desktop-portal, install grim, or run desktopd --xvfb.",
             )
         })?;
-        let proxy = Proxy::new(
+        let unique_name = conn
+            .unique_name()
+            .map(|n| n.as_str().to_string())
+            .ok_or_else(|| {
+                RpcError::new(
+                    ErrorCode::BackendError,
+                    "session D-Bus connection has no unique name",
+                )
+            })?;
+
+        let token = format!("agent_desktop_{}", Uuid::new_v4().simple());
+        let expected_path = portal_request_path(&unique_name, &token);
+
+        // Subscribe to Request.Response BEFORE invoking Screenshot to avoid missing fast responses.
+        let req_proxy = uncached_proxy(
+            &conn,
+            "org.freedesktop.portal.Desktop",
+            &expected_path,
+            "org.freedesktop.portal.Request",
+        )
+        .await?;
+        let mut stream = req_proxy.receive_signal("Response").await.map_err(|e| {
+            RpcError::new(
+                ErrorCode::BackendError,
+                format!("portal signal subscribe error: {e}"),
+            )
+        })?;
+
+        let proxy = uncached_proxy(
             &conn,
             "org.freedesktop.portal.Desktop",
             "/org/freedesktop/portal/desktop",
             "org.freedesktop.portal.Screenshot",
         )
-        .await
-        .map_err(|e| {
-            RpcError::with_next(
-                ErrorCode::BackendError,
-                format!("org.freedesktop.portal.Screenshot unavailable: {e}"),
-                "Install xdg-desktop-portal or grim on Wayland, or run desktopd --xvfb.",
-            )
-        })?;
+        .await?;
 
-        let token = format!("agent_desktop_{}", Uuid::new_v4().simple());
         let mut opts: HashMap<&str, Variant<'_>> = HashMap::new();
         opts.insert("handle_token", Variant::from(token.as_str()));
         opts.insert("interactive", Variant::from(false));
 
-        let req_path: OwnedObjectPath =
+        let actual_path: OwnedObjectPath =
             proxy.call("Screenshot", &("", opts)).await.map_err(|e| {
                 RpcError::new(
                     ErrorCode::BackendError,
@@ -139,18 +223,22 @@ fn portal_screenshot_bytes() -> Result<Vec<u8>, RpcError> {
                 )
             })?;
 
-        let req_proxy = Proxy::new(
-            &conn,
-            "org.freedesktop.portal.Desktop",
-            req_path.as_str(),
-            "org.freedesktop.portal.Request",
-        )
-        .await
-        .map_err(|e| RpcError::new(ErrorCode::BackendError, format!("Request proxy: {e}")))?;
-
-        let mut stream = req_proxy.receive_signal("Response").await.map_err(|e| {
-            RpcError::new(ErrorCode::BackendError, format!("portal signal error: {e}"))
-        })?;
+        // Fallback if an older portal returns a non-standard request path.
+        if actual_path.as_str() != expected_path {
+            let alt_proxy = uncached_proxy(
+                &conn,
+                "org.freedesktop.portal.Desktop",
+                actual_path.as_str(),
+                "org.freedesktop.portal.Request",
+            )
+            .await?;
+            stream = alt_proxy.receive_signal("Response").await.map_err(|e| {
+                RpcError::new(
+                    ErrorCode::BackendError,
+                    format!("portal signal subscribe error: {e}"),
+                )
+            })?;
+        }
 
         use futures_util::StreamExt as _;
         let sig = tokio::time::timeout(std::time::Duration::from_secs(6), stream.next())
@@ -192,14 +280,14 @@ fn portal_screenshot_bytes() -> Result<Vec<u8>, RpcError> {
                     "Wayland screenshot portal returned no image URI",
                 )
             })?;
-        let path = uri.strip_prefix("file://").unwrap_or(uri);
-        let bytes = std::fs::read(path).map_err(|e| {
+        let path = decode_file_uri(uri);
+        let bytes = std::fs::read(&path).map_err(|e| {
             RpcError::new(
                 ErrorCode::BackendError,
                 format!("failed to read portal screenshot {path}: {e}"),
             )
         })?;
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&path);
         Ok(bytes)
     })
 }
@@ -376,7 +464,87 @@ pub fn wayland_type_text(text: &str) -> Result<StepExecInfo, RpcError> {
     ))
 }
 
-pub fn wayland_key_combo(combo: KeyCombo) -> Result<StepExecInfo, RpcError> {
+/// Exact XKB keysym names accepted by `wtype -k <name>`.
+#[must_use]
+pub fn xkb_keysym_name(key: KeyCode) -> &'static str {
+    match key {
+        KeyCode::A => "a",
+        KeyCode::B => "b",
+        KeyCode::C => "c",
+        KeyCode::D => "d",
+        KeyCode::E => "e",
+        KeyCode::F => "f",
+        KeyCode::G => "g",
+        KeyCode::H => "h",
+        KeyCode::I => "i",
+        KeyCode::J => "j",
+        KeyCode::K => "k",
+        KeyCode::L => "l",
+        KeyCode::M => "m",
+        KeyCode::N => "n",
+        KeyCode::O => "o",
+        KeyCode::P => "p",
+        KeyCode::Q => "q",
+        KeyCode::R => "r",
+        KeyCode::S => "s",
+        KeyCode::T => "t",
+        KeyCode::U => "u",
+        KeyCode::V => "v",
+        KeyCode::W => "w",
+        KeyCode::X => "x",
+        KeyCode::Y => "y",
+        KeyCode::Z => "z",
+        KeyCode::Digit0 => "0",
+        KeyCode::Digit1 => "1",
+        KeyCode::Digit2 => "2",
+        KeyCode::Digit3 => "3",
+        KeyCode::Digit4 => "4",
+        KeyCode::Digit5 => "5",
+        KeyCode::Digit6 => "6",
+        KeyCode::Digit7 => "7",
+        KeyCode::Digit8 => "8",
+        KeyCode::Digit9 => "9",
+        KeyCode::Minus => "minus",
+        KeyCode::Equal => "equal",
+        KeyCode::LeftBracket => "bracketleft",
+        KeyCode::RightBracket => "bracketright",
+        KeyCode::Backslash => "backslash",
+        KeyCode::Semicolon => "semicolon",
+        KeyCode::Quote => "apostrophe",
+        KeyCode::Comma => "comma",
+        KeyCode::Period => "period",
+        KeyCode::Slash => "slash",
+        KeyCode::Grave => "grave",
+        KeyCode::Return => "Return",
+        KeyCode::Tab => "Tab",
+        KeyCode::Space => "space",
+        KeyCode::Backspace => "BackSpace",
+        KeyCode::Delete => "Delete",
+        KeyCode::Escape => "Escape",
+        KeyCode::Home => "Home",
+        KeyCode::End => "End",
+        KeyCode::PageUp => "Page_Up",
+        KeyCode::PageDown => "Page_Down",
+        KeyCode::Left => "Left",
+        KeyCode::Right => "Right",
+        KeyCode::Up => "Up",
+        KeyCode::Down => "Down",
+        KeyCode::F1 => "F1",
+        KeyCode::F2 => "F2",
+        KeyCode::F3 => "F3",
+        KeyCode::F4 => "F4",
+        KeyCode::F5 => "F5",
+        KeyCode::F6 => "F6",
+        KeyCode::F7 => "F7",
+        KeyCode::F8 => "F8",
+        KeyCode::F9 => "F9",
+        KeyCode::F10 => "F10",
+        KeyCode::F11 => "F11",
+        KeyCode::F12 => "F12",
+    }
+}
+
+pub fn wayland_key_combo(combo: KeyCombo, repeat: u8) -> Result<StepExecInfo, RpcError> {
     if !command_exists("wtype") {
         return Err(RpcError::with_next(
             ErrorCode::BackendError,
@@ -384,33 +552,49 @@ pub fn wayland_key_combo(combo: KeyCombo) -> Result<StepExecInfo, RpcError> {
             "Install wtype or run under X11/Xvfb.",
         ));
     }
-    let mut args: Vec<String> = Vec::new();
+    let key_name = xkb_keysym_name(combo.key);
+    let mut args: Vec<&str> = Vec::new();
     if combo.modifiers.ctrl {
-        args.extend(["-M".into(), "ctrl".into()]);
+        args.extend(["-M", "ctrl"]);
     }
     if combo.modifiers.alt {
-        args.extend(["-M".into(), "alt".into()]);
+        args.extend(["-M", "alt"]);
     }
     if combo.modifiers.shift {
-        args.extend(["-M".into(), "shift".into()]);
+        args.extend(["-M", "shift"]);
     }
     if combo.modifiers.cmd {
-        args.extend(["-M".into(), "logo".into()]);
+        args.extend(["-M", "logo"]);
     }
-    let key_name = format!("{:?}", combo.key);
-    args.extend(["-k".into(), key_name.clone()]);
-    let status = Command::new("wtype")
-        .args(&args)
-        .status()
-        .map_err(|e| RpcError::new(ErrorCode::BackendError, format!("wtype failed: {e}")))?;
-    if !status.success() {
-        return Err(RpcError::new(
-            ErrorCode::BackendError,
-            format!("wtype exited with non-zero status for {key_name}"),
-        ));
+    args.extend(["-k", key_name]);
+    if combo.modifiers.cmd {
+        args.extend(["-m", "logo"]);
+    }
+    if combo.modifiers.shift {
+        args.extend(["-m", "shift"]);
+    }
+    if combo.modifiers.alt {
+        args.extend(["-m", "alt"]);
+    }
+    if combo.modifiers.ctrl {
+        args.extend(["-m", "ctrl"]);
+    }
+
+    let count = repeat.max(1);
+    for _ in 0..count {
+        let status = Command::new("wtype")
+            .args(&args)
+            .status()
+            .map_err(|e| RpcError::new(ErrorCode::BackendError, format!("wtype failed: {e}")))?;
+        if !status.success() {
+            return Err(RpcError::new(
+                ErrorCode::BackendError,
+                format!("wtype exited with non-zero status for {key_name}"),
+            ));
+        }
     }
     Ok(StepExecInfo {
-        detail: format!("wtype pressed {key_name}"),
+        detail: format!("wtype pressed {key_name} x{count}"),
         used_background: false,
     })
 }
@@ -428,4 +612,32 @@ fn run_ydotool(args: &[&str]) -> Result<(), RpcError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_xkb_keysym_names_and_decodes_portal_uris() {
+        assert_eq!(xkb_keysym_name(KeyCode::A), "a");
+        assert_eq!(xkb_keysym_name(KeyCode::Digit0), "0");
+        assert_eq!(xkb_keysym_name(KeyCode::Backspace), "BackSpace");
+        assert_eq!(xkb_keysym_name(KeyCode::Space), "space");
+        assert_eq!(xkb_keysym_name(KeyCode::PageUp), "Page_Up");
+        assert_eq!(xkb_keysym_name(KeyCode::Quote), "apostrophe");
+
+        assert_eq!(
+            portal_request_path(":1.42", "tok123"),
+            "/org/freedesktop/portal/desktop/request/1_42/tok123"
+        );
+        assert_eq!(
+            decode_file_uri("file:///tmp/Screenshot%20from%202026.png"),
+            "/tmp/Screenshot from 2026.png"
+        );
+        assert_eq!(
+            decode_file_uri("file://localhost/tmp/caf%C3%A9.png"),
+            "/tmp/café.png"
+        );
+    }
 }
