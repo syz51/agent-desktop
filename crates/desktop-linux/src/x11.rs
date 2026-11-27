@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,6 +13,7 @@ use desktop_proto::{
 };
 use x11rb::CURRENT_TIME;
 use x11rb::connection::Connection as _;
+use x11rb::errors::{ConnectError, ConnectionError, ReplyError};
 use x11rb::protocol::composite;
 use x11rb::protocol::randr::{self, Connection as RandrConnection};
 use x11rb::protocol::screensaver;
@@ -37,6 +39,62 @@ const XTEST_BUTTON_PRESS: u8 = 4;
 const XTEST_BUTTON_RELEASE: u8 = 5;
 const XTEST_MOTION_NOTIFY: u8 = 6;
 
+const X11_CONNECT_RETRY_DELAYS_MS: &[u64] = &[15, 30, 50, 80, 120];
+
+struct ConnectAttemptError {
+    error: RpcError,
+    transient: bool,
+}
+
+fn is_transient_io_error(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+    )
+}
+
+fn is_transient_connect_error(err: &ConnectError) -> bool {
+    match err {
+        ConnectError::IoError(io_err) => is_transient_io_error(io_err.kind()),
+        ConnectError::Incomplete { .. } => true,
+        _ => false,
+    }
+}
+
+fn is_transient_connection_error(err: &ConnectionError) -> bool {
+    matches!(err, ConnectionError::IoError(io_err) if is_transient_io_error(io_err.kind()))
+}
+
+fn is_transient_reply_error(err: &ReplyError) -> bool {
+    matches!(err, ReplyError::ConnectionError(c) if is_transient_connection_error(c))
+}
+
+fn retry_transient_connect<T>(
+    delays_ms: &[u64],
+    mut attempt: impl FnMut() -> Result<T, ConnectAttemptError>,
+) -> Result<T, RpcError> {
+    let mut retry_iter = delays_ms.iter().copied();
+    loop {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(err) if err.transient => {
+                let Some(delay_ms) = retry_iter.next() else {
+                    return Err(err.error);
+                };
+                if delay_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                }
+            }
+            Err(err) => return Err(err.error),
+        }
+    }
+}
+
 /// Interned EWMH/ICCCM atoms cached per X11 connection.
 struct Atoms {
     net_client_list_stacking: Atom,
@@ -53,13 +111,22 @@ struct Atoms {
 }
 
 impl Atoms {
-    fn intern(conn: &RustConnection) -> Result<Self, RpcError> {
-        let intern_one = |name: &[u8]| -> Result<Atom, RpcError> {
-            conn.intern_atom(false, name)
-                .map_err(x11_err)?
-                .reply()
-                .map(|r| r.atom)
-                .map_err(x11_reply_err)
+    fn intern(conn: &RustConnection) -> Result<Self, ConnectAttemptError> {
+        let intern_one = |name: &[u8]| -> Result<Atom, ConnectAttemptError> {
+            let cookie = conn.intern_atom(false, name).map_err(|err| {
+                let transient = is_transient_connection_error(&err);
+                ConnectAttemptError {
+                    error: x11_err(err),
+                    transient,
+                }
+            })?;
+            cookie.reply().map(|r| r.atom).map_err(|err| {
+                let transient = is_transient_reply_error(&err);
+                ConnectAttemptError {
+                    error: x11_reply_err(err),
+                    transient,
+                }
+            })
         };
         Ok(Self {
             net_client_list_stacking: intern_one(b"_NET_CLIENT_LIST_STACKING")?,
@@ -86,23 +153,39 @@ pub struct X11Session {
 
 impl X11Session {
     pub fn connect(display: &str, auth_cookie: Option<&[u8]>) -> Result<Self, RpcError> {
-        let (conn, screen_num) = if let Some(cookie) = auth_cookie {
-            connect_with_cookie(display, cookie)?
-        } else {
-            RustConnection::connect(Some(display)).map_err(|err| {
-                RpcError::with_next(
-                    ErrorCode::BackendError,
-                    format!("failed to connect to X11 display {display:?}: {err}"),
-                    "Verify DISPLAY is active or start desktopd with --xvfb for headless operation.",
-                )
-            })?
-        };
-        let atoms = Atoms::intern(&conn)?;
-        Ok(Self {
-            conn,
-            screen_num,
-            atoms,
+        retry_transient_connect(X11_CONNECT_RETRY_DELAYS_MS, || {
+            let (conn, screen_num) = if let Some(cookie) = auth_cookie {
+                connect_with_cookie(display, cookie)?
+            } else {
+                RustConnection::connect(Some(display)).map_err(|err| {
+                    let transient = is_transient_connect_error(&err);
+                    ConnectAttemptError {
+                        error: RpcError::with_next(
+                            ErrorCode::BackendError,
+                            format!("failed to connect to X11 display {display:?}: {err}"),
+                            "Verify DISPLAY is active or start desktopd with --xvfb for headless operation.",
+                        ),
+                        transient,
+                    }
+                })?
+            };
+            let atoms = Atoms::intern(&conn)?;
+            Ok(Self {
+                conn,
+                screen_num,
+                atoms,
+            })
         })
+    }
+
+    /// Verify that the underlying X11 connection is still responsive.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.conn
+            .get_input_focus()
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .is_some()
     }
 
     fn root(&self) -> Window {
@@ -1031,32 +1114,38 @@ impl X11Session {
 }
 
 /// Connect to an X11 display using an explicit `MIT-MAGIC-COOKIE-1` without mutating process env.
-fn connect_with_cookie(display: &str, cookie: &[u8]) -> Result<(RustConnection, usize), RpcError> {
+fn connect_with_cookie(
+    display: &str,
+    cookie: &[u8],
+) -> Result<(RustConnection, usize), ConnectAttemptError> {
     use std::os::unix::net::UnixStream;
 
     let trimmed = display.trim().trim_start_matches(':');
     let (dpy_str, screen_str) = trimmed
         .split_once('.')
         .map_or((trimmed, "0"), |(d, s)| (d, s));
-    let dpy_num: u32 = dpy_str.parse().map_err(|_| {
-        RpcError::new(
+    let dpy_num: u32 = dpy_str.parse().map_err(|_| ConnectAttemptError {
+        error: RpcError::new(
             ErrorCode::BackendError,
             format!("invalid X11 display {display:?}"),
-        )
+        ),
+        transient: false,
     })?;
     let screen: usize = screen_str.parse().unwrap_or(0);
     let sock_path = format!("/tmp/.X11-unix/X{dpy_num}");
-    let unix = UnixStream::connect(&sock_path).map_err(|err| {
-        RpcError::new(
+    let unix = UnixStream::connect(&sock_path).map_err(|err| ConnectAttemptError {
+        transient: is_transient_io_error(err.kind()),
+        error: RpcError::new(
             ErrorCode::BackendError,
             format!("failed to connect to X11 Unix socket {sock_path}: {err}"),
-        )
+        ),
     })?;
-    let (stream, _) = DefaultStream::from_unix_stream(unix).map_err(|err| {
-        RpcError::new(
+    let (stream, _) = DefaultStream::from_unix_stream(unix).map_err(|err| ConnectAttemptError {
+        transient: is_transient_io_error(err.kind()),
+        error: RpcError::new(
             ErrorCode::BackendError,
             format!("failed to wrap X11 Unix stream {sock_path}: {err}"),
-        )
+        ),
     })?;
     let conn = RustConnection::connect_to_stream_with_auth_info(
         stream,
@@ -1064,11 +1153,12 @@ fn connect_with_cookie(display: &str, cookie: &[u8]) -> Result<(RustConnection, 
         b"MIT-MAGIC-COOKIE-1".to_vec(),
         cookie.to_vec(),
     )
-    .map_err(|err| {
-        RpcError::new(
+    .map_err(|err| ConnectAttemptError {
+        transient: is_transient_connect_error(&err),
+        error: RpcError::new(
             ErrorCode::BackendError,
             format!("X11 auth handshake failed on {display:?}: {err}"),
-        )
+        ),
     })?;
     Ok((conn, screen))
 }
@@ -1356,5 +1446,66 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn transient_connect_retry_recovers_and_fails_fast_on_permanent_errors() {
+        assert!(is_transient_io_error(ErrorKind::ConnectionReset));
+        assert!(is_transient_io_error(ErrorKind::ConnectionRefused));
+        assert!(is_transient_io_error(ErrorKind::BrokenPipe));
+        assert!(is_transient_io_error(ErrorKind::UnexpectedEof));
+        assert!(!is_transient_io_error(ErrorKind::NotFound));
+        assert!(!is_transient_io_error(ErrorKind::PermissionDenied));
+        assert!(is_transient_connect_error(&ConnectError::Incomplete {
+            expected: 8,
+            received: 0,
+        }));
+        assert!(!is_transient_connect_error(&ConnectError::InvalidScreen));
+
+        // Recovers after two transient resets (e.g. Xvfb server reset window).
+        let mut attempts = 0usize;
+        let val = retry_transient_connect(&[0, 0, 0], || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(ConnectAttemptError {
+                    error: RpcError::new(ErrorCode::BackendError, "connection reset"),
+                    transient: true,
+                })
+            } else {
+                Ok("connected")
+            }
+        })
+        .unwrap();
+        assert_eq!(val, "connected");
+        assert_eq!(attempts, 3);
+
+        // Permanent error fails immediately without consuming retries.
+        let mut permanent_attempts = 0usize;
+        let err = retry_transient_connect::<()>(&[0, 0, 0], || {
+            permanent_attempts += 1;
+            Err(ConnectAttemptError {
+                error: RpcError::new(ErrorCode::BackendError, "socket not found"),
+                transient: false,
+            })
+        })
+        .unwrap_err();
+        assert_eq!(permanent_attempts, 1);
+        assert!(err.message.contains("socket not found"));
+
+        // Exhausting retries returns the last transient error.
+        let mut exhausted_attempts = 0usize;
+        let err = retry_transient_connect::<()>(&[0, 0], || {
+            exhausted_attempts += 1;
+            Err(ConnectAttemptError {
+                error: RpcError::new(
+                    ErrorCode::BackendError,
+                    format!("attempt {exhausted_attempts} reset"),
+                ),
+                transient: true,
+            })
+        })
+        .unwrap_err();
+        assert_eq!(exhausted_attempts, 3);
+        assert!(err.message.contains("attempt 3 reset"));
     }
 }
