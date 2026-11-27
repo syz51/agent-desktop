@@ -22,7 +22,10 @@ mod macos_backend {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    use desktop_core::{AnnotateBox, PlatformBackend, RawScreenshot, ResolvedRef, StepExecInfo};
+    use desktop_core::{
+        AnnotateBox, EscKillSwitch, PlatformBackend, RawScreenshot, ResolvedRef, StepExecInfo,
+        Timestamp,
+    };
     use desktop_proto::{
         AppInfo, ClickMode, DisplayInfo, FocusMode, ImageFormat, KeyCombo, Modifiers, MouseButton,
         PermissionsStatus, Point, ReadTextMode, ReadTextResult, RpcError, ScreenState,
@@ -35,6 +38,7 @@ mod macos_backend {
 
     /// Native macOS implementation of [`PlatformBackend`].
     pub struct MacOsBackend {
+        kill_switch: Arc<EscKillSwitch>,
         stop_flag: Arc<AtomicBool>,
         refs: ax::AxRefStore,
         awake: power::DisplayAwakeGuard,
@@ -45,8 +49,10 @@ mod macos_backend {
     impl MacOsBackend {
         /// Create a backend wired to a running AppKit main-thread UI handle (daemon mode).
         #[must_use]
-        pub fn with_ui(stop_flag: Arc<AtomicBool>, ui: UiHandle) -> Self {
+        pub fn with_ui(kill_switch: Arc<EscKillSwitch>, ui: UiHandle) -> Self {
+            let stop_flag = kill_switch.stop_flag();
             Self {
+                kill_switch,
                 stop_flag,
                 refs: ax::AxRefStore::new(),
                 awake: power::DisplayAwakeGuard::new(),
@@ -58,8 +64,14 @@ mod macos_backend {
         /// Create a headless backend without an AppKit runloop (suitable for CLI doctor / live tests).
         #[must_use]
         pub fn headless() -> Self {
+            let stop_flag = Arc::new(AtomicBool::new(false));
+            let kill_switch = Arc::new(EscKillSwitch::new(
+                Arc::clone(&stop_flag),
+                Arc::new(AtomicBool::new(false)),
+            ));
             Self {
-                stop_flag: Arc::new(AtomicBool::new(false)),
+                kill_switch,
+                stop_flag,
                 refs: ax::AxRefStore::new(),
                 awake: power::DisplayAwakeGuard::new(),
                 stream: stream::WarmDisplayStream::new(),
@@ -115,6 +127,10 @@ mod macos_backend {
             }
         }
 
+        fn set_control_active(&self, active: bool) {
+            self.kill_switch.set_control_active(active);
+        }
+
         fn confirm_dialog(&self, title: &str, message: &str) -> Result<bool, RpcError> {
             if let Some(ui) = &self.ui {
                 ui.confirm_dialog(title, message)
@@ -125,6 +141,10 @@ mod macos_backend {
 
         fn stop_flag(&self) -> Arc<AtomicBool> {
             Arc::clone(&self.stop_flag)
+        }
+
+        fn take_stop_triggered_at(&self) -> Option<Timestamp> {
+            self.kill_switch.take_triggered_at()
         }
 
         fn displays(&self) -> Result<Vec<DisplayInfo>, RpcError> {

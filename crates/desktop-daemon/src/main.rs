@@ -75,10 +75,12 @@ fn main() -> Result<()> {
         }
 
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let ui = desktop_macos::UiHandle::new(Arc::clone(&stop_flag));
+        let control_active = Arc::new(AtomicBool::new(false));
+        let kill_switch = Arc::new(desktop_core::EscKillSwitch::new(stop_flag, control_active));
+        let ui = desktop_macos::UiHandle::new(Arc::clone(&kill_switch));
         let ui_shutdown = ui.clone();
         let backend = Arc::new(desktop_macos::MacOsBackend::with_ui(
-            Arc::clone(&stop_flag),
+            Arc::clone(&kill_switch),
             ui,
         ));
         let engine = Arc::new(DesktopEngine::new(
@@ -104,7 +106,7 @@ fn main() -> Result<()> {
             })?;
 
         // AppKit runloop owns the process main thread on macOS.
-        desktop_macos::run_main_loop(stop_flag);
+        desktop_macos::run_main_loop(kill_switch);
     }
 
     #[cfg(target_os = "linux")]
