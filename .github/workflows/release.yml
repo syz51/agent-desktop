@@ -76,9 +76,7 @@ jobs:
           mkdir -p "staging/$name" out
           cp "$cli" "$daemon" LICENSE README.md "staging/$name/"
           if [[ "$RUNNER_OS" == Linux ]]; then
-            cp -R packaging/linux "staging/$name/packaging-linux"
-          else
-            cp -R packaging/macos "staging/$name/packaging-macos"
+            cp packaging/linux/desktopd.service packaging/linux/desktopd-xvfb.service "staging/$name/"
           fi
           COPYFILE_DISABLE=1 tar -czf "out/$name.tar.gz" -C staging "$name"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -24,8 +24,8 @@ fleet RPC (`100.64.0.0/10` with constant-time 256-bit bearer auth). Report a wea
 when it requires local user access or Tailscale network access. Examples in scope:
 
 - authentication or bind-restriction bypass on the remote HTTP RPC listener (including binding
-  outside `100.64.0.0/10` / loopback when `require_tailscale = true`, or timing/comparison
-  flaws in bearer token verification);
+  outside `100.64.0.0/10` / loopback when `allow_non_tailscale = false`, bypassing peer checks
+  when `require_tailscale = true`, or timing/comparison flaws in bearer token verification);
 - unauthorized local access to the daemon Unix socket or managed `Xvfb` Xauthority cookie;
 - bearer token or redacted password-field disclosure in logs, errors, audit trails, or snapshots;
 - bypass of opt-in `deny_apps`, `confirm_apps`, `focus_mode = "background"`, or the physical
