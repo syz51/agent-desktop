@@ -1,10 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use desktop_core::ResolvedRef;
 use desktop_core::tree::{
-    AxNodeData, RecordOutcome, SnapshotWalkBuilder, WalkBudget, is_decorative_container,
+    AxNodeData, DEFAULT_PRIMARY_FANOUT, RecordOutcome, SnapshotWalkBuilder, WalkBudget,
+    is_decorative_container,
 };
 use desktop_proto::{
     AppInfo, ElementAction, ErrorCode, ReadTextMode, ReadTextResult, Rect, RpcError, Snapshot,
@@ -214,13 +215,63 @@ pub fn take_atspi_snapshot(
             children: Vec::new(),
         };
 
+        struct LazyChildrenTail {
+            bus: String,
+            path: String,
+            parent_idx: usize,
+            child_depth: usize,
+            next_idx: usize,
+            total: usize,
+        }
+
         let deadline = Instant::now() + WALK_BUDGET;
         let mut builder = SnapshotWalkBuilder::new(
             (start_bus, start_path),
             WalkBudget::new(max_depth, max_nodes),
         );
+        // Defer D-Bus `GetChildAtIndex` calls past `DEFAULT_PRIMARY_FANOUT` until shallower panes
+        // finish so wide lists do not burn the 250 ms budget fetching tail items up front.
+        let mut lazy_tails: VecDeque<LazyChildrenTail> = VecDeque::new();
 
-        while let Some(pending) = builder.next_pending() {
+        loop {
+            let pending = match builder.next_pending() {
+                Some(p) => p,
+                None => {
+                    if builder.is_budget_saturated() {
+                        if !lazy_tails.is_empty() {
+                            builder.mark_truncated();
+                        }
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        if !lazy_tails.is_empty() {
+                            builder.mark_truncated();
+                        }
+                        break;
+                    }
+                    let Some(mut tail) = lazy_tails.pop_front() else {
+                        break;
+                    };
+                    if let Ok(p) =
+                        uncached_proxy(&conn, &tail.bus, &tail.path, "org.a11y.atspi.Accessible")
+                            .await
+                    {
+                        let batch_end = (tail.next_idx + DEFAULT_PRIMARY_FANOUT).min(tail.total);
+                        let batch = get_children_range(&p, tail.next_idx, batch_end).await;
+                        builder.enqueue_children_from(
+                            tail.parent_idx,
+                            tail.child_depth,
+                            tail.next_idx,
+                            batch,
+                        );
+                        tail.next_idx = batch_end;
+                        if tail.next_idx < tail.total {
+                            lazy_tails.push_back(tail);
+                        }
+                    }
+                    continue;
+                }
+            };
             if Instant::now() >= deadline {
                 builder.mark_truncated();
                 break;
@@ -325,8 +376,24 @@ pub fn take_atspi_snapshot(
 
             match builder.record_node(meta, data, entry) {
                 RecordOutcome::Expand(node_idx) => {
-                    let children = get_children_via(&acc_proxy).await;
-                    builder.enqueue_children(node_idx, depth + 1, children);
+                    let raw_count: i32 = acc_proxy.get_property("ChildCount").await.unwrap_or(0);
+                    let total = raw_count.clamp(0, 64) as usize;
+                    if raw_count > 64 {
+                        builder.mark_truncated();
+                    }
+                    let first_end = total.min(DEFAULT_PRIMARY_FANOUT);
+                    let first_batch = get_children_range(&acc_proxy, 0, first_end).await;
+                    builder.enqueue_children_from(node_idx, depth + 1, 0, first_batch);
+                    if first_end < total {
+                        lazy_tails.push_back(LazyChildrenTail {
+                            bus,
+                            path,
+                            parent_idx: node_idx,
+                            child_depth: depth + 1,
+                            next_idx: first_end,
+                            total,
+                        });
+                    }
                 }
                 RecordOutcome::CheckChildrenForTruncation => {
                     let count: i32 = acc_proxy.get_property("ChildCount").await.unwrap_or(0);
@@ -756,11 +823,18 @@ async fn find_atspi_target(
 
 async fn get_children_via(proxy: &Proxy<'_>) -> Vec<(String, String)> {
     let count: i32 = proxy.get_property("ChildCount").await.unwrap_or(0);
-    let capped = count.clamp(0, 64);
-    let mut out = Vec::with_capacity(capped as usize);
-    for idx in 0..capped {
+    let capped = count.clamp(0, 64) as usize;
+    get_children_range(proxy, 0, capped).await
+}
+
+async fn get_children_range(proxy: &Proxy<'_>, start: usize, end: usize) -> Vec<(String, String)> {
+    if start >= end {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(end - start);
+    for idx in start..end {
         if let Ok((cbus, cpath)) = proxy
-            .call::<_, _, (String, OwnedObjectPath)>("GetChildAtIndex", &(idx,))
+            .call::<_, _, (String, OwnedObjectPath)>("GetChildAtIndex", &(idx as i32,))
             .await
             && !cbus.is_empty()
             && cpath.as_str() != "/org/a11y/atspi/null"

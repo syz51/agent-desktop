@@ -20,9 +20,9 @@ pub fn draw_annotations_rgba(
     let sx = img_w as f64 / display_bounds.width;
     let sy = img_h as f64 / display_bounds.height;
 
-    // Collect visible pixel rects first so all outlines are drawn under all `@eN` badges
+    // Collect visible badge anchors first so all outlines are drawn under all `@eN` badges
     // (preventing later outlines from cutting across earlier badges).
-    let mut visible: Vec<(isize, isize, isize, isize, &str)> = Vec::with_capacity(boxes.len());
+    let mut visible: Vec<(isize, isize, &str)> = Vec::with_capacity(boxes.len());
     for b in boxes {
         let x0 = ((b.bounds.x - display_bounds.x) * sx).round() as isize;
         let y0 = ((b.bounds.y - display_bounds.y) * sy).round() as isize;
@@ -43,10 +43,10 @@ pub fn draw_annotations_rgba(
             y1,
             [255, 68, 58, 255],
         );
-        visible.push((x0, y0, x1, y1, b.ref_id.as_str()));
+        visible.push((x0, y0, b.ref_id.as_str()));
     }
 
-    for (x0, y0, _x1, _y1, ref_id) in visible {
+    for (x0, y0, ref_id) in visible {
         draw_badge(pixels, img_w, img_h, bpr, x0, y0, ref_id);
     }
 }

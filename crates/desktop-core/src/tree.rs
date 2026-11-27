@@ -353,6 +353,12 @@ impl<H, R> SnapshotWalkBuilder<H, R> {
         None
     }
 
+    /// Returns true once the walk has hit either the interactive node cap or visit cap.
+    #[must_use]
+    pub fn is_budget_saturated(&self) -> bool {
+        self.total_visited >= self.budget.max_visits || self.priority_count >= self.budget.max_nodes
+    }
+
     /// Mark the snapshot as truncated (e.g. wall-clock deadline reached or children past max depth).
     pub fn mark_truncated(&mut self) {
         self.truncated = true;
@@ -412,16 +418,22 @@ impl<H, R> SnapshotWalkBuilder<H, R> {
         });
 
         if meta.depth >= self.budget.max_depth {
-            return RecordOutcome::CheckChildrenForTruncation;
+            return if self.truncated {
+                RecordOutcome::Done
+            } else {
+                RecordOutcome::CheckChildrenForTruncation
+            };
         }
-        if self.priority_count >= self.budget.max_nodes
-            || self.total_visited >= self.budget.max_visits
-        {
+        if self.is_budget_saturated() {
             if self.has_queued() {
                 self.truncated = true;
                 return RecordOutcome::Done;
             }
-            return RecordOutcome::CheckChildrenForTruncation;
+            return if self.truncated {
+                RecordOutcome::Done
+            } else {
+                RecordOutcome::CheckChildrenForTruncation
+            };
         }
         RecordOutcome::Expand(idx)
     }
@@ -431,22 +443,34 @@ impl<H, R> SnapshotWalkBuilder<H, R> {
     /// The first `primary_fanout` children enter the next BFS level; any overflow children are
     /// deferred so a single wide list/sidebar never starves sibling panes.
     pub fn enqueue_children(&mut self, parent_idx: usize, child_depth: usize, children: Vec<H>) {
+        self.enqueue_children_from(parent_idx, child_depth, 0, children);
+    }
+
+    /// Enqueue a slice of direct children starting at sibling index `start_order` (used by
+    /// backends that paginate child handles lazily, such as AT-SPI2 over D-Bus).
+    pub fn enqueue_children_from(
+        &mut self,
+        parent_idx: usize,
+        child_depth: usize,
+        start_order: usize,
+        children: Vec<H>,
+    ) {
         if children.is_empty() {
             return;
         }
         let fanout = self.budget.primary_fanout.max(1);
         let mut primary = VecDeque::new();
         let mut overflow = VecDeque::new();
-        for (order, handle) in children.into_iter().enumerate() {
+        for (offset, handle) in children.into_iter().enumerate() {
             let pending = PendingNode {
                 handle,
                 meta: PendingMeta {
                     parent_idx: Some(parent_idx),
-                    child_order: order,
+                    child_order: start_order + offset,
                     depth: child_depth,
                 },
             };
-            if order < fanout {
+            if offset < fanout {
                 primary.push_back(pending);
             } else {
                 overflow.push_back(pending);
@@ -813,17 +837,16 @@ fn classify_annotate_tier(
         return Some(0);
     }
 
-    if has_explicit_input_action(&node.actions) && !is_structural_container_role(role) {
-        return Some(0);
-    }
-
-    // Never annotate static text/headings (Chromium attaches generic ShowMenu/Press to them).
+    // Never annotate static text/headings (Chromium attaches generic ShowMenu/Press/Focus to them),
+    // except explicitly editable text nodes exposing SetValue.
     if matches!(role, "text" | "heading") {
-        return None;
+        return node.actions.contains(&ElementAction::SetValue).then_some(0);
     }
 
-    // List/table/tree rows/items are annotatable when clickable/selected and not already wrapping
-    // a more specific interactive control.
+    // List/table/tree rows/items are annotatable when clickable/selected and labeled.
+    // Rows that wrap a full-size inner button are deduplicated geometrically later, while rows
+    // with small inline controls (e.g. a trailing archive/delete button or disclosure arrow)
+    // remain individually clickable.
     if matches!(role, "row" | "cell" | "treeitem" | "listitem" | "option") {
         let clickable = node.selected
             || node.actions.iter().any(|a| {
@@ -835,7 +858,8 @@ fn classify_annotate_tier(
                         | ElementAction::SetValue
                 )
             });
-        if clickable && !has_eligible_descendant && has_label_or_text {
+        let too_large = window_bounds.is_some_and(|wb| rect_area(bounds) >= 0.50 * rect_area(wb));
+        if clickable && has_label_or_text && !too_large {
             return Some(1);
         }
         return None;
@@ -862,7 +886,11 @@ fn classify_annotate_tier(
         return None;
     }
 
-    // Any other non-structural role with explicit Press/Confirm and no interactive descendants.
+    // Any other custom non-structural role with explicit input actions.
+    if has_explicit_input_action(&node.actions) {
+        return Some(0);
+    }
+
     let explicit_press = node
         .actions
         .iter()
@@ -1685,6 +1713,65 @@ mod tests {
                         children: vec![],
                     }],
                 },
+                // Clickable sidebar row with a small trailing Delete button: BOTH row and button
+                // must be annotated (dedup only drops rows >= 70% covered by an inner control).
+                UiNode {
+                    ref_id: "@e11".into(),
+                    role: "row".into(),
+                    subrole: None,
+                    title: Some("Thread 3".into()),
+                    label: None,
+                    value: None,
+                    bounds: Some(rect(10.0, 120.0, 240.0, 40.0)),
+                    enabled: true,
+                    focused: false,
+                    selected: false,
+                    actions: vec![ElementAction::Press, ElementAction::Focus],
+                    children: vec![UiNode {
+                        ref_id: "@e12".into(),
+                        role: "button".into(),
+                        subrole: None,
+                        title: Some("Delete".into()),
+                        label: None,
+                        value: None,
+                        bounds: Some(rect(224.0, 130.0, 20.0, 20.0)),
+                        enabled: true,
+                        focused: false,
+                        selected: false,
+                        actions: vec![ElementAction::Press],
+                        children: vec![],
+                    }],
+                },
+                // Large backdrop image exposing Confirm must still be filtered by the 50% size cap.
+                UiNode {
+                    ref_id: "@e13".into(),
+                    role: "image".into(),
+                    subrole: None,
+                    title: Some("Backdrop".into()),
+                    label: None,
+                    value: None,
+                    bounds: Some(rect(0.0, 0.0, 900.0, 700.0)),
+                    enabled: true,
+                    focused: false,
+                    selected: false,
+                    actions: vec![ElementAction::Confirm],
+                    children: vec![],
+                },
+                // Static text with Focus (not SetValue) must not be annotated.
+                UiNode {
+                    ref_id: "@e14".into(),
+                    role: "text".into(),
+                    subrole: None,
+                    title: Some("Focusable caption".into()),
+                    label: None,
+                    value: None,
+                    bounds: Some(rect(300.0, 20.0, 180.0, 20.0)),
+                    enabled: true,
+                    focused: false,
+                    selected: false,
+                    actions: vec![ElementAction::Focus],
+                    children: vec![],
+                },
             ],
         };
 
@@ -1701,15 +1788,15 @@ mod tests {
             window_title: Some("Win".into()),
             window_bounds: Some(rect(0.0, 0.0, 1000.0, 800.0)),
             truncated: false,
-            total_nodes: 10,
-            emitted_nodes: 10,
+            total_nodes: 14,
+            emitted_nodes: 14,
             elapsed_ms: 1,
             root,
         };
 
         let boxes = collect_annotate_boxes(&snap, 80);
         let ids: Vec<&str> = boxes.iter().map(|b| b.ref_id.as_str()).collect();
-        assert_eq!(ids, vec!["@e3", "@e5", "@e6", "@e7", "@e9"]);
+        assert_eq!(ids, vec!["@e3", "@e5", "@e6", "@e7", "@e9", "@e11", "@e12"]);
     }
 
     #[test]
