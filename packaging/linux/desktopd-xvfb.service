@@ -1,0 +1,14 @@
+[Unit]
+Description=agent-desktop daemon (24/7 headless Xvfb session)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/desktopd --xvfb --xvfb-size 1920x1080
+Restart=always
+RestartSec=2
+Environment=RUST_LOG=info
+EnvironmentFile=-%h/.config/agent-desktop/env
+
+[Install]
+WantedBy=default.target

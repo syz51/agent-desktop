@@ -178,6 +178,99 @@ impl KeyCode {
             Self::Up => 126,
         }
     }
+
+    /// Standard X11 keysym (`KeySym`) for Linux X11/XTest and XWayland input.
+    #[must_use]
+    pub fn x11_keysym(self) -> u32 {
+        match self {
+            Self::A => u32::from(b'a'),
+            Self::B => u32::from(b'b'),
+            Self::C => u32::from(b'c'),
+            Self::D => u32::from(b'd'),
+            Self::E => u32::from(b'e'),
+            Self::F => u32::from(b'f'),
+            Self::G => u32::from(b'g'),
+            Self::H => u32::from(b'h'),
+            Self::I => u32::from(b'i'),
+            Self::J => u32::from(b'j'),
+            Self::K => u32::from(b'k'),
+            Self::L => u32::from(b'l'),
+            Self::M => u32::from(b'm'),
+            Self::N => u32::from(b'n'),
+            Self::O => u32::from(b'o'),
+            Self::P => u32::from(b'p'),
+            Self::Q => u32::from(b'q'),
+            Self::R => u32::from(b'r'),
+            Self::S => u32::from(b's'),
+            Self::T => u32::from(b't'),
+            Self::U => u32::from(b'u'),
+            Self::V => u32::from(b'v'),
+            Self::W => u32::from(b'w'),
+            Self::X => u32::from(b'x'),
+            Self::Y => u32::from(b'y'),
+            Self::Z => u32::from(b'z'),
+            Self::Digit0 => u32::from(b'0'),
+            Self::Digit1 => u32::from(b'1'),
+            Self::Digit2 => u32::from(b'2'),
+            Self::Digit3 => u32::from(b'3'),
+            Self::Digit4 => u32::from(b'4'),
+            Self::Digit5 => u32::from(b'5'),
+            Self::Digit6 => u32::from(b'6'),
+            Self::Digit7 => u32::from(b'7'),
+            Self::Digit8 => u32::from(b'8'),
+            Self::Digit9 => u32::from(b'9'),
+            Self::Minus => u32::from(b'-'),
+            Self::Equal => u32::from(b'='),
+            Self::LeftBracket => u32::from(b'['),
+            Self::RightBracket => u32::from(b']'),
+            Self::Backslash => u32::from(b'\\'),
+            Self::Semicolon => u32::from(b';'),
+            Self::Quote => u32::from(b'\''),
+            Self::Comma => u32::from(b','),
+            Self::Period => u32::from(b'.'),
+            Self::Slash => u32::from(b'/'),
+            Self::Grave => u32::from(b'`'),
+            Self::Return => 0xff0d,
+            Self::Tab => 0xff09,
+            Self::Space => 0x0020,
+            Self::Backspace => 0xff08,
+            Self::Delete => 0xffff,
+            Self::Escape => 0xff1b,
+            Self::Home => 0xff50,
+            Self::End => 0xff57,
+            Self::PageUp => 0xff55,
+            Self::PageDown => 0xff56,
+            Self::Left => 0xff51,
+            Self::Up => 0xff52,
+            Self::Right => 0xff53,
+            Self::Down => 0xff54,
+            Self::F1 => 0xffbe,
+            Self::F2 => 0xffbf,
+            Self::F3 => 0xffc0,
+            Self::F4 => 0xffc1,
+            Self::F5 => 0xffc2,
+            Self::F6 => 0xffc3,
+            Self::F7 => 0xffc4,
+            Self::F8 => 0xffc5,
+            Self::F9 => 0xffc6,
+            Self::F10 => 0xffc7,
+            Self::F11 => 0xffc8,
+            Self::F12 => 0xffc9,
+        }
+    }
+}
+
+/// Map a printable character (or `\n`/`\t`) to its X11 keysym.
+#[must_use]
+pub fn char_to_x11_keysym(ch: char) -> Option<u32> {
+    match ch {
+        '\n' | '\r' => Some(0xff0d),
+        '\t' => Some(0xff09),
+        c if (0x20..=0x7e).contains(&(c as u32)) => Some(c as u32),
+        c if (0xa0..=0xff).contains(&(c as u32)) => Some(c as u32),
+        c if (c as u32) >= 0x100 => Some(0x0100_0000 | (c as u32)),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,6 +440,12 @@ mod tests {
 
         let esc = parse_key_combo("esc", true).unwrap();
         assert_eq!(esc.key.macos_keycode(), 53);
+        assert_eq!(esc.key.x11_keysym(), 0xff1b);
+        assert_eq!(KeyCode::Return.x11_keysym(), 0xff0d);
+        assert_eq!(KeyCode::A.x11_keysym(), u32::from(b'a'));
+        assert_eq!(char_to_x11_keysym('A'), Some(u32::from(b'A')));
+        assert_eq!(char_to_x11_keysym('\n'), Some(0xff0d));
+        assert_eq!(char_to_x11_keysym('你'), Some(0x0100_4f60));
     }
 
     #[test]

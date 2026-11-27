@@ -559,14 +559,21 @@ async fn run_cli_command(
         Command::Grant => {
             let res = client.call(host, RpcMethod::RequestPermissions).await?;
             if let RpcResult::Status(st) = res {
-                println!(
-                    "Requested macOS TCC registration for AgentDesktop.app (accessibility={}, screen_recording={}).",
-                    st.permissions.accessibility, st.permissions.screen_recording
-                );
-                println!(
-                    "Toggle AgentDesktop on in System Settings > Privacy & Security, then restart:"
-                );
-                println!("  launchctl kickstart -k \"gui/$(id -u)/com.syz.agent-desktop\"");
+                if st.os == "macos" {
+                    println!(
+                        "Requested macOS TCC registration for AgentDesktop.app (accessibility={}, screen_recording={}).",
+                        st.permissions.accessibility, st.permissions.screen_recording
+                    );
+                    println!(
+                        "Toggle AgentDesktop on in System Settings > Privacy & Security, then restart:"
+                    );
+                    println!("  launchctl kickstart -k \"gui/$(id -u)/com.syz.agent-desktop\"");
+                } else {
+                    println!(
+                        "{} does not require macOS TCC grants (accessibility={}, screen_recording={}).",
+                        st.os, st.permissions.accessibility, st.permissions.screen_recording
+                    );
+                }
             }
         }
         Command::Doctor => {
@@ -630,6 +637,31 @@ async fn run_cli_command(
                     );
                 }
             }
+            #[cfg(target_os = "linux")]
+            {
+                let dpy = std::env::var("DISPLAY").unwrap_or_else(|_| "(unset)".into());
+                let wl = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "(unset)".into());
+                let session =
+                    std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".into());
+                println!("linux_session: type={session} DISPLAY={dpy} WAYLAND_DISPLAY={wl}");
+                let tools: Vec<&str> = [
+                    "Xvfb", "xclip", "xsel", "grim", "wl-copy", "ydotool", "wtype",
+                ]
+                .into_iter()
+                .filter(|bin| {
+                    std::env::var_os("PATH")
+                        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
+                })
+                .collect();
+                println!(
+                    "linux_tools: {}",
+                    if tools.is_empty() {
+                        "none detected".into()
+                    } else {
+                        tools.join(", ")
+                    }
+                );
+            }
         }
     }
 
@@ -684,9 +716,12 @@ fn init_fleet(fleet_path: &std::path::Path, port: u16, force: bool) -> Result<()
 
     println!("\nNext steps:");
     println!("  1. Restart desktopd so it binds its Tailscale IP:");
+    #[cfg(target_os = "macos")]
     println!("     launchctl kickstart -k \"gui/$(id -u)/com.syz.agent-desktop\"");
+    #[cfg(target_os = "linux")]
+    println!("     systemctl --user restart desktopd   # or desktopd-xvfb");
     println!(
-        "  2. Copy {} (0600) to your peer Mac and add [hosts.<name>] entries.",
+        "  2. Copy {} (0600) to your peer machines and add [hosts.<name>] entries.",
         token_path.display()
     );
     println!("  3. Run `desktop hosts` to verify connectivity.");
