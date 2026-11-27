@@ -16,7 +16,11 @@ use rand::RngExt as _;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "desktop", about = "Fast Rust computer-use CLI and MCP server")]
+#[command(
+    name = "desktop",
+    version,
+    about = "Fast Rust computer-use CLI and MCP server"
+)]
 struct Cli {
     /// Target host ("local" or configured Tailscale peer name).
     #[arg(long, global = true, default_value = "local")]

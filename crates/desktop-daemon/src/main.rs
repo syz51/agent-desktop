@@ -18,7 +18,7 @@ use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "desktopd", about = "Persistent agent-desktop daemon")]
+#[command(name = "desktopd", version, about = "Persistent agent-desktop daemon")]
 struct Args {
     /// Unix domain socket path to listen on.
     #[arg(long, env = "DESKTOP_SOCKET")]
