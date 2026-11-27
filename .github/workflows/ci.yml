@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt-and-shellcheck:
+    name: Format & Shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+      - run: shellcheck packaging/macos/*.sh packaging/linux/*.sh
+
+  macos:
+    name: macOS (Rust + Live FFI tests)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  linux:
+    name: Linux (Rust + Live Xvfb/X11/XTest tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Xvfb & clipboard tools for live Linux tests
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb xclip
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run full workspace tests under live Xvfb display
+        run: xvfb-run -a -s "-screen 0 1280x800x24" cargo test --workspace

@@ -12,7 +12,9 @@ pub use fleet::{
     PeerHostConfig, expand_tilde, is_tailscale_ip, resolve_token, validate_bind_ip,
 };
 
-pub use keys::{KeyCode, KeyCombo, Modifiers, parse_key_combo, parse_modifiers};
+pub use keys::{
+    KeyCode, KeyCombo, Modifiers, char_to_x11_keysym, parse_key_combo, parse_modifiers,
+};
 pub use rpc::{
     ActParams, ErrorCode, FindParams, ListWindowsParams, MenuParams, ReadTextParams, RpcError,
     RpcMethod, RpcRequest, RpcResponse, RpcResult, ScreenshotParams, SessionStartParams,
@@ -23,5 +25,5 @@ pub use types::{
     HostStatus, ImageFormat, LeaseInfo, MouseButton, PermissionsStatus, Point, PolicyConfig,
     PolicyMode, PostAction, ReadTextMode, ReadTextResult, Rect, ScreenState, ScreenshotResult,
     ScreenshotTarget, ScrollDirection, Snapshot, StepOutcome, Target, TextMethod, UiNode,
-    WaitCondition, WindowInfo, fit_screenshot, screenshot_to_global,
+    WaitCondition, WindowInfo, fit_screenshot, sanitize_text, screenshot_to_global,
 };

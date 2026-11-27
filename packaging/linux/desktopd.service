@@ -1,0 +1,14 @@
+[Unit]
+Description=agent-desktop daemon (interactive X11/Wayland session)
+After=graphical-session.target network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/desktopd
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+EnvironmentFile=-%h/.config/agent-desktop/env
+
+[Install]
+WantedBy=graphical-session.target

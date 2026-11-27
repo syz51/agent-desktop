@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
 use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
@@ -34,6 +35,15 @@ struct Args {
     /// Run without starting the macOS AppKit NSApplication overlay loop (for tests/CI).
     #[arg(long)]
     headless: bool,
+    /// Linux: launch a private daemon-owned headless Xvfb virtual display (24/7 server mode).
+    #[arg(long, env = "DESKTOP_XVFB")]
+    xvfb: bool,
+    /// Linux: virtual screen resolution when --xvfb is set (e.g. 1920x1080 or 1280x800).
+    #[arg(long, env = "DESKTOP_XVFB_SIZE", default_value = "1920x1080")]
+    xvfb_size: String,
+    /// Linux: explicit X11 DISPLAY override (e.g. :0 or :99).
+    #[arg(long, env = "DESKTOP_DISPLAY")]
+    display: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -97,10 +107,36 @@ fn main() -> Result<()> {
         desktop_macos::run_main_loop(stop_flag);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
-        let _ = (socket, state_dir, policy_path, fleet_path);
-        anyhow::bail!("Linux backend (Phase 3) is not yet enabled in desktopd");
+        let (width, height) = desktop_linux::xvfb::parse_xvfb_size(&args.xvfb_size)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let cfg = desktop_linux::LinuxConfig {
+            display: args.display,
+            xvfb: args.xvfb,
+            xvfb_config: desktop_linux::xvfb::XvfbConfig {
+                width,
+                height,
+                ..desktop_linux::xvfb::XvfbConfig::default()
+            },
+        };
+        let backend = Arc::new(
+            desktop_linux::LinuxBackend::connect(cfg).map_err(|e| anyhow::anyhow!("{e}"))?,
+        );
+        let engine = Arc::new(DesktopEngine::new(
+            backend,
+            Arc::new(SystemClock),
+            PolicyStore::new(policy_path),
+            AuditLog::new(&state_dir),
+        ));
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(run_with_signals(socket, fleet_path, engine, None))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (socket, state_dir, policy_path, fleet_path, args);
+        anyhow::bail!("agent-desktop daemon is currently supported on macOS and Linux");
     }
 }
 

@@ -4,6 +4,7 @@ members = [
     "crates/desktop-proto",
     "crates/desktop-core",
     "crates/desktop-macos",
+    "crates/desktop-linux",
     "crates/desktop-daemon",
     "crates/desktop",
 ]
@@ -19,6 +20,7 @@ repository = "https://github.com/syz51/agent-desktop"
 desktop-proto = { path = "crates/desktop-proto" }
 desktop-core = { path = "crates/desktop-core" }
 desktop-macos = { path = "crates/desktop-macos" }
+desktop-linux = { path = "crates/desktop-linux" }
 desktop-daemon = { path = "crates/desktop-daemon" }
 
 anyhow = "1.0.104"

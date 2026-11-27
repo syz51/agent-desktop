@@ -1,0 +1,27 @@
+[package]
+name = "desktop-linux"
+description = "Pure-Rust Linux backend for agent-desktop (X11/XTest/RandR, managed Xvfb, AT-SPI2, Wayland portal)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+desktop-core.workspace = true
+desktop-proto.workspace = true
+futures-util.workspace = true
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+rand.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+x11rb = { version = "0.14.0", default-features = false, features = ["composite", "randr", "screensaver", "xfixes", "xtest"] }
+zbus = { version = "6.5.0", default-features = false, features = ["proxy", "tokio"] }
+
+[dev-dependencies]
+desktop-core = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true
