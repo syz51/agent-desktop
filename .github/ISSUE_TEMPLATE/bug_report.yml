@@ -1,0 +1,59 @@
+name: Bug report
+description: Something in agent-desktop doesn't work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This repository is public. Replace Tailscale IPs, hostnames, bearer tokens, and
+        personal screenshots with placeholders. Report security problems privately instead
+        (see SECURITY.md).
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Daemon (desktopd)
+        - CLI (desktop)
+        - MCP server (desktop mcp)
+        - macOS backend (desktop-macos)
+        - Linux backend (X11 / Xvfb / AT-SPI2 / Wayland)
+        - Tailscale fleet RPC
+        - Packaging / Installers
+        - Docs
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. desktop ...
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `desktop --version`, or the commit you built.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: macOS 26 arm64 or Ubuntu 24.04 (X11 / Wayland / Xvfb)
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Doctor output & logs
+      description: Output of `desktop doctor` and relevant logs (`RUST_LOG=debug`). Check for secrets/IPs first.
+      render: text
