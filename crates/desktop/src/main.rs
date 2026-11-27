@@ -133,6 +133,15 @@ enum Command {
     Grant,
     /// Diagnose daemon connectivity, permissions, lock state, and AgentDesktop.app signing.
     Doctor,
+    /// Benchmark end-to-end latency for status, windows, snapshot, screenshot, and find.
+    Bench {
+        /// Number of timed iterations per operation.
+        #[arg(long, default_value_t = 10)]
+        iterations: usize,
+        /// Optional app filter for snapshot/find benchmarks.
+        #[arg(long)]
+        app: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -667,8 +676,240 @@ async fn run_cli_command(
                 );
             }
         }
+        Command::Bench { iterations, app } => {
+            run_bench(client, host, iterations.clamp(1, 200), app, json_out).await?;
+        }
     }
 
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BenchRow {
+    op: &'static str,
+    iterations: usize,
+    min_ms: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    max_ms: f64,
+    mean_ms: f64,
+    note: String,
+}
+
+fn summarize_samples(op: &'static str, mut samples: Vec<f64>, note: String) -> BenchRow {
+    samples.sort_by(|a, b| a.total_cmp(b));
+    let n = samples.len().max(1);
+    let min_ms = samples.first().copied().unwrap_or(0.0);
+    let max_ms = samples.last().copied().unwrap_or(0.0);
+    let p50_ms = samples[(n - 1) / 2];
+    let p95_idx = ((n as f64) * 0.95).ceil() as usize;
+    let p95_ms = samples[p95_idx.saturating_sub(1).min(n - 1)];
+    let mean_ms = samples.iter().sum::<f64>() / (n as f64);
+    BenchRow {
+        op,
+        iterations: samples.len(),
+        min_ms,
+        p50_ms,
+        p95_ms,
+        max_ms,
+        mean_ms,
+        note,
+    }
+}
+
+async fn run_bench(
+    client: &DesktopClient,
+    host: Option<&str>,
+    iterations: usize,
+    app: Option<String>,
+    json_out: bool,
+) -> Result<()> {
+    use std::time::Instant;
+
+    let mut rows = Vec::new();
+
+    // 1. status (RPC transport floor)
+    let mut s_status = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let _ = client.call(host, RpcMethod::Status).await?;
+        s_status.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    rows.push(summarize_samples("status", s_status, "RPC floor".into()));
+
+    // 2. list_windows
+    let mut s_win = Vec::with_capacity(iterations);
+    let mut last_win_count = 0usize;
+    for _ in 0..iterations {
+        let t = Instant::now();
+        if let RpcResult::Windows { windows, .. } = client
+            .call(
+                host,
+                RpcMethod::ListWindows(ListWindowsParams {
+                    app: app.clone(),
+                    include_displays: true,
+                }),
+            )
+            .await?
+        {
+            last_win_count = windows.len();
+        }
+        s_win.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    rows.push(summarize_samples(
+        "list_windows",
+        s_win,
+        format!("{last_win_count} windows"),
+    ));
+
+    // 3. snapshot (AX tree)
+    let mut s_snap = Vec::with_capacity(iterations);
+    let mut last_nodes = 0usize;
+    for _ in 0..iterations {
+        let t = Instant::now();
+        if let RpcResult::Snapshot(snap) = client
+            .call(
+                host,
+                RpcMethod::Snapshot(SnapshotParams {
+                    app: app.clone(),
+                    focus_mode: FocusMode::Background,
+                    ..SnapshotParams::default()
+                }),
+            )
+            .await?
+        {
+            last_nodes = snap.emitted_nodes;
+        }
+        s_snap.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    rows.push(summarize_samples(
+        "snapshot",
+        s_snap,
+        format!("{last_nodes} nodes"),
+    ));
+
+    // 4. screenshot (warm / stream + ring buffer)
+    // Prime warm SCStream once, then measure warm display screenshots.
+    let first_shot = client
+        .call(
+            host,
+            RpcMethod::Screenshot(ScreenshotParams {
+                target: ScreenshotTarget::Display { index: None },
+                annotate: false,
+                format: ImageFormat::Jpeg,
+                if_changed_since: None,
+                focus_mode: FocusMode::Background,
+            }),
+        )
+        .await?;
+    let mut last_hash = String::new();
+    let mut last_dims = String::new();
+    if let RpcResult::Screenshot(s) = first_shot {
+        last_hash = s.hash;
+        last_dims = format!("{}x{}", s.width, s.height);
+    }
+
+    // Wait briefly so warm SCStream delivers a live frame, then benchmark rapid display captures.
+    tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+    let mut s_shot = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let _ = client
+            .call(
+                host,
+                RpcMethod::Screenshot(ScreenshotParams {
+                    target: ScreenshotTarget::Display { index: None },
+                    annotate: false,
+                    format: ImageFormat::Jpeg,
+                    if_changed_since: None,
+                    focus_mode: FocusMode::Background,
+                }),
+            )
+            .await?;
+        s_shot.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    rows.push(summarize_samples(
+        "screenshot (warm)",
+        s_shot,
+        last_dims.clone(),
+    ));
+
+    // 5. screenshot (unchanged poll via if_changed_since)
+    let mut s_unchanged = Vec::with_capacity(iterations);
+    let mut unchanged_hits = 0usize;
+    for _ in 0..iterations {
+        let t = Instant::now();
+        if let RpcResult::Screenshot(s) = client
+            .call(
+                host,
+                RpcMethod::Screenshot(ScreenshotParams {
+                    target: ScreenshotTarget::Display { index: None },
+                    annotate: false,
+                    format: ImageFormat::Jpeg,
+                    if_changed_since: Some(last_hash.clone()),
+                    focus_mode: FocusMode::Background,
+                }),
+            )
+            .await?
+        {
+            if s.unchanged {
+                unchanged_hits += 1;
+            }
+            last_hash = s.hash;
+        }
+        s_unchanged.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    rows.push(summarize_samples(
+        "screenshot (poll)",
+        s_unchanged,
+        format!("{unchanged_hits}/{iterations} unchanged"),
+    ));
+
+    // 6. screenshot (annotated SoM)
+    let ann_iters = iterations.min(5);
+    let mut s_ann = Vec::with_capacity(ann_iters);
+    for _ in 0..ann_iters {
+        let t = Instant::now();
+        let _ = client
+            .call(
+                host,
+                RpcMethod::Screenshot(ScreenshotParams {
+                    target: ScreenshotTarget::Display { index: None },
+                    annotate: true,
+                    format: ImageFormat::Jpeg,
+                    if_changed_since: None,
+                    focus_mode: FocusMode::Background,
+                }),
+            )
+            .await?;
+        s_ann.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    rows.push(summarize_samples(
+        "screenshot (SoM)",
+        s_ann,
+        format!("{last_dims} annotated"),
+    ));
+
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        println!(
+            "agent-desktop benchmark (host={}, iterations={})\n",
+            host.unwrap_or("local"),
+            iterations
+        );
+        println!(
+            "{:<20} {:>8} {:>8} {:>8} {:>8}  Notes",
+            "Operation", "min ms", "p50 ms", "p95 ms", "max ms"
+        );
+        println!("{}", "-".repeat(72));
+        for r in &rows {
+            println!(
+                "{:<20} {:>8.1} {:>8.1} {:>8.1} {:>8.1}  {}",
+                r.op, r.min_ms, r.p50_ms, r.p95_ms, r.max_ms, r.note
+            );
+        }
+    }
     Ok(())
 }
 

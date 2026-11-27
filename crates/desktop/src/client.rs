@@ -3,9 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use desktop_proto::{
     DEFAULT_CONNECT_TIMEOUT_MS, ErrorCode, FleetConfig, HostEntryStatus, PeerHostConfig, RpcError,
-    RpcMethod, RpcRequest, RpcResponse, RpcResult, resolve_token,
+    RpcMethod, RpcRequest, RpcResponse, RpcResult, ScreenshotParams, ScreenshotResult,
+    resolve_token,
 };
 use futures_util::future::join_all;
 use rand::RngExt as _;
@@ -14,6 +17,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 const CLIENT_ID_HEADER: &str = "x-desktop-client-id";
+const META_HEADER: &str = "x-desktop-meta";
 
 /// Resolve the local `desktopd` socket path without pulling daemon dependencies into `desktop`.
 #[must_use]
@@ -69,6 +73,8 @@ pub struct DesktopClient {
     remote_client_id: u64,
     conn: Mutex<Option<Conn>>,
     http: reqwest::Client,
+    /// Pooled HTTP clients keyed by `connect_timeout_ms` to preserve TCP keep-alive connections.
+    http_pool: Mutex<HashMap<u64, reqwest::Client>>,
     sessions: Mutex<HashMap<String, String>>,
     next_id: AtomicU64,
 }
@@ -88,6 +94,7 @@ impl DesktopClient {
         let remote_client_id = rand::rng().random::<u64>().max(1);
         let http = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(60))
+            .tcp_nodelay(true)
             .build()
             .expect("build reqwest client");
         Self {
@@ -97,9 +104,25 @@ impl DesktopClient {
             remote_client_id,
             conn: Mutex::new(None),
             http,
+            http_pool: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         }
+    }
+
+    async fn pooled_http(&self, connect_ms: u64) -> reqwest::Client {
+        let mut pool = self.http_pool.lock().await;
+        if let Some(existing) = pool.get(&connect_ms) {
+            return existing.clone();
+        }
+        let built = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(connect_ms))
+            .pool_idle_timeout(Duration::from_secs(60))
+            .tcp_nodelay(true)
+            .build()
+            .unwrap_or_else(|_| self.http.clone());
+        pool.insert(connect_ms, built.clone());
+        built
     }
 
     #[must_use]
@@ -308,6 +331,33 @@ impl DesktopClient {
             peer.token_file.as_deref(),
             dirs::home_dir().as_deref(),
         )?;
+        let connect_ms = peer
+            .connect_timeout_ms
+            .unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS);
+        let timeout = total_timeout.unwrap_or(Duration::from_secs(30));
+        let client = self.pooled_http(connect_ms).await;
+
+        // Fast binary screenshot transfer: avoid 33% Base64 wire bloat over Tailscale HTTP.
+        if let RpcMethod::Screenshot(ref params) = method {
+            match self
+                .call_peer_screenshot_binary(&client, alias, peer, &token, params, timeout)
+                .await
+            {
+                Ok(Some(shot)) => {
+                    self.sessions
+                        .lock()
+                        .await
+                        .entry(alias.to_string())
+                        .or_default();
+                    return Ok(RpcResult::Screenshot(Box::new(shot)));
+                }
+                Ok(None) => {
+                    // Older daemon without `/v1/screenshot`: fall back seamlessly to `/v1/rpc`.
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let session_id = self.sessions.lock().await.get(alias).cloned();
         let req = RpcRequest {
@@ -318,22 +368,11 @@ impl DesktopClient {
         };
 
         let url = format!("{}/v1/rpc", peer.base_url());
-        let connect_ms = peer
-            .connect_timeout_ms
-            .unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS);
-        let timeout = total_timeout.unwrap_or(Duration::from_secs(30));
-
-        // Use a dedicated short connect timeout so sleeping Macs fail fast instead of hanging.
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_millis(connect_ms))
-            .timeout(timeout)
-            .build()
-            .unwrap_or_else(|_| self.http.clone());
-
         let resp = client
             .post(&url)
             .bearer_auth(&token)
             .header(CLIENT_ID_HEADER, self.remote_client_id.to_string())
+            .timeout(timeout)
             .json(&req)
             .send()
             .await
@@ -384,6 +423,102 @@ impl DesktopClient {
             .or_default();
         self.update_session_cache(alias, &result).await;
         Ok(result)
+    }
+
+    async fn call_peer_screenshot_binary(
+        &self,
+        client: &reqwest::Client,
+        alias: &str,
+        peer: &PeerHostConfig,
+        token: &str,
+        params: &ScreenshotParams,
+        timeout: Duration,
+    ) -> Result<Option<ScreenshotResult>, RpcError> {
+        let session_id = self.sessions.lock().await.get(alias).cloned();
+        let body = serde_json::json!({
+            "session_id": session_id,
+            "caller": format!("{}@remote", self.caller),
+            "params": params,
+        });
+        let url = format!("{}/v1/screenshot", peer.base_url());
+        let resp = client
+            .post(&url)
+            .bearer_auth(token)
+            .header(CLIENT_ID_HEADER, self.remote_client_id.to_string())
+            .timeout(timeout)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| {
+                RpcError::with_next(
+                    ErrorCode::BackendError,
+                    format!("could not reach host {alias:?} at {}: {err}", peer.base_url()),
+                    "Verify the peer machine is awake, Tailscale is connected, and desktopd is listening.",
+                )
+            })?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(RpcError::with_next(
+                ErrorCode::PermissionDenied,
+                format!("host {alias:?} rejected bearer token (401 Unauthorized)"),
+                "Ensure both machines share the same token in ~/.config/agent-desktop/token.",
+            ));
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(RpcError::with_next(
+                ErrorCode::PermissionDenied,
+                format!("host {alias:?} refused Tailscale peer (403 Forbidden): {text}"),
+                "Verify both machines belong to the same Tailscale tailnet.",
+            ));
+        }
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let rpc_err: RpcError = resp.json().await.map_err(|e| {
+                RpcError::new(
+                    ErrorCode::Internal,
+                    format!("decode screenshot RPC error from {alias:?}: {e}"),
+                )
+            })?;
+            return Err(rpc_err);
+        }
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(RpcError::new(
+                ErrorCode::BackendError,
+                format!("host {alias:?} returned HTTP {status}: {text}"),
+            ));
+        }
+
+        let meta_raw = resp
+            .headers()
+            .get(META_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                RpcError::new(
+                    ErrorCode::Internal,
+                    format!("host {alias:?} omitted {META_HEADER} header on /v1/screenshot"),
+                )
+            })?;
+        let mut meta: ScreenshotResult = serde_json::from_str(meta_raw).map_err(|e| {
+            RpcError::new(
+                ErrorCode::Internal,
+                format!("decode {META_HEADER} from {alias:?}: {e}"),
+            )
+        })?;
+        let bytes = resp.bytes().await.map_err(|e| {
+            RpcError::new(
+                ErrorCode::BackendError,
+                format!("read binary screenshot body from {alias:?}: {e}"),
+            )
+        })?;
+        if !meta.unchanged && !bytes.is_empty() {
+            meta.data_base64 = Some(BASE64.encode(&bytes));
+        }
+        Ok(Some(meta))
     }
 
     async fn update_session_cache(&self, alias: &str, result: &RpcResult) {

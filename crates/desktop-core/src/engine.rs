@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::audit::{AuditEvent, AuditLog};
 use crate::backend::{PlatformBackend, RawScreenshot};
 use crate::clock::{Clock, default_lease_ttl};
+use crate::frame_ring::{DEFAULT_WARM_FRAME_TTL, FrameKey, FrameRing, has_visual_change};
 use crate::policy::{PolicyStore, check_app_policy};
 use crate::tree::{collect_annotate_boxes, find_in_snapshot};
 
@@ -44,6 +45,7 @@ struct EngineState {
     shots_by_display: HashMap<u32, CachedShot>,
     last_display: Option<u32>,
     last_shot_hash: Option<String>,
+    frame_ring: FrameRing,
 }
 
 /// Core stateful engine shared by `desktopd` and unit/integration tests.
@@ -206,6 +208,7 @@ impl DesktopEngine {
                 self.ensure_active_session(client_id, session_id, caller, &policy)?;
                 self.ensure_app_allowed_by_query(&params.app, &policy)?;
                 let detail = self.backend.menu(&params.app, &params.path)?;
+                self.invalidate_frame_caches();
                 Ok(RpcResult::Menu { detail })
             }
             RpcMethod::Wait(params) => {
@@ -608,11 +611,45 @@ impl DesktopEngine {
         Ok(snap)
     }
 
+    /// Capture a screenshot and return `(metadata_without_base64, optional_raw_bytes)` for
+    /// zero-Base64 binary HTTP transfer (`/v1/screenshot`).
+    pub fn capture_screenshot_binary(
+        &self,
+        client_id: Option<u64>,
+        session_id: Option<&str>,
+        caller: Option<&str>,
+        params: &ScreenshotParams,
+    ) -> Result<(ScreenshotResult, Option<Vec<u8>>), RpcError> {
+        params.validate()?;
+        let policy = self.policy.load()?;
+        self.ensure_display_ready(true)?;
+        self.ensure_active_session(client_id, session_id, caller, &policy)?;
+        self.capture_screenshot_raw(params, &policy)
+    }
+
+    fn invalidate_frame_caches(&self) {
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.frame_ring.invalidate_all();
+        }
+        self.backend.invalidate_caches();
+    }
+
     fn capture_screenshot(
         &self,
         params: &ScreenshotParams,
         policy: &PolicyConfig,
     ) -> Result<ScreenshotResult, RpcError> {
+        let (mut meta, raw_bytes) = self.capture_screenshot_raw(params, policy)?;
+        meta.data_base64 = raw_bytes.map(|b| BASE64.encode(&b));
+        Ok(meta)
+    }
+
+    fn capture_screenshot_raw(
+        &self,
+        params: &ScreenshotParams,
+        policy: &PolicyConfig,
+    ) -> Result<(ScreenshotResult, Option<Vec<u8>>), RpcError> {
         let (annotate_boxes, snapshot_id) = if params.annotate {
             let snap_params = match &params.target {
                 ScreenshotTarget::Window { window_id } => SnapshotParams {
@@ -638,14 +675,38 @@ impl DesktopEngine {
             (Vec::new(), None)
         };
 
-        let raw: RawScreenshot = self.backend.capture(
-            &params.target,
-            params.format,
-            &annotate_boxes,
-            params.focus_mode,
-        )?;
+        let frame_key = FrameKey::from_target(&params.target);
+        // Serve unannotated screenshots from the warm frame ring if captured within 120 ms with
+        // no intervening mutating action (bypass when caller explicitly polls `if_changed_since`).
+        let cached = if params.if_changed_since.is_none()
+            && annotate_boxes.is_empty()
+            && params.focus_mode != FocusMode::Foreground
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.frame_ring
+                .get_fresh(&frame_key, params.format, DEFAULT_WARM_FRAME_TTL)
+        } else {
+            None
+        };
 
-        let hash = short_sha256(&raw.bytes);
+        let (raw, hash) = if let Some(hit) = cached {
+            (hit.raw, hit.hash)
+        } else {
+            let raw: RawScreenshot = self.backend.capture(
+                &params.target,
+                params.format,
+                &annotate_boxes,
+                params.focus_mode,
+            )?;
+            let hash = short_sha256(&raw.bytes);
+            if annotate_boxes.is_empty() {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.frame_ring
+                    .record(frame_key, params.format, raw.clone(), hash.clone());
+            }
+            (raw, hash)
+        };
+
         let unchanged = params
             .if_changed_since
             .as_deref()
@@ -672,13 +733,9 @@ impl DesktopEngine {
         }
 
         let annotated_refs = annotate_boxes.into_iter().map(|b| b.ref_id).collect();
-        let data_base64 = if unchanged {
-            None
-        } else {
-            Some(BASE64.encode(&raw.bytes))
-        };
+        let bytes_opt = if unchanged { None } else { Some(raw.bytes) };
 
-        Ok(ScreenshotResult {
+        let meta = ScreenshotResult {
             snapshot_id,
             width: raw.width,
             height: raw.height,
@@ -686,9 +743,10 @@ impl DesktopEngine {
             mime_type: raw.mime_type,
             hash,
             unchanged,
-            data_base64,
+            data_base64: None,
             annotated_refs,
-        })
+        };
+        Ok((meta, bytes_opt))
     }
 
     fn resolve_point(&self, target: &Target) -> Result<Point, RpcError> {
@@ -769,8 +827,12 @@ impl DesktopEngine {
             }
             let step_start = Instant::now();
             let op_name = step_op_name(&step).to_string();
+            let mutates_ui = !matches!(step, ActionStep::Wait { .. } | ActionStep::Sleep { .. });
             match self.execute_step(step, params.focus_mode, policy) {
                 Ok((detail, used_background)) => {
+                    if mutates_ui {
+                        self.invalidate_frame_caches();
+                    }
                     outcomes.push(StepOutcome {
                         index,
                         op: op_name,
@@ -1022,12 +1084,12 @@ impl DesktopEngine {
         let start = Instant::now();
         let deadline = start + StdDuration::from_millis(timeout_ms);
 
-        // Capture initial hash for VisualChange comparisons.
-        let initial_visual_hash = if let WaitCondition::VisualChange { target } = condition {
+        // Capture initial hash + perceptual dHash for VisualChange comparisons.
+        let initial_visual = if let WaitCondition::VisualChange { target } = condition {
             let raw =
                 self.backend
                     .capture(target, ImageFormat::Jpeg, &[], FocusMode::Background)?;
-            Some(short_sha256(&raw.bytes))
+            Some((short_sha256(&raw.bytes), raw.dhash))
         } else {
             None
         };
@@ -1113,7 +1175,9 @@ impl DesktopEngine {
                         FocusMode::Background,
                     )?;
                     let h = short_sha256(&raw.bytes);
-                    if initial_visual_hash.as_deref() != Some(h.as_str()) {
+                    if let Some((base_sha, base_dhash)) = &initial_visual
+                        && has_visual_change(base_sha, *base_dhash, &h, raw.dhash)
+                    {
                         return Ok((
                             true,
                             start.elapsed().as_millis() as u64,

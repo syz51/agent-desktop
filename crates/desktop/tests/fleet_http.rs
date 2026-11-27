@@ -187,6 +187,27 @@ async fn tailscale_http_fleet_auth_routing_leases_and_list_hosts() {
     assert!(shot2.unchanged);
     assert!(shot2.data_base64.is_none());
 
+    // 6b. Verify raw binary /v1/screenshot endpoint directly (zero Base64 on the wire!).
+    let bin_url = format!("http://{peer_addr}/v1/screenshot");
+    let unauth_bin = http
+        .post(&bin_url)
+        .json(&json!({ "params": {} }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth_bin.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let bin_resp = http
+        .post(&bin_url)
+        .bearer_auth("super-secret-fleet-token")
+        .header("x-desktop-client-id", "99999")
+        .json(&json!({ "params": {} }))
+        .send()
+        .await
+        .unwrap();
+    // Held by client1's lease -> 422 Unprocessable Entity with LeaseBusy RpcError!
+    assert_eq!(bin_resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+
     // 7. Second remote client gets LeaseBusy until client1 releases via disconnect_remote.
     let client2 = DesktopClient::new_with_fleet(local_sock.clone(), fleet_path.clone(), "agent-2");
     let busy = client2
@@ -196,6 +217,42 @@ async fn tailscale_http_fleet_auth_routing_leases_and_list_hosts() {
     assert_eq!(busy.code, ErrorCode::LeaseBusy);
 
     client1.disconnect_remote("pro").await.unwrap();
+
+    // Now raw binary /v1/screenshot succeeds with raw image bytes + X-Desktop-Meta header.
+    let bin_ok = http
+        .post(&bin_url)
+        .bearer_auth("super-secret-fleet-token")
+        .header("x-desktop-client-id", "99999")
+        .json(&json!({ "params": {} }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bin_ok.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        bin_ok
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("image/jpeg")
+    );
+    let meta_hdr = bin_ok
+        .headers()
+        .get("x-desktop-meta")
+        .and_then(|v| v.to_str().ok())
+        .expect("x-desktop-meta header present")
+        .to_string();
+    let meta_val: serde_json::Value = serde_json::from_str(&meta_hdr).unwrap();
+    assert_eq!(meta_val["unchanged"], json!(false));
+    let raw_bytes = bin_ok.bytes().await.unwrap();
+    assert!(!raw_bytes.is_empty());
+
+    // Release 99999's lease via /v1/disconnect before MCP tests.
+    let _ = http
+        .post(format!("http://{peer_addr}/v1/disconnect"))
+        .bearer_auth("super-secret-fleet-token")
+        .header("x-desktop-client-id", "99999")
+        .send()
+        .await;
 
     // Now MCP client can talk to "pro" and list all hosts cleanly.
     let mcp = DesktopMcp::new_with_fleet(local_sock, fleet_path);

@@ -11,6 +11,8 @@ mod input;
 #[cfg(target_os = "macos")]
 mod power;
 #[cfg(target_os = "macos")]
+mod stream;
+#[cfg(target_os = "macos")]
 mod ui;
 #[cfg(target_os = "macos")]
 mod windows;
@@ -27,7 +29,7 @@ mod macos_backend {
         ScreenshotTarget, ScrollDirection, Snapshot, SnapshotParams, TextMethod, WindowInfo,
     };
 
-    use crate::{ax, capture, input, power, ui, windows};
+    use crate::{ax, capture, input, power, stream, ui, windows};
 
     pub use crate::ui::{UiHandle, run_main_loop};
 
@@ -36,6 +38,7 @@ mod macos_backend {
         stop_flag: Arc<AtomicBool>,
         refs: ax::AxRefStore,
         awake: power::DisplayAwakeGuard,
+        stream: stream::WarmDisplayStream,
         ui: Option<UiHandle>,
     }
 
@@ -47,6 +50,7 @@ mod macos_backend {
                 stop_flag,
                 refs: ax::AxRefStore::new(),
                 awake: power::DisplayAwakeGuard::new(),
+                stream: stream::WarmDisplayStream::new(),
                 ui: Some(ui),
             }
         }
@@ -58,6 +62,7 @@ mod macos_backend {
                 stop_flag: Arc::new(AtomicBool::new(false)),
                 refs: ax::AxRefStore::new(),
                 awake: power::DisplayAwakeGuard::new(),
+                stream: stream::WarmDisplayStream::new(),
                 ui: None,
             }
         }
@@ -94,6 +99,14 @@ mod macos_backend {
 
         fn set_display_awake(&self, active: bool) {
             self.awake.set_active(active);
+            if !active {
+                self.stream.stop();
+            }
+        }
+
+        fn invalidate_caches(&self) {
+            self.stream.mark_mutation();
+            capture::invalidate_shareable_content_cache();
         }
 
         fn set_overlay(&self, text: Option<&str>) {
@@ -161,7 +174,7 @@ mod macos_backend {
             annotate: &[AnnotateBox],
             focus_mode: FocusMode,
         ) -> Result<RawScreenshot, RpcError> {
-            capture::capture(target, format, annotate, focus_mode)
+            capture::capture(&self.stream, target, format, annotate, focus_mode)
         }
 
         fn click_ref(

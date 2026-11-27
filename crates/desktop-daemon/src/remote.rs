@@ -2,14 +2,18 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
+use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use desktop_core::DesktopEngine;
 use desktop_proto::{
-    ErrorCode, ListenConfig, RpcError, RpcRequest, RpcResponse, resolve_token, validate_bind_ip,
+    ErrorCode, ListenConfig, RpcError, RpcRequest, RpcResponse, ScreenshotParams, resolve_token,
+    validate_bind_ip,
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq as _;
@@ -23,6 +27,16 @@ const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
 const REMOTE_CLIENT_MASK: u64 = 1u64 << 63;
 
 pub const CLIENT_ID_HEADER: &str = "x-desktop-client-id";
+pub const META_HEADER: &str = "x-desktop-meta";
+
+#[derive(Debug, Deserialize)]
+struct BinaryScreenshotRequest {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    caller: Option<String>,
+    params: ScreenshotParams,
+}
 
 struct RemoteState {
     engine: Arc<DesktopEngine>,
@@ -72,6 +86,7 @@ pub async fn bind_http(
     let router = Router::new()
         .route("/v1/health", get(handle_health))
         .route("/v1/rpc", post(handle_rpc))
+        .route("/v1/screenshot", post(handle_screenshot_binary))
         .route("/v1/disconnect", post(handle_disconnect))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state);
@@ -180,6 +195,76 @@ async fn handle_rpc(
         ),
     };
     Ok(Json(response))
+}
+
+async fn handle_screenshot_binary(
+    State(state): State<Arc<RemoteState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<BinaryScreenshotRequest>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    verify_auth(&state, peer, &headers)?;
+    let client_id = parse_client_id(&headers);
+    let engine = Arc::clone(&state.engine);
+    let res = tokio::task::spawn_blocking(move || {
+        engine.capture_screenshot_binary(
+            client_id,
+            req.session_id.as_deref(),
+            req.caller.as_deref(),
+            &req.params,
+        )
+    })
+    .await;
+
+    let (meta, bytes_opt) = match res {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(err)) => {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::to_value(err).unwrap_or_else(|_| json!({"error": "rpc error"}))),
+            ));
+        }
+        Err(join_err) => {
+            let err = RpcError::new(ErrorCode::Internal, format!("worker panic: {join_err}"));
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::to_value(err).unwrap_or_else(|_| json!({"error": "panic"}))),
+            ));
+        }
+    };
+
+    let meta_json = serde_json::to_string(&meta).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("encode screenshot meta: {e}") })),
+        )
+    })?;
+    let meta_val = HeaderValue::from_str(&meta_json).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("invalid screenshot meta header: {e}") })),
+        )
+    })?;
+    let content_type = HeaderValue::from_str(&meta.mime_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+
+    let mut resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(HeaderName::from_static(META_HEADER), meta_val);
+    let body = match bytes_opt {
+        Some(bytes) => Body::from(bytes),
+        None => {
+            resp = resp.header("x-desktop-unchanged", "1");
+            Body::empty()
+        }
+    };
+    resp.body(body).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("build binary screenshot response: {e}") })),
+        )
+    })
 }
 
 async fn handle_disconnect(

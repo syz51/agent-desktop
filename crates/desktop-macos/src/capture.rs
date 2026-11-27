@@ -1,9 +1,9 @@
 use std::ptr;
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock, mpsc};
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
-use desktop_core::{AnnotateBox, RawScreenshot};
+use desktop_core::{AnnotateBox, RawScreenshot, dhash_from_pixels};
 use desktop_proto::{
     ErrorCode, FocusMode, ImageFormat, Rect, RpcError, ScreenshotTarget, fit_screenshot,
 };
@@ -21,12 +21,34 @@ use crate::ffi::{
     self, CGImageRef, CGRect, CfOwned, K_CF_NUMBER_FLOAT64_TYPE,
     K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST, cf_string,
 };
+use crate::stream::WarmDisplayStream;
 use crate::windows;
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(6);
+const SHAREABLE_CONTENT_TTL: Duration = Duration::from_millis(350);
+
+struct SendContent(Retained<SCShareableContent>);
+
+// SAFETY: `SCShareableContent` is an immutable snapshot object delivered on background GCD queues.
+unsafe impl Send for SendContent {}
+
+static CONTENT_CACHE: OnceLock<Mutex<Option<(Instant, SendContent)>>> = OnceLock::new();
+
+/// Clear the cached `SCShareableContent` snapshot after window/app changes.
+pub fn invalidate_shareable_content_cache() {
+    if let Some(cache) = CONTENT_CACHE.get()
+        && let Ok(mut guard) = cache.lock()
+    {
+        *guard = None;
+    }
+}
 
 /// Capture a display, background/foreground window, app, or region in memory via ScreenCaptureKit.
+///
+/// Uses the on-demand warm `SCStream` frame ring for sub-15 ms display grabs when a fresh
+/// post-mutation frame is ready, and caches `SCShareableContent` briefly for fast window captures.
 pub fn capture(
+    stream: &WarmDisplayStream,
     target: &ScreenshotTarget,
     format: ImageFormat,
     annotate: &[AnnotateBox],
@@ -40,8 +62,37 @@ pub fn capture(
         ));
     }
 
-    let content = fetch_shareable_content()?;
     let displays = windows::displays()?;
+
+    // Fast path: serve live warm SCStream frame directly in memory (~3-8 ms!) for Display targets.
+    if let ScreenshotTarget::Display { index } = target {
+        let disp_info = match index {
+            Some(i) => displays.get(*i as usize).ok_or_else(|| {
+                RpcError::new(
+                    ErrorCode::NotFound,
+                    format!("display {i} not found ({} displays active)", displays.len()),
+                )
+            })?,
+            None => displays
+                .iter()
+                .find(|d| d.main)
+                .or_else(|| displays.first())
+                .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "no active displays"))?,
+        };
+        if let Some(frame) = stream.latest_frame(disp_info.id) {
+            return encode_rgba_frame(
+                &frame.rgba,
+                frame.width,
+                frame.height,
+                frame.display_bounds,
+                format,
+                annotate,
+                frame.dhash,
+            );
+        }
+    }
+
+    let content = fetch_shareable_content()?;
 
     let (filter, config, out_w, out_h, display_bounds) = match target {
         ScreenshotTarget::Display { index } => {
@@ -68,6 +119,8 @@ pub fn capture(
                         format!("ScreenCaptureKit display {} not found", disp_info.id),
                     )
                 })?;
+            // Warm up the persistent low-FPS SCStream in the background for subsequent grabs.
+            stream.ensure_started(disp_info, &sc_display);
             let (w, h) = fit_screenshot(disp_info.pixel_width, disp_info.pixel_height);
             let empty_windows = NSArray::new();
             let filter = unsafe {
@@ -180,10 +233,14 @@ pub fn capture(
     };
 
     let cg_image = capture_image(&filter, &config)?;
-    let final_image = if annotate.is_empty() {
-        cg_image
+    let (final_image, dhash) = if annotate.is_empty() {
+        let dh = compute_cg_image_dhash(&cg_image);
+        (cg_image, dh)
     } else {
-        draw_annotations(&cg_image, display_bounds, annotate).unwrap_or(cg_image)
+        match draw_annotations(&cg_image, display_bounds, annotate) {
+            Some((img, dh)) => (img, dh),
+            None => (cg_image, None),
+        }
     };
 
     let bytes = encode_cg_image(&final_image, format)?;
@@ -193,6 +250,84 @@ pub fn capture(
         display_bounds,
         mime_type: format.mime_type().into(),
         bytes,
+        dhash,
+    })
+}
+
+fn encode_rgba_frame(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    display_bounds: Rect,
+    format: ImageFormat,
+    annotate: &[AnnotateBox],
+    dhash: Option<u64>,
+) -> Result<RawScreenshot, RpcError> {
+    let w = width as usize;
+    let h = height as usize;
+    let bpr = w * 4;
+    if w == 0 || h == 0 || rgba.len() < h * bpr {
+        return Err(RpcError::new(
+            ErrorCode::BackendError,
+            "invalid warm stream RGBA frame dimensions",
+        ));
+    }
+    let cs = unsafe { CfOwned::from_owned(ffi::CGColorSpaceCreateDeviceRGB().cast_const()) }
+        .ok_or_else(|| {
+            RpcError::new(
+                ErrorCode::BackendError,
+                "CGColorSpaceCreateDeviceRGB failed",
+            )
+        })?;
+    let ctx = unsafe {
+        CfOwned::from_owned(
+            ffi::CGBitmapContextCreate(
+                ptr::null_mut(),
+                w,
+                h,
+                8,
+                bpr,
+                cs.as_mut_ptr(),
+                K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
+            )
+            .cast_const(),
+        )
+    }
+    .ok_or_else(|| RpcError::new(ErrorCode::BackendError, "CGBitmapContextCreate failed"))?;
+
+    let data = unsafe { ffi::CGBitmapContextGetData(ctx.as_mut_ptr()) };
+    let ctx_bpr = unsafe { ffi::CGBitmapContextGetBytesPerRow(ctx.as_mut_ptr()) };
+    if data.is_null() || ctx_bpr < bpr {
+        return Err(RpcError::new(
+            ErrorCode::BackendError,
+            "CGBitmapContext backing buffer unavailable",
+        ));
+    }
+    // SAFETY: `data` points to `h * ctx_bpr` writable RGBA bytes owned by `ctx`.
+    let pixels = unsafe { std::slice::from_raw_parts_mut(data, h * ctx_bpr) };
+    if ctx_bpr == bpr {
+        pixels[..h * bpr].copy_from_slice(&rgba[..h * bpr]);
+    } else {
+        for y in 0..h {
+            pixels[y * ctx_bpr..y * ctx_bpr + bpr].copy_from_slice(&rgba[y * bpr..(y + 1) * bpr]);
+        }
+    }
+    if !annotate.is_empty() {
+        desktop_core::draw_annotations_rgba(pixels, w, h, ctx_bpr, display_bounds, annotate);
+    }
+
+    let cg_img = unsafe {
+        CfOwned::from_owned(ffi::CGBitmapContextCreateImage(ctx.as_mut_ptr()).cast_const())
+    }
+    .ok_or_else(|| RpcError::new(ErrorCode::BackendError, "CGBitmapContextCreateImage failed"))?;
+    let bytes = encode_cg_image(&cg_img, format)?;
+    Ok(RawScreenshot {
+        width,
+        height,
+        display_bounds,
+        mime_type: format.mime_type().into(),
+        bytes,
+        dhash,
     })
 }
 
@@ -262,6 +397,14 @@ fn capture_window_filter(
 }
 
 fn fetch_shareable_content() -> Result<Retained<SCShareableContent>, RpcError> {
+    let cache = CONTENT_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock()
+        && let Some((ts, cached)) = guard.as_ref()
+        && ts.elapsed() <= SHAREABLE_CONTENT_TTL
+    {
+        return Ok(cached.0.clone());
+    }
+
     let (tx, rx) = mpsc::sync_channel::<Result<Retained<SCShareableContent>, String>>(1);
     let block = RcBlock::new(move |content: *mut SCShareableContent, err: *mut NSError| {
         let res = if !err.is_null() {
@@ -287,7 +430,12 @@ fn fetch_shareable_content() -> Result<Retained<SCShareableContent>, RpcError> {
     }
 
     match rx.recv_timeout(CAPTURE_TIMEOUT) {
-        Ok(Ok(content)) => Ok(content),
+        Ok(Ok(content)) => {
+            if let Ok(mut guard) = cache.lock() {
+                *guard = Some((Instant::now(), SendContent(content.clone())));
+            }
+            Ok(content)
+        }
         Ok(Err(msg)) => Err(RpcError::with_next(
             ErrorCode::BackendError,
             format!("SCShareableContent failed: {msg}"),
@@ -423,12 +571,52 @@ fn encode_cg_image(image: &CfOwned, format: ImageFormat) -> Result<Vec<u8>, RpcE
     }
 }
 
-/// Draw crisp Set-of-Marks bounding boxes and `@eN` tags directly onto an RGBA bitmap copy.
+/// Compute a 64-bit perceptual dHash from a `CGImage` by rasterizing it into a tiny 16x16 bitmap.
+fn compute_cg_image_dhash(image: &CfOwned) -> Option<u64> {
+    let w = 16usize;
+    let h = 16usize;
+    let cs = unsafe { CfOwned::from_owned(ffi::CGColorSpaceCreateDeviceRGB().cast_const()) }?;
+    let ctx = unsafe {
+        CfOwned::from_owned(
+            ffi::CGBitmapContextCreate(
+                ptr::null_mut(),
+                w,
+                h,
+                8,
+                w * 4,
+                cs.as_mut_ptr(),
+                K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
+            )
+            .cast_const(),
+        )
+    }?;
+    let rect = CGRect {
+        origin: ffi::CGPoint { x: 0.0, y: 0.0 },
+        size: ffi::CGSize {
+            width: w as f64,
+            height: h as f64,
+        },
+    };
+    unsafe {
+        ffi::CGContextDrawImage(ctx.as_mut_ptr(), rect, image.as_mut_ptr());
+    }
+    let data = unsafe { ffi::CGBitmapContextGetData(ctx.as_mut_ptr()) };
+    let bpr = unsafe { ffi::CGBitmapContextGetBytesPerRow(ctx.as_mut_ptr()) };
+    if data.is_null() || bpr < w * 4 {
+        return None;
+    }
+    // SAFETY: `data` points to `h * bpr` readable RGBA bytes owned by `ctx`.
+    let pixels = unsafe { std::slice::from_raw_parts(data, h * bpr) };
+    dhash_from_pixels(pixels, w, h, bpr, false)
+}
+
+/// Draw crisp Set-of-Marks bounding boxes and `@eN` tags directly onto an RGBA bitmap copy,
+/// returning both the annotated `CGImage` and the pre-annotation perceptual dHash.
 fn draw_annotations(
     image: &CfOwned,
     display_bounds: Rect,
     boxes: &[AnnotateBox],
-) -> Option<CfOwned> {
+) -> Option<(CfOwned, Option<u64>)> {
     if display_bounds.is_empty() {
         return None;
     }
@@ -474,10 +662,14 @@ fn draw_annotations(
     }
     // SAFETY: `data` points to `img_h * bpr` writable RGBA bytes owned by `ctx`.
     let pixels = unsafe { std::slice::from_raw_parts_mut(data, img_h * bpr) };
+    let dhash = dhash_from_pixels(pixels, img_w, img_h, bpr, false);
     desktop_core::draw_annotations_rgba(pixels, img_w, img_h, bpr, display_bounds, boxes);
 
     // SAFETY: Creates a new CGImage from the annotated bitmap context.
-    unsafe { CfOwned::from_owned(ffi::CGBitmapContextCreateImage(ctx.as_mut_ptr()).cast_const()) }
+    let out = unsafe {
+        CfOwned::from_owned(ffi::CGBitmapContextCreateImage(ctx.as_mut_ptr()).cast_const())
+    }?;
+    Some((out, dhash))
 }
 
 #[allow(dead_code)]
@@ -536,7 +728,7 @@ mod tests {
             "valid PNG signature"
         );
 
-        let annotated = draw_annotations(
+        let (annotated, _) = draw_annotations(
             &img,
             Rect {
                 x: 0.0,

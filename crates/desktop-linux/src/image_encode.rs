@@ -93,6 +93,14 @@ pub fn encode_rgba_screenshot(
         img
     };
 
+    let dhash = desktop_core::dhash_from_pixels(
+        final_img.as_raw(),
+        out_w as usize,
+        out_h as usize,
+        out_w as usize * 4,
+        false,
+    );
+
     if !annotate.is_empty() {
         let w = final_img.width() as usize;
         let h = final_img.height() as usize;
@@ -127,6 +135,7 @@ pub fn encode_rgba_screenshot(
         display_bounds,
         mime_type: format.mime_type().to_string(),
         bytes,
+        dhash,
     })
 }
 
