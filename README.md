@@ -35,12 +35,26 @@ Status: early development. Architecture and protocol design live in
 
 ## Install
 
+### Homebrew (macOS and Linux)
+
+```sh
+brew tap syz51/tap
+brew trust --formula syz51/tap/agent-desktop
+brew install syz51/tap/agent-desktop
+```
+
+> Omit `brew trust` on older Homebrew versions that do not provide it. On macOS, if you want
+> persistent TCC permissions across upgrades, use the signed app bundle flow in Quick Start below.
+
+### Prebuilt Release Archives
+
 Tagged [releases](https://github.com/syz51/agent-desktop/releases) ship `desktop` and
 `desktopd` archives for macOS (Apple silicon and Intel) and Linux (`x86_64` and `aarch64`)
 with a `SHA256SUMS` file and GitHub build provenance attestations:
 
 ```sh
 shasum -a 256 --check --ignore-missing SHA256SUMS
+gh release verify-asset v<version> agent-desktop-<version>-<target>.tar.gz --repo syz51/agent-desktop
 gh attestation verify agent-desktop-<version>-<target>.tar.gz --repo syz51/agent-desktop   # optional
 tar -xzf agent-desktop-<version>-<target>.tar.gz
 ```
