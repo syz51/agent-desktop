@@ -9,8 +9,8 @@ pub mod xvfb;
 
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use desktop_core::{AnnotateBox, PlatformBackend, RawScreenshot, ResolvedRef, StepExecInfo};
@@ -46,6 +46,10 @@ pub struct LinuxConfig {
 /// - Wayland sessions via `grim` / XDG Screenshot portal + `wl-clipboard` / `ydotool` / `wtype`
 pub struct LinuxBackend {
     session: SessionKind,
+    /// Persistent X11 connection (dropped before `managed_xvfb` shuts down its child process).
+    /// Keeping a connection open avoids triggering X11 server reset on servers without `-noreset`
+    /// (such as `xvfb-run` or minimal headless sessions with no other clients).
+    x11_session: Mutex<Option<X11Session>>,
     managed_xvfb: Option<ManagedXvfb>,
     stop_flag: Arc<AtomicBool>,
     refs: LinuxRefStore,
@@ -68,17 +72,21 @@ impl LinuxBackend {
             ));
         };
 
-        // Verify X11 connectivity up-front when running in X11 or Xvfb mode.
-        if let Some(dpy) = session.x11_display()
+        // Verify X11 connectivity up-front when running in X11 or Xvfb mode, and keep the
+        // session alive so the X server never sees a 1 -> 0 client drop between calls.
+        let initial_x11 = if let Some(dpy) = session.x11_display()
             && !session.is_wayland()
         {
             let cookie = managed_xvfb.as_ref().map(|x| x.cookie().as_slice());
-            let _ = X11Session::connect(dpy, cookie)?;
-        }
+            Some(X11Session::connect(dpy, cookie)?)
+        } else {
+            None
+        };
 
         tracing::info!(session = ?session, "initialized LinuxBackend");
         Ok(Self {
             session,
+            x11_session: Mutex::new(initial_x11),
             managed_xvfb,
             stop_flag: Arc::new(AtomicBool::new(false)),
             refs: LinuxRefStore::new(),
@@ -98,21 +106,116 @@ impl LinuxBackend {
         self.managed_xvfb.as_ref().map(ManagedXvfb::xauth_path)
     }
 
-    fn x11(&self) -> Result<(X11Session, &str), RpcError> {
-        let dpy = self.session.x11_display().ok_or_else(|| {
+    fn require_x11_display(&self) -> Result<&str, RpcError> {
+        self.session.x11_display().ok_or_else(|| {
             RpcError::with_next(
                 ErrorCode::BackendError,
                 "no X11/XWayland DISPLAY is active in this Wayland session",
                 "Enable XWayland, use AT-SPI2 semantic actions, or run `desktopd --xvfb`.",
             )
-        })?;
-        let conn = X11Session::connect(dpy, self.xauth_cookie())?;
-        Ok((conn, dpy))
+        })
+    }
+
+    /// Run an idempotent X11 query on the persistent connection, proactively reconnecting if the
+    /// cached connection has died (even for queries that would otherwise mask I/O errors) and
+    /// retrying once if it drops mid-call.
+    fn with_x11_read<T>(
+        &self,
+        mut op: impl FnMut(&X11Session, &str) -> Result<T, RpcError>,
+    ) -> Result<T, RpcError> {
+        let dpy = self.require_x11_display()?;
+        let cookie = self.xauth_cookie();
+        run_cached_read(
+            &self.x11_session,
+            || X11Session::connect(dpy, cookie),
+            X11Session::is_alive,
+            |conn| op(conn, dpy),
+        )
+    }
+
+    /// Run a mutating X11 action on the persistent connection without retrying side effects.
+    /// Proactively replaces a dead cached connection before running the action, and clears the
+    /// cache if the connection dies during the call so the next call reconnects.
+    fn with_x11_action<T>(
+        &self,
+        op: impl FnOnce(&X11Session, &str) -> Result<T, RpcError>,
+    ) -> Result<T, RpcError> {
+        let dpy = self.require_x11_display()?;
+        let cookie = self.xauth_cookie();
+        run_cached_action(
+            &self.x11_session,
+            || X11Session::connect(dpy, cookie),
+            X11Session::is_alive,
+            |conn| op(conn, dpy),
+        )
     }
 
     fn launch_env_display(&self) -> Option<&str> {
         self.session.x11_display()
     }
+}
+
+fn run_cached_read<S, T>(
+    cache: &Mutex<Option<S>>,
+    mut connect: impl FnMut() -> Result<S, RpcError>,
+    is_alive: impl Fn(&S) -> bool,
+    mut op: impl FnMut(&S) -> Result<T, RpcError>,
+) -> Result<T, RpcError> {
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.as_ref().is_some_and(|conn| !is_alive(conn)) {
+        *guard = None;
+    }
+    let had_cached = guard.is_some();
+    if guard.is_none() {
+        *guard = Some(connect()?);
+    }
+    let (first_err, dead) = {
+        let conn = guard.as_ref().expect("cached session initialized above");
+        match op(conn) {
+            Ok(val) => return Ok(val),
+            Err(err) => (err, !is_alive(conn)),
+        }
+    };
+    if !dead {
+        return Err(first_err);
+    }
+
+    *guard = None;
+    if !had_cached {
+        return Err(first_err);
+    }
+    let fresh = match connect() {
+        Ok(conn) => conn,
+        Err(_) => return Err(first_err),
+    };
+    let result = op(&fresh);
+    if result.is_ok() || is_alive(&fresh) {
+        *guard = Some(fresh);
+    }
+    result
+}
+
+fn run_cached_action<S, T>(
+    cache: &Mutex<Option<S>>,
+    mut connect: impl FnMut() -> Result<S, RpcError>,
+    is_alive: impl Fn(&S) -> bool,
+    op: impl FnOnce(&S) -> Result<T, RpcError>,
+) -> Result<T, RpcError> {
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.as_ref().is_some_and(|conn| !is_alive(conn)) {
+        *guard = None;
+    }
+    if guard.is_none() {
+        *guard = Some(connect()?);
+    }
+    let result = {
+        let conn = guard.as_ref().expect("cached session initialized above");
+        op(conn)
+    };
+    if result.is_err() && guard.as_ref().is_some_and(|conn| !is_alive(conn)) {
+        *guard = None;
+    }
+    result
 }
 
 impl PlatformBackend for LinuxBackend {
@@ -130,8 +233,8 @@ impl PlatformBackend for LinuxBackend {
 
     fn permissions(&self) -> PermissionsStatus {
         let screen_ok = match &self.session {
-            SessionKind::X11 { display } | SessionKind::HeadlessXvfb { display } => {
-                X11Session::connect(display, self.xauth_cookie()).is_ok()
+            SessionKind::X11 { .. } | SessionKind::HeadlessXvfb { .. } => {
+                self.with_x11_read(|_, _| Ok(())).is_ok()
             }
             SessionKind::Wayland { .. } => {
                 let caps = wayland::WaylandCapabilities::probe();
@@ -149,15 +252,18 @@ impl PlatformBackend for LinuxBackend {
     }
 
     fn screen_state(&self) -> ScreenState {
-        if let Ok((conn, _)) = self.x11() {
-            return conn.screen_state();
+        if let Ok(state) = self.with_x11_read(|conn, _| Ok(conn.screen_state())) {
+            return state;
         }
         ScreenState::Unlocked
     }
 
     fn wake_display(&self) -> Result<bool, RpcError> {
-        if let Ok((conn, _)) = self.x11() {
-            return conn.wake_display();
+        if !self.session.is_wayland() {
+            return self.with_x11_read(|conn, _| conn.wake_display());
+        }
+        if let Ok(woke) = self.with_x11_read(|conn, _| conn.wake_display()) {
+            return Ok(woke);
         }
         Ok(false)
     }
@@ -197,8 +303,11 @@ impl PlatformBackend for LinuxBackend {
     }
 
     fn displays(&self) -> Result<Vec<DisplayInfo>, RpcError> {
-        if let Ok((conn, _)) = self.x11() {
-            return conn.displays();
+        if !self.session.is_wayland() {
+            return self.with_x11_read(|conn, _| conn.displays());
+        }
+        if let Ok(displays) = self.with_x11_read(|conn, _| conn.displays()) {
+            return Ok(displays);
         }
         // Pure Wayland fallback: report logical primary display until portal/output query runs.
         Ok(vec![DisplayInfo {
@@ -218,15 +327,23 @@ impl PlatformBackend for LinuxBackend {
     }
 
     fn windows(&self, app_filter: Option<&str>) -> Result<Vec<WindowInfo>, RpcError> {
-        if let Ok((conn, _)) = self.x11() {
-            return conn.windows(app_filter);
+        if !self.session.is_wayland() {
+            return self.with_x11_read(|conn, _| conn.windows(app_filter));
+        }
+        if let Ok(wins) = self.with_x11_read(|conn, _| conn.windows(app_filter)) {
+            return Ok(wins);
         }
         Ok(Vec::new())
     }
 
     fn focused_app(&self) -> Result<Option<AppInfo>, RpcError> {
-        if let Ok((conn, _)) = self.x11() {
-            return Ok(conn.focused_window()?.map(|w| w.app));
+        if !self.session.is_wayland() {
+            return Ok(self
+                .with_x11_read(|conn, _| conn.focused_window())?
+                .map(|w| w.app));
+        }
+        if let Ok(focused) = self.with_x11_read(|conn, _| conn.focused_window()) {
+            return Ok(focused.map(|w| w.app));
         }
         Ok(None)
     }
@@ -331,8 +448,7 @@ impl PlatformBackend for LinuxBackend {
     }
 
     fn focus_window(&self, window_id: u32) -> Result<WindowInfo, RpcError> {
-        let (conn, _) = self.x11()?;
-        conn.focus_window(window_id)
+        self.with_x11_action(|conn, _| conn.focus_window(window_id))
     }
 
     fn snapshot(
@@ -377,8 +493,7 @@ impl PlatformBackend for LinuxBackend {
         if self.session.is_wayland() {
             return wayland::capture_wayland(target, format, annotate);
         }
-        let (conn, _) = self.x11()?;
-        conn.capture(target, format, annotate, focus_mode)
+        self.with_x11_read(|conn, _| conn.capture(target, format, annotate, focus_mode))
     }
 
     fn click_ref(
@@ -434,16 +549,16 @@ impl PlatformBackend for LinuxBackend {
         if self.session.is_wayland() && self.session.x11_display().is_none() {
             return wayland::wayland_click_point(point, button, count);
         }
-        let (conn, _) = self.x11()?;
-        conn.click_point(&self.stop_flag, point, button, count, mods)
+        self.with_x11_action(|conn, _| {
+            conn.click_point(&self.stop_flag, point, button, count, mods)
+        })
     }
 
     fn hover_point(&self, point: Point) -> Result<StepExecInfo, RpcError> {
         if self.session.is_wayland() && self.session.x11_display().is_none() {
             return wayland::wayland_hover_point(point);
         }
-        let (conn, _) = self.x11()?;
-        conn.hover_point(&self.stop_flag, point)
+        self.with_x11_action(|conn, _| conn.hover_point(&self.stop_flag, point))
     }
 
     fn drag(
@@ -453,8 +568,7 @@ impl PlatformBackend for LinuxBackend {
         mods: Modifiers,
         _focus_mode: FocusMode,
     ) -> Result<StepExecInfo, RpcError> {
-        let (conn, _) = self.x11()?;
-        conn.drag(&self.stop_flag, from, to, mods)
+        self.with_x11_action(|conn, _| conn.drag(&self.stop_flag, from, to, mods))
     }
 
     fn scroll(
@@ -467,8 +581,7 @@ impl PlatformBackend for LinuxBackend {
         if self.session.is_wayland() && self.session.x11_display().is_none() {
             return wayland::wayland_scroll(point, direction, amount);
         }
-        let (conn, _) = self.x11()?;
-        conn.scroll(&self.stop_flag, point, direction, amount)
+        self.with_x11_action(|conn, _| conn.scroll(&self.stop_flag, point, direction, amount))
     }
 
     fn set_text(
@@ -543,59 +656,62 @@ impl PlatformBackend for LinuxBackend {
             return Ok(info);
         }
 
-        let (conn, dpy) = self.x11()?;
-        if replace {
-            let _ = conn.press_key_combo(
-                &self.stop_flag,
-                KeyCombo {
-                    key: KeyCode::A,
-                    modifiers: Modifiers {
-                        ctrl: true,
-                        ..Modifiers::default()
-                    },
-                },
-                1,
-            );
-            std::thread::sleep(Duration::from_millis(15));
-        }
-
         let xauth = self.xauth_path();
         let is_short_ascii = text.len() <= 16 && text.is_ascii();
-        let detail = match method {
-            TextMethod::Type => {
-                let n = conn.type_text(&self.stop_flag, text)?;
-                format!("xtest typed {n} chars")
+        let detail = self.with_x11_action(|conn, dpy| {
+            if replace {
+                let _ = conn.press_key_combo(
+                    &self.stop_flag,
+                    KeyCombo {
+                        key: KeyCode::A,
+                        modifiers: Modifiers {
+                            ctrl: true,
+                            ..Modifiers::default()
+                        },
+                    },
+                    1,
+                );
+                std::thread::sleep(Duration::from_millis(15));
             }
-            TextMethod::Paste => {
-                conn.paste_text_via_clipboard(&self.stop_flag, dpy, xauth, text)?;
-                format!("clipboard pasted {} chars", text.chars().count())
-            }
-            TextMethod::Auto | TextMethod::Ax => {
-                if is_short_ascii {
-                    let n = conn.type_text(&self.stop_flag, text)?;
-                    format!("xtest typed {n} chars")
-                } else if conn
-                    .paste_text_via_clipboard(&self.stop_flag, dpy, xauth, text)
-                    .is_ok()
-                {
-                    format!("clipboard pasted {} chars", text.chars().count())
-                } else {
+
+            let detail = match method {
+                TextMethod::Type => {
                     let n = conn.type_text(&self.stop_flag, text)?;
                     format!("xtest typed {n} chars")
                 }
-            }
-        };
+                TextMethod::Paste => {
+                    conn.paste_text_via_clipboard(&self.stop_flag, dpy, xauth, text)?;
+                    format!("clipboard pasted {} chars", text.chars().count())
+                }
+                TextMethod::Auto | TextMethod::Ax => {
+                    if is_short_ascii {
+                        let n = conn.type_text(&self.stop_flag, text)?;
+                        format!("xtest typed {n} chars")
+                    } else if conn
+                        .paste_text_via_clipboard(&self.stop_flag, dpy, xauth, text)
+                        .is_ok()
+                    {
+                        format!("clipboard pasted {} chars", text.chars().count())
+                    } else {
+                        let n = conn.type_text(&self.stop_flag, text)?;
+                        format!("xtest typed {n} chars")
+                    }
+                }
+            };
 
-        if submit {
-            let _ = conn.press_key_combo(
-                &self.stop_flag,
-                KeyCombo {
-                    key: KeyCode::Return,
-                    modifiers: Modifiers::default(),
-                },
-                1,
-            )?;
-        }
+            if submit {
+                let _ = conn.press_key_combo(
+                    &self.stop_flag,
+                    KeyCombo {
+                        key: KeyCode::Return,
+                        modifiers: Modifiers::default(),
+                    },
+                    1,
+                )?;
+            }
+
+            Ok(detail)
+        })?;
 
         Ok(StepExecInfo {
             detail,
@@ -612,8 +728,7 @@ impl PlatformBackend for LinuxBackend {
         if self.session.is_wayland() && self.session.x11_display().is_none() {
             return wayland::wayland_key_combo(combo, repeat);
         }
-        let (conn, _) = self.x11()?;
-        conn.press_key_combo(&self.stop_flag, combo, repeat)
+        self.with_x11_action(|conn, _| conn.press_key_combo(&self.stop_flag, combo, repeat))
     }
 
     fn menu(&self, app: &str, path: &[String]) -> Result<String, RpcError> {
@@ -656,9 +771,168 @@ impl PlatformBackend for LinuxBackend {
     }
 }
 
+#[cfg(test)]
+mod x11_cache_tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use super::*;
+
+    struct FakeConn {
+        id: usize,
+        alive: Arc<AtomicBool>,
+    }
+
+    #[test]
+    fn cached_read_reuses_live_conn_proactively_replaces_stale_and_retries_mid_call_drop() {
+        let cache = Mutex::new(None);
+        let connects = AtomicUsize::new(0);
+        let first_alive = Arc::new(AtomicBool::new(true));
+        let second_alive = Arc::new(AtomicBool::new(true));
+        let third_alive = Arc::new(AtomicBool::new(true));
+
+        let make_conn = || {
+            let id = connects.fetch_add(1, Ordering::SeqCst) + 1;
+            let alive = match id {
+                1 => Arc::clone(&first_alive),
+                2 => Arc::clone(&second_alive),
+                _ => Arc::clone(&third_alive),
+            };
+            Ok(FakeConn { id, alive })
+        };
+
+        // Initial connect + reuse on healthy connection (no second connect).
+        let id1 = run_cached_read(
+            &cache,
+            make_conn,
+            |c| c.alive.load(Ordering::SeqCst),
+            |c| Ok(c.id),
+        )
+        .unwrap();
+        let id2 = run_cached_read(
+            &cache,
+            make_conn,
+            |c| c.alive.load(Ordering::SeqCst),
+            |c| Ok(c.id),
+        )
+        .unwrap();
+        assert_eq!((id1, id2), (1, 1));
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+
+        // Application error on a healthy connection must neither reconnect nor retry.
+        let mut app_err_calls = 0usize;
+        let err = run_cached_read::<FakeConn, ()>(
+            &cache,
+            make_conn,
+            |c| c.alive.load(Ordering::SeqCst),
+            |_| {
+                app_err_calls += 1;
+                Err(RpcError::new(ErrorCode::NotFound, "missing window"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(app_err_calls, 1);
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+
+        // Stale cached connection is proactively replaced BEFORE running `op`, so queries that
+        // never return `Err` (like displays/windows/screen_state) still recover cleanly.
+        first_alive.store(false, Ordering::SeqCst);
+        let id3 = run_cached_read(
+            &cache,
+            make_conn,
+            |c| c.alive.load(Ordering::SeqCst),
+            |c| Ok(c.id),
+        )
+        .unwrap();
+        assert_eq!(id3, 2);
+        assert_eq!(connects.load(Ordering::SeqCst), 2);
+
+        // Connection that dies mid-call triggers a single reconnect and retries the read.
+        let mut op_calls = 0usize;
+        let id4 = run_cached_read(
+            &cache,
+            make_conn,
+            |c| c.alive.load(Ordering::SeqCst),
+            |c| {
+                op_calls += 1;
+                if c.id == 2 {
+                    c.alive.store(false, Ordering::SeqCst);
+                    Err(RpcError::new(ErrorCode::BackendError, "connection reset"))
+                } else {
+                    Ok(c.id)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(id4, 3);
+        assert_eq!(op_calls, 2);
+        assert_eq!(connects.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn cached_action_replaces_stale_conn_and_evicts_mid_call_drop_without_retrying() {
+        let first_alive = Arc::new(AtomicBool::new(false));
+        let second_alive = Arc::new(AtomicBool::new(true));
+        let third_alive = Arc::new(AtomicBool::new(true));
+        let cache = Mutex::new(Some(FakeConn {
+            id: 1,
+            alive: Arc::clone(&first_alive),
+        }));
+        let connects = AtomicUsize::new(1);
+
+        let make_conn = || {
+            let id = connects.fetch_add(1, Ordering::SeqCst) + 1;
+            let alive = match id {
+                2 => Arc::clone(&second_alive),
+                _ => Arc::clone(&third_alive),
+            };
+            Ok(FakeConn { id, alive })
+        };
+
+        // Pre-call health check replaces stale connection #1 with #2 before running action.
+        let id = run_cached_action(
+            &cache,
+            make_conn,
+            |c| c.alive.load(Ordering::SeqCst),
+            |c| Ok(c.id),
+        )
+        .unwrap();
+        assert_eq!(id, 2);
+        assert_eq!(connects.load(Ordering::SeqCst), 2);
+
+        // Mid-call drop evicts cached connection #2 without re-executing the mutating action.
+        let mut action_calls = 0usize;
+        let err = run_cached_action::<FakeConn, ()>(
+            &cache,
+            make_conn,
+            |c| c.alive.load(Ordering::SeqCst),
+            |c| {
+                action_calls += 1;
+                c.alive.store(false, Ordering::SeqCst);
+                Err(RpcError::new(ErrorCode::BackendError, "broken pipe"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BackendError);
+        assert_eq!(action_calls, 1);
+        assert!(cache.lock().unwrap().is_none());
+
+        // Subsequent action reconnects cleanly to #3.
+        let next_id = run_cached_action(
+            &cache,
+            make_conn,
+            |c| c.alive.load(Ordering::SeqCst),
+            |c| Ok(c.id),
+        )
+        .unwrap();
+        assert_eq!(next_id, 3);
+        assert_eq!(connects.load(Ordering::SeqCst), 3);
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod linux_live_tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use desktop_core::{AuditLog, DesktopEngine, PolicyStore, SystemClock};
     use desktop_proto::{
@@ -668,9 +942,13 @@ mod linux_live_tests {
 
     use super::*;
 
+    /// Serialize live X11/Xvfb tests so concurrent runs never contend for host X11/Xvfb resources.
+    static LIVE_X11_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     /// Runs live against `$DISPLAY` (e.g. under `xvfb-run` in CI) and also tests managed `-auth` Xvfb!
     #[test]
     fn live_x11_capture_input_and_engine_roundtrip() {
+        let _guard = LIVE_X11_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cfg = if std::env::var("DISPLAY")
             .ok()
             .filter(|s| !s.is_empty())
@@ -807,6 +1085,7 @@ mod linux_live_tests {
 
     #[test]
     fn live_managed_authenticated_xvfb_boots_and_captures() {
+        let _guard = LIVE_X11_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if !session::command_exists("Xvfb") {
             return;
         }
@@ -822,6 +1101,17 @@ mod linux_live_tests {
             ..LinuxConfig::default()
         })
         .expect("start authenticated managed Xvfb");
+
+        if let Ok(active) = std::env::var("DISPLAY")
+            && let Some(active_num) = xvfb::parse_display_number(&active)
+            && let Some(managed_dpy) = backend.session_kind().x11_display()
+        {
+            assert_ne!(
+                xvfb::parse_display_number(managed_dpy),
+                Some(active_num),
+                "managed Xvfb display {managed_dpy} must not collide with active DISPLAY {active}"
+            );
+        }
 
         let displays = backend.displays().unwrap();
         assert_eq!(displays[0].pixel_width, 800);

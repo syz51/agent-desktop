@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use desktop_proto::{ErrorCode, RpcError};
@@ -10,6 +12,21 @@ use crate::session::command_exists;
 
 const XAUTH_FAMILY_WILD: u16 = 0xffff;
 const MIT_MAGIC_COOKIE_1: &[u8] = b"MIT-MAGIC-COOKIE-1";
+const DISPLAY_SEARCH_SPAN: u32 = 1000;
+
+static RESERVED_DISPLAYS: LazyLock<Mutex<HashSet<u32>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Process-local reservation preventing concurrent `ManagedXvfb::start` calls from picking
+/// the same display number before `Xvfb` creates its Unix socket/lockfile.
+struct DisplayReservation(u32);
+
+impl Drop for DisplayReservation {
+    fn drop(&mut self) {
+        let mut guard = RESERVED_DISPLAYS.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(&self.0);
+    }
+}
 
 /// Configuration for a daemon-managed private headless `Xvfb` display.
 #[derive(Debug, Clone)]
@@ -69,18 +86,101 @@ pub fn parse_xvfb_size(spec: &str) -> Result<(u32, u32), RpcError> {
     Ok((w, h))
 }
 
-/// Find an unused X11 display number in `99..200` (or starting from `hint`).
+/// Parse the numeric display ID from an X11 `DISPLAY` string (e.g. `":99"`, `":99.0"`, `"localhost:10.0"`).
 #[must_use]
-pub fn pick_free_display(hint: Option<u32>) -> u32 {
+pub fn parse_display_number(display: &str) -> Option<u32> {
+    let trimmed = display.trim();
+    let (_, after_colon) = trimmed.rsplit_once(':')?;
+    let num_str = match after_colon.split_once('.') {
+        Some((num, screen)) => {
+            if screen.is_empty() || !screen.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            num
+        }
+        None => after_colon,
+    };
+    if num_str.is_empty() || !num_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    num_str.parse().ok()
+}
+
+fn find_free_display_in(
+    hint: Option<u32>,
+    x11_tmp_dir: &Path,
+    active_display: Option<&str>,
+    reserved: &HashSet<u32>,
+) -> Option<u32> {
     let start = hint.unwrap_or(99);
-    for n in start..start.saturating_add(100) {
-        let sock = format!("/tmp/.X11-unix/X{n}");
-        let lock = format!("/tmp/.X{n}-lock");
-        if !Path::new(&sock).exists() && !Path::new(&lock).exists() {
-            return n;
+    let end = start.saturating_add(DISPLAY_SEARCH_SPAN - 1);
+    let active_num = active_display.and_then(parse_display_number);
+    let sock_dir = x11_tmp_dir.join(".X11-unix");
+    for n in start..=end {
+        if active_num == Some(n) || reserved.contains(&n) {
+            continue;
+        }
+        let sock = sock_dir.join(format!("X{n}"));
+        let lock = x11_tmp_dir.join(format!(".X{n}-lock"));
+        if std::fs::symlink_metadata(&sock).is_err() && std::fs::symlink_metadata(&lock).is_err() {
+            return Some(n);
         }
     }
-    start
+    None
+}
+
+fn pick_free_display_in(
+    hint: Option<u32>,
+    x11_tmp_dir: &Path,
+    active_display: Option<&str>,
+    reserved: &HashSet<u32>,
+) -> u32 {
+    if let Some(n) = find_free_display_in(hint, x11_tmp_dir, active_display, reserved) {
+        return n;
+    }
+    let start = hint.unwrap_or(99);
+    let active_num = active_display.and_then(parse_display_number);
+    if active_num == Some(start) {
+        start.saturating_add(1)
+    } else {
+        start
+    }
+}
+
+fn reserve_free_display_in(
+    hint: Option<u32>,
+    x11_tmp_dir: &Path,
+    active_display: Option<&str>,
+) -> Result<DisplayReservation, RpcError> {
+    let mut reserved = RESERVED_DISPLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    let num =
+        find_free_display_in(hint, x11_tmp_dir, active_display, &reserved).ok_or_else(|| {
+            RpcError::with_next(
+                ErrorCode::BackendError,
+                format!(
+                    "no unused X11 display number available starting from :{}",
+                    hint.unwrap_or(99)
+                ),
+                "Free stale /tmp/.X*-lock sockets or pass a lower --xvfb display hint.",
+            )
+        })?;
+    let inserted = reserved.insert(num);
+    debug_assert!(inserted, "find_free_display_in skipped reserved displays");
+    Ok(DisplayReservation(num))
+}
+
+fn reserve_free_display(hint: Option<u32>) -> Result<DisplayReservation, RpcError> {
+    let active = std::env::var("DISPLAY").ok();
+    reserve_free_display_in(hint, Path::new("/tmp"), active.as_deref())
+}
+
+/// Find an unused X11 display number starting from `hint` (default `99`),
+/// avoiding the active `$DISPLAY`, in-process reservations, and existing X11 sockets/lockfiles.
+#[must_use]
+pub fn pick_free_display(hint: Option<u32>) -> u32 {
+    let active = std::env::var("DISPLAY").ok();
+    let reserved = RESERVED_DISPLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    pick_free_display_in(hint, Path::new("/tmp"), active.as_deref(), &reserved)
 }
 
 /// Build an Xauthority (`MIT-MAGIC-COOKIE-1`, `FamilyWild`) record in wire format.
@@ -100,7 +200,8 @@ pub fn encode_xauthority_record(display_num: u32, cookie: &[u8; 16]) -> Vec<u8> 
     out
 }
 
-/// Build command-line arguments for `Xvfb` with mandatory `-auth` cookie protection (never `-ac`).
+/// Build command-line arguments for `Xvfb` with mandatory `-auth` cookie protection (never `-ac`)
+/// and `-noreset` so disconnecting a client never triggers an X server reset.
 #[must_use]
 pub fn xvfb_args(display_num: u32, cfg: &XvfbConfig, xauth_path: &Path) -> Vec<String> {
     vec![
@@ -110,6 +211,7 @@ pub fn xvfb_args(display_num: u32, cfg: &XvfbConfig, xauth_path: &Path) -> Vec<S
         format!("{}x{}x{}", cfg.width, cfg.height, cfg.depth),
         "-nolisten".to_string(),
         "tcp".to_string(),
+        "-noreset".to_string(),
         "-auth".to_string(),
         xauth_path.to_string_lossy().into_owned(),
     ]
@@ -159,6 +261,7 @@ pub struct ManagedXvfb {
     xauth_path: PathBuf,
     xvfb: Child,
     wm: Option<Child>,
+    _reservation: DisplayReservation,
 }
 
 impl ManagedXvfb {
@@ -172,7 +275,8 @@ impl ManagedXvfb {
             ));
         }
 
-        let display_num = pick_free_display(cfg.display_hint);
+        let reservation = reserve_free_display(cfg.display_hint)?;
+        let display_num = reservation.0;
         let display_str = format!(":{display_num}");
         let cookie: [u8; 16] = rand::rng().random();
         let xauth_path = write_private_xauthority(display_num, &cookie)?;
@@ -238,6 +342,7 @@ impl ManagedXvfb {
             xauth_path,
             xvfb,
             wm,
+            _reservation: reservation,
         })
     }
 
@@ -330,6 +435,7 @@ mod tests {
                 "1280x800x24",
                 "-nolisten",
                 "tcp",
+                "-noreset",
                 "-auth",
                 "/tmp/test.xauth"
             ]
@@ -342,5 +448,94 @@ mod tests {
         assert_eq!(&rec[0..4], &[0xff, 0xff, 0x00, 0x00]);
         assert_eq!(&rec[4..9], &[0x00, 0x03, b'1', b'0', b'5']);
         assert_eq!(&rec[rec.len() - 16..], &cookie);
+    }
+
+    #[test]
+    fn parses_display_numbers_and_rejects_invalid_strings() {
+        assert_eq!(parse_display_number(":99"), Some(99));
+        assert_eq!(parse_display_number(":99.0"), Some(99));
+        assert_eq!(parse_display_number("localhost:10.1"), Some(10));
+        assert_eq!(parse_display_number("unix:0"), Some(0));
+        assert_eq!(parse_display_number("/tmp/launchd/org.xquartz:3"), Some(3));
+        assert_eq!(parse_display_number("  :120  "), Some(120));
+        assert_eq!(parse_display_number(""), None);
+        assert_eq!(parse_display_number("99"), None);
+        assert_eq!(parse_display_number(":abc"), None);
+        assert_eq!(parse_display_number(":99."), None);
+        assert_eq!(parse_display_number(":99.abc"), None);
+    }
+
+    #[test]
+    fn pick_free_display_avoids_active_display_lockfiles_sockets_and_reservations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_dir = tmp.path().join(".X11-unix");
+        std::fs::create_dir_all(&sock_dir).unwrap();
+
+        // :99 is active in $DISPLAY (even with no lock/socket file on disk)
+        // :100 has a lockfile
+        // :101 has a socket entry
+        // :102 is reserved in-process
+        std::fs::write(tmp.path().join(".X100-lock"), "12345\n").unwrap();
+        std::fs::write(sock_dir.join("X101"), "").unwrap();
+        let mut reserved = HashSet::new();
+        reserved.insert(102);
+
+        assert_eq!(
+            pick_free_display_in(None, tmp.path(), Some(":99.0"), &reserved),
+            103
+        );
+        // Explicit hint colliding with active DISPLAY must still skip it.
+        assert_eq!(
+            pick_free_display_in(Some(99), tmp.path(), Some(":99"), &HashSet::new()),
+            102
+        );
+        // Explicit hint outside occupied range is used directly.
+        assert_eq!(
+            pick_free_display_in(Some(120), tmp.path(), Some(":99"), &reserved),
+            120
+        );
+    }
+
+    #[test]
+    fn display_reservation_blocks_concurrent_selection_until_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = reserve_free_display_in(Some(140), tmp.path(), None).unwrap();
+        let first_num = first.0;
+        let second = reserve_free_display_in(Some(first_num), tmp.path(), None).unwrap();
+        assert_ne!(second.0, first_num);
+        drop(first);
+        let third = reserve_free_display_in(Some(first_num), tmp.path(), None).unwrap();
+        assert_eq!(third.0, first_num);
+        drop(second);
+        drop(third);
+    }
+
+    #[test]
+    fn reserve_free_display_errors_instead_of_evicting_existing_reservation_when_exhausted() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Starting at u32::MAX leaves only a single candidate (u32::MAX).
+        let live = reserve_free_display_in(Some(u32::MAX), tmp.path(), None).unwrap();
+        assert_eq!(live.0, u32::MAX);
+
+        // Second reservation at u32::MAX must fail rather than stealing/evicting `live`.
+        let err = reserve_free_display_in(Some(u32::MAX), tmp.path(), None)
+            .err()
+            .expect("exhausted display range should error");
+        assert_eq!(err.code, ErrorCode::BackendError);
+
+        // `live`'s reservation must still be intact until `live` itself is dropped.
+        assert!(
+            RESERVED_DISPLAYS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&u32::MAX)
+        );
+        drop(live);
+        assert!(
+            !RESERVED_DISPLAYS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&u32::MAX)
+        );
     }
 }
