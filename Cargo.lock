@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "chrono",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-linux"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "desktop-core",
  "desktop-proto",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-macos"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "block2",
  "desktop-core",
@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "serde",
