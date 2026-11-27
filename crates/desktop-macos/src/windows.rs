@@ -458,12 +458,15 @@ mod tests {
 
     #[test]
     fn open_app_running_finder_in_background_and_auto_does_not_steal_focus() {
+        let Some(finder) = find_app("Finder").filter(|a| a.pid.is_some()) else {
+            return;
+        };
         let before = frontmost_pid();
         let app_bg = open_app("Finder", FocusMode::Background).unwrap();
         assert_eq!(app_bg.bundle_id.as_deref(), Some("com.apple.finder"));
         let app_auto = open_app("Finder", FocusMode::Auto).unwrap();
         assert_eq!(app_auto.bundle_id.as_deref(), Some("com.apple.finder"));
-        if before != app_bg.pid.map(|p| p as i32) {
+        if before != finder.pid.map(|p| p as i32) {
             assert_eq!(frontmost_pid(), before);
         }
     }

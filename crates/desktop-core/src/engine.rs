@@ -836,24 +836,19 @@ impl DesktopEngine {
         let mut outcomes = Vec::with_capacity(total);
         let mut failed_error: Option<RpcError> = None;
         let mut stopped_early = false;
+        let mut deferred_session_end = false;
         let mut released = false;
 
         for (index, step) in params.steps.into_iter().enumerate() {
             if let Err(err) = self.check_not_stopped() {
                 stopped_early = true;
+                released = true;
                 failed_error = Some(err);
                 break;
             }
             let step_start = Instant::now();
             let op_name = step_op_name(&step).to_string();
-            match self.execute_step(
-                client_id,
-                session_id,
-                caller,
-                step,
-                params.focus_mode,
-                policy,
-            ) {
+            match self.execute_step(step, params.focus_mode, policy) {
                 Ok(exec) => {
                     // Invalidate warm frame caches after steps that may change screen contents
                     // so post-step or post-wait screenshots never return a pre-step cached frame.
@@ -861,7 +856,7 @@ impl DesktopEngine {
                         self.invalidate_frame_caches();
                     }
                     if exec.released_session {
-                        released = true;
+                        deferred_session_end = true;
                     }
                     outcomes.push(StepOutcome {
                         index,
@@ -884,7 +879,19 @@ impl DesktopEngine {
                         duration_ms: step_start.elapsed().as_millis() as u64,
                         text: None,
                     });
-                    stopped_early = is_stop;
+                    if is_stop {
+                        stopped_early = true;
+                        // Ensure lease is torn down even when a backend step returned StoppedByUser
+                        // directly without going through check_not_stopped().
+                        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        let lease = st.lease.take();
+                        drop(st);
+                        if let Some(lease) = lease {
+                            self.teardown_lease(&lease, "stopped_by_user");
+                        }
+                        self.backend.stop_flag().store(false, Ordering::Release);
+                        released = true;
+                    }
                     failed_error = Some(err);
                     break;
                 }
@@ -942,7 +949,7 @@ impl DesktopEngine {
             detail: Some(&format!("{completed}/{total} steps")),
         });
 
-        if params.release_after && !released && !stopped_early {
+        if (params.release_after || deferred_session_end) && !released {
             let _ = self.handle_session_end(client_id, session_id, caller);
             released = true;
         }
@@ -962,9 +969,6 @@ impl DesktopEngine {
 
     fn execute_step(
         &self,
-        client_id: Option<u64>,
-        session_id: Option<&str>,
-        caller: Option<&str>,
         step: ActionStep,
         focus_mode: FocusMode,
         policy: &PolicyConfig,
@@ -1071,7 +1075,11 @@ impl DesktopEngine {
             ActionStep::OpenApp { app } => {
                 self.ensure_app_allowed_by_query(&app, policy)?;
                 let opened = self.backend.open_app(&app, focus_mode)?;
-                let used_background = focus_mode != FocusMode::Foreground;
+                let used_background = if is_macos {
+                    focus_mode != FocusMode::Foreground
+                } else {
+                    focus_mode == FocusMode::Background
+                };
                 let detail = if used_background {
                     format!("opened {} (background)", opened.name)
                 } else {
@@ -1097,11 +1105,21 @@ impl DesktopEngine {
                 ref_id,
                 window_id,
             } => {
-                if mode != ReadTextMode::Clipboard
-                    && let Some(r) = &ref_id
-                {
-                    let resolved = self.backend.resolve_ref(r)?;
-                    self.ensure_app_allowed(&resolved.app, policy)?;
+                if mode != ReadTextMode::Clipboard {
+                    if let Some(r) = &ref_id {
+                        let resolved = self.backend.resolve_ref(r)?;
+                        self.ensure_app_allowed(&resolved.app, policy)?;
+                    } else if let Some(wid) = window_id
+                        && let Some(win) = self
+                            .backend
+                            .windows(None)?
+                            .into_iter()
+                            .find(|w| w.id == wid)
+                    {
+                        self.ensure_app_allowed(&win.app, policy)?;
+                    } else if let Some(app) = self.backend.focused_app()? {
+                        self.ensure_app_allowed(&app, policy)?;
+                    }
                 }
                 let res = self.backend.read_text(
                     ref_id.as_deref(),
@@ -1147,19 +1165,13 @@ impl DesktopEngine {
                 }
                 Ok(StepRun::mutating(format!("slept {ms} ms"), true))
             }
-            ActionStep::SessionEnd => {
-                let detail = match self.handle_session_end(client_id, session_id, caller)? {
-                    RpcResult::Released { message } => message,
-                    _ => "Session released; lease is free.".into(),
-                };
-                Ok(StepRun {
-                    detail,
-                    used_background: true,
-                    text: None,
-                    released_session: true,
-                    mutated_screen: false,
-                })
-            }
+            ActionStep::SessionEnd => Ok(StepRun {
+                detail: "Session released; lease is free.".into(),
+                used_background: true,
+                text: None,
+                released_session: true,
+                mutated_screen: false,
+            }),
         }
     }
 

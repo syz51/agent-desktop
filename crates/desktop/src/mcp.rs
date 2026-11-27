@@ -232,6 +232,7 @@ pub fn tools() -> Vec<Tool> {
     });
     let screenshot_target_schema = json!({
         "type": "object",
+        "required": ["kind"],
         "description": "Capture target tagged with \"kind\": {\"kind\":\"display\",\"index\"?:0} | {\"kind\":\"window\",\"window_id\":123} | {\"kind\":\"app\",\"app\":\"Notes\"} | {\"kind\":\"region\",\"x\":0,\"y\":0,\"width\":400,\"height\":300,\"display\"?:0}.",
         "properties": {
             "kind": {
@@ -819,6 +820,13 @@ mod tests {
                 "missing ActionStep field {expected_field} in act schema"
             );
         }
+
+        let screenshot = all_tools.iter().find(|t| t.name == "screenshot").unwrap();
+        let screenshot_schema = Value::Object((*screenshot.input_schema).clone());
+        assert_eq!(
+            screenshot_schema["properties"]["target"]["required"],
+            json!(["kind"])
+        );
 
         let wait = all_tools.iter().find(|t| t.name == "wait").unwrap();
         let wait_schema = Value::Object((*wait.input_schema).clone());

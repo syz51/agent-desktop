@@ -275,6 +275,18 @@ impl PlatformBackend for LinuxBackend {
             return Ok(first.app.clone());
         }
 
+        if focus_mode == FocusMode::Background
+            && !matches!(self.session, SessionKind::HeadlessXvfb { .. })
+        {
+            return Err(RpcError::with_next(
+                ErrorCode::RequiresFocus,
+                format!(
+                    "launching new app {trimmed:?} on an interactive Linux session may steal foreground focus"
+                ),
+                "Use focus_mode=\"auto\" or \"foreground\", or run desktopd with --xvfb.",
+            ));
+        }
+
         let mut cmd = if command_exists(trimmed) {
             Command::new(trimmed)
         } else if command_exists("gtk-launch") {

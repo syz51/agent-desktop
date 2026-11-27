@@ -25,6 +25,7 @@ pub struct MockState {
     pub focused: Option<AppInfo>,
     pub ref_requires_focus: bool,
     pub ref_gone: bool,
+    pub stop_on_drag: bool,
 }
 
 pub struct MockBackend {
@@ -429,7 +430,7 @@ impl PlatformBackend for MockBackend {
         _mods: Modifiers,
         _focus_mode: FocusMode,
     ) -> Result<StepExecInfo, RpcError> {
-        if self.stop.load(Ordering::Acquire) {
+        if self.stop.load(Ordering::Acquire) || self.state.lock().unwrap().stop_on_drag {
             return Err(RpcError::new(ErrorCode::StoppedByUser, "stopped"));
         }
         self.state.lock().unwrap().actions_log.push(format!(
@@ -1113,6 +1114,162 @@ mod tests {
         assert!(failed.error.is_some());
         assert!(failed.released);
         assert!(!backend.state.lock().unwrap().display_awake);
+        assert!(
+            engine
+                .handle(
+                    Some(2),
+                    None,
+                    Some("agent-2"),
+                    RpcMethod::Snapshot(SnapshotParams::default()),
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn read_text_enforces_app_policy_without_ref_and_session_end_preserves_after_scope() {
+        let (engine, backend, _, _tmp) = make_engine();
+
+        // Deny Notes: ActionStep::ReadText with no ref (focused app = Notes) must be blocked.
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::PolicySet(PolicyConfig {
+                    mode: PolicyMode::Open,
+                    deny_apps: vec!["com.apple.Notes".into()],
+                    ..PolicyConfig::default()
+                }),
+            )
+            .unwrap();
+        let denied = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::ReadText {
+                        mode: ReadTextMode::Value,
+                        ref_id: None,
+                        window_id: None,
+                    }],
+                    after: PostAction::None,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Background,
+                    release_after: true,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        assert_eq!(denied.completed, 0);
+        assert_eq!(denied.error.unwrap().code, ErrorCode::PolicyDenied);
+        assert!(denied.released);
+
+        // Reset policy, start a session scoped to Safari (NOT Notes).
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::PolicySet(PolicyConfig::default()),
+            )
+            .unwrap();
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::SessionStart(SessionStartParams {
+                    reason: Some("scoped".into()),
+                    apps: Some(vec!["Safari".into()]),
+                    wait_for_lease_ms: None,
+                }),
+            )
+            .unwrap();
+
+        // Trailing SessionEnd with after=Snapshot must still enforce scoped_apps during after capture,
+        // then release the lease afterward.
+        let scoped = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::SessionEnd],
+                    after: PostAction::Snapshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Background,
+                    release_after: false,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        assert_eq!(scoped.completed, 1);
+        assert!(scoped.released);
+        // Notes is out of the Safari-only scope, so after=Snapshot was rejected by scope before release.
+        assert!(scoped.snapshot.is_none());
+        assert!(!backend.state.lock().unwrap().display_awake);
+    }
+
+    #[test]
+    fn mid_step_stop_tears_down_lease_and_marks_released() {
+        let (engine, backend, _, _tmp) = make_engine();
+
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::SessionStart(SessionStartParams::default()),
+            )
+            .unwrap();
+        assert!(backend.state.lock().unwrap().display_awake);
+
+        // Simulate a backend input step returning StoppedByUser mid-step (without check_not_stopped).
+        backend.state.lock().unwrap().stop_on_drag = true;
+        let res = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::Drag {
+                        from: Target::Point {
+                            x: 10.0,
+                            y: 10.0,
+                            display: None,
+                        },
+                        to: Target::Point {
+                            x: 50.0,
+                            y: 50.0,
+                            display: None,
+                        },
+                        modifiers: vec![],
+                    }],
+                    after: PostAction::None,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Auto,
+                    release_after: true,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        assert_eq!(res.completed, 0);
+        assert!(res.stopped_early);
+        assert!(res.released);
+        assert_eq!(res.error.unwrap().code, ErrorCode::StoppedByUser);
+        assert!(!backend.state.lock().unwrap().display_awake);
+        // Another client can acquire control immediately since the lease was torn down.
         assert!(
             engine
                 .handle(
