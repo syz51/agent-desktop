@@ -106,15 +106,31 @@ jobs:
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*.tar.gz
-      - name: Create the release
+      - name: Create and publish immutable release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
+        shell: bash
         run: |
+          set -euo pipefail
           prerelease=()
           [[ "$TAG" != *-* ]] || prerelease=(--prerelease)
-          notes="Verify a download with \`shasum -a 256 --check --ignore-missing SHA256SUMS\` and
+          notes="Verify a download with \`shasum -a 256 --check --ignore-missing SHA256SUMS\`,
+          \`gh release verify-asset $TAG <archive> --repo $GH_REPO\`, and
           \`gh attestation verify <archive> --repo $GH_REPO\`."
+          # Passing all assets to `gh release create` uploads them to a temporary draft and
+          # publishes atomically by release ID, so immutable releases freeze the complete set.
           gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
             --verify-tag --title "$TAG" --generate-notes --notes "$notes" "${prerelease[@]}"
+          for attempt in {1..30}; do
+            if gh release verify "$TAG" --repo "$GH_REPO"; then
+              break
+            fi
+            if [[ "$attempt" -eq 30 ]]; then
+              echo "::error::Timed out waiting for GitHub release attestation for $TAG"
+              exit 1
+            fi
+            echo "Waiting for GitHub release attestation ($attempt/30)..." >&2
+            sleep 5
+          done
