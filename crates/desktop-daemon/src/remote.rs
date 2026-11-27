@@ -239,7 +239,8 @@ async fn handle_screenshot_binary(
             Json(json!({ "error": format!("encode screenshot meta: {e}") })),
         )
     })?;
-    let meta_val = HeaderValue::from_str(&meta_json).map_err(|e| {
+    let meta_ascii = escape_non_ascii_json(&meta_json);
+    let meta_val = HeaderValue::from_str(&meta_ascii).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("invalid screenshot meta header: {e}") })),
@@ -278,4 +279,25 @@ async fn handle_disconnect(
         let _ = tokio::task::spawn_blocking(move || engine.on_client_disconnect(client_id)).await;
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+/// Escape non-ASCII characters as JSON `\uXXXX` sequences so the JSON string is always a valid
+/// ASCII HTTP `HeaderValue` regardless of Unicode window titles or app names.
+fn escape_non_ascii_json(input: &str) -> String {
+    if input.is_ascii() {
+        return input.to_string();
+    }
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii() {
+            out.push(ch);
+        } else {
+            let mut buf = [0u16; 2];
+            for unit in ch.encode_utf16(&mut buf) {
+                let _ = write!(out, "\\u{unit:04x}");
+            }
+        }
+    }
+    out
 }

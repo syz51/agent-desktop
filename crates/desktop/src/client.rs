@@ -477,13 +477,14 @@ impl DesktopClient {
             ));
         }
         if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-            let rpc_err: RpcError = resp.json().await.map_err(|e| {
-                RpcError::new(
-                    ErrorCode::Internal,
-                    format!("decode screenshot RPC error from {alias:?}: {e}"),
-                )
-            })?;
-            return Err(rpc_err);
+            let text = resp.text().await.unwrap_or_default();
+            if let Ok(rpc_err) = serde_json::from_str::<RpcError>(&text) {
+                return Err(rpc_err);
+            }
+            return Err(RpcError::new(
+                ErrorCode::InvalidInput,
+                format!("host {alias:?} rejected screenshot request (422): {text}"),
+            ));
         }
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();

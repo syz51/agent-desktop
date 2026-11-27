@@ -16,5 +16,7 @@ pub use audit::AuditLog;
 pub use backend::{AnnotateBox, PlatformBackend, RawScreenshot, ResolvedRef, StepExecInfo};
 pub use clock::{Clock, SystemClock};
 pub use engine::DesktopEngine;
-pub use frame_ring::{FrameKey, FrameRing, dhash_distance, dhash_from_pixels, has_visual_change};
+pub use frame_ring::{
+    FrameKey, FrameRing, has_visual_change, max_visual_delta, visual_signature_from_pixels,
+};
 pub use policy::PolicyStore;

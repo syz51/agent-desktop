@@ -93,7 +93,7 @@ pub fn encode_rgba_screenshot(
         img
     };
 
-    let dhash = desktop_core::dhash_from_pixels(
+    let visual_sig = desktop_core::visual_signature_from_pixels(
         final_img.as_raw(),
         out_w as usize,
         out_h as usize,
@@ -135,7 +135,7 @@ pub fn encode_rgba_screenshot(
         display_bounds,
         mime_type: format.mime_type().to_string(),
         bytes,
-        dhash,
+        visual_sig,
     })
 }
 

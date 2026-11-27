@@ -35,7 +35,7 @@ objc2-app-kit = { version = "0.3", features = [
     "NSWorkspace",
     "block2",
 ] }
-objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
+objc2-core-foundation = { version = "0.3", features = ["CFArray", "CFCGTypes", "CFDictionary"] }
 objc2-core-graphics = { version = "0.3", features = ["CGImage"] }
 objc2-core-media = { version = "0.3", features = ["CMSampleBuffer", "CMTime", "objc2-core-video"] }
 objc2-core-video = { version = "0.3", features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer"] }

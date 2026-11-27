@@ -21,8 +21,8 @@ pub struct RawScreenshot {
     pub display_bounds: Rect,
     pub mime_type: String,
     pub bytes: Vec<u8>,
-    /// Optional 64-bit perceptual difference hash (dHash) computed from raw pixels before encoding.
-    pub dhash: Option<u64>,
+    /// Optional 8x8 area-averaged luma thumbnail computed from raw pixels before encoding.
+    pub visual_sig: Option<[u8; 64]>,
 }
 
 #[derive(Debug, Clone)]

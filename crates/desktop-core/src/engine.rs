@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::audit::{AuditEvent, AuditLog};
 use crate::backend::{PlatformBackend, RawScreenshot};
 use crate::clock::{Clock, default_lease_ttl};
-use crate::frame_ring::{DEFAULT_WARM_FRAME_TTL, FrameKey, FrameRing, has_visual_change};
+use crate::frame_ring::{DEFAULT_WARM_FRAME_TTL_MS, FrameKey, FrameRing, has_visual_change};
 use crate::policy::{PolicyStore, check_app_policy};
 use crate::tree::{collect_annotate_boxes, find_in_snapshot};
 
@@ -218,6 +218,7 @@ impl DesktopEngine {
                 self.ensure_display_ready(false)?;
                 let (matched, elapsed_ms, detail) =
                     self.run_wait(&params.condition, params.timeout_ms, &policy)?;
+                self.invalidate_frame_caches();
                 Ok(RpcResult::Wait {
                     matched,
                     elapsed_ms,
@@ -628,9 +629,10 @@ impl DesktopEngine {
     }
 
     fn invalidate_frame_caches(&self) {
+        let now = self.clock.now();
         {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.frame_ring.invalidate_all();
+            st.frame_ring.invalidate_all(now);
         }
         self.backend.invalidate_caches();
     }
@@ -676,15 +678,16 @@ impl DesktopEngine {
         };
 
         let frame_key = FrameKey::from_target(&params.target);
+        let now = self.clock.now();
         // Serve unannotated screenshots from the warm frame ring if captured within 120 ms with
-        // no intervening mutating action (bypass when caller explicitly polls `if_changed_since`).
+        // no intervening action/wait/sleep (bypass when caller explicitly polls `if_changed_since`).
         let cached = if params.if_changed_since.is_none()
             && annotate_boxes.is_empty()
             && params.focus_mode != FocusMode::Foreground
         {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             st.frame_ring
-                .get_fresh(&frame_key, params.format, DEFAULT_WARM_FRAME_TTL)
+                .get_fresh(now, &frame_key, params.format, DEFAULT_WARM_FRAME_TTL_MS)
         } else {
             None
         };
@@ -701,8 +704,13 @@ impl DesktopEngine {
             let hash = short_sha256(&raw.bytes);
             if annotate_boxes.is_empty() {
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                st.frame_ring
-                    .record(frame_key, params.format, raw.clone(), hash.clone());
+                st.frame_ring.record(
+                    self.clock.now(),
+                    frame_key,
+                    params.format,
+                    raw.clone(),
+                    hash.clone(),
+                );
             }
             (raw, hash)
         };
@@ -827,12 +835,11 @@ impl DesktopEngine {
             }
             let step_start = Instant::now();
             let op_name = step_op_name(&step).to_string();
-            let mutates_ui = !matches!(step, ActionStep::Wait { .. } | ActionStep::Sleep { .. });
             match self.execute_step(step, params.focus_mode, policy) {
                 Ok((detail, used_background)) => {
-                    if mutates_ui {
-                        self.invalidate_frame_caches();
-                    }
+                    // Always invalidate warm frame caches after every step (including Wait/Sleep)
+                    // so post-step or post-wait screenshots never return a pre-step cached frame.
+                    self.invalidate_frame_caches();
                     outcomes.push(StepOutcome {
                         index,
                         op: op_name,
@@ -1084,12 +1091,12 @@ impl DesktopEngine {
         let start = Instant::now();
         let deadline = start + StdDuration::from_millis(timeout_ms);
 
-        // Capture initial hash + perceptual dHash for VisualChange comparisons.
+        // Capture initial hash + 8x8 visual signature for VisualChange comparisons.
         let initial_visual = if let WaitCondition::VisualChange { target } = condition {
             let raw =
                 self.backend
                     .capture(target, ImageFormat::Jpeg, &[], FocusMode::Background)?;
-            Some((short_sha256(&raw.bytes), raw.dhash))
+            Some((short_sha256(&raw.bytes), raw.visual_sig))
         } else {
             None
         };
@@ -1175,8 +1182,13 @@ impl DesktopEngine {
                         FocusMode::Background,
                     )?;
                     let h = short_sha256(&raw.bytes);
-                    if let Some((base_sha, base_dhash)) = &initial_visual
-                        && has_visual_change(base_sha, *base_dhash, &h, raw.dhash)
+                    if let Some((base_sha, base_sig)) = &initial_visual
+                        && has_visual_change(
+                            base_sha,
+                            base_sig.as_ref(),
+                            &h,
+                            raw.visual_sig.as_ref(),
+                        )
                     {
                         return Ok((
                             true,
