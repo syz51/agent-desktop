@@ -533,6 +533,9 @@ impl DesktopClient {
             RpcResult::Released { .. } | RpcResult::Stopped { .. } => {
                 self.sessions.lock().await.remove(alias);
             }
+            RpcResult::Act(act) if act.released => {
+                self.sessions.lock().await.remove(alias);
+            }
             _ => {}
         }
     }

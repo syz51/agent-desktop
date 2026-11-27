@@ -257,7 +257,7 @@ impl PlatformBackend for LinuxBackend {
         Ok(None)
     }
 
-    fn open_app(&self, app: &str) -> Result<AppInfo, RpcError> {
+    fn open_app(&self, app: &str, focus_mode: FocusMode) -> Result<AppInfo, RpcError> {
         let trimmed = app.trim();
         if trimmed.is_empty() {
             return Err(RpcError::new(
@@ -265,11 +265,13 @@ impl PlatformBackend for LinuxBackend {
                 "app name cannot be empty",
             ));
         }
-        // If a window for this app already exists, focus and return it.
+        // If a window for this app already exists, only raise/focus it in Foreground mode.
         if let Ok(wins) = self.windows(Some(trimmed))
             && let Some(first) = wins.first()
         {
-            let _ = self.focus_window(first.id);
+            if focus_mode == FocusMode::Foreground {
+                let _ = self.focus_window(first.id);
+            }
             return Ok(first.app.clone());
         }
 
@@ -783,6 +785,7 @@ mod linux_live_tests {
                     after: PostAction::None,
                     expect_snapshot: None,
                     focus_mode: FocusMode::Auto,
+                    release_after: false,
                 }),
             )
             .unwrap();

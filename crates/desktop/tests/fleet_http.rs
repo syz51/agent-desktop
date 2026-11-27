@@ -145,6 +145,7 @@ async fn tailscale_http_fleet_auth_routing_leases_and_list_hosts() {
                 after: PostAction::Snapshot,
                 expect_snapshot: Some(snap.snapshot_id),
                 focus_mode: FocusMode::Auto,
+                release_after: false,
             }),
         )
         .await
