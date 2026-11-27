@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/desktop-proto",
+    "crates/desktop-core",
+    "crates/desktop-macos",
+    "crates/desktop-daemon",
+    "crates/desktop",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+repository = "https://github.com/syz51/agent-desktop"
+
+[workspace.dependencies]
+desktop-proto = { path = "crates/desktop-proto" }
+desktop-core = { path = "crates/desktop-core" }
+desktop-macos = { path = "crates/desktop-macos" }
+desktop-daemon = { path = "crates/desktop-daemon" }
+
+anyhow = "1.0.104"
+axum = "0.8.9"
+base64 = "0.23.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+dirs = "7.0.0"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+rand = "0.10.4"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json"] }
+rmcp = { version = "3.9.0", default-features = false, features = ["server", "transport-io"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+subtle = "2.6.1"
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "fs", "signal", "sync"] }
+toml = "1.2.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.16.0", features = ["v4", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"

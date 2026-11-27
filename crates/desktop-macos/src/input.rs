@@ -1,0 +1,755 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use desktop_core::StepExecInfo;
+use desktop_proto::{
+    ClickMode, ElementAction, ErrorCode, FocusMode, KeyCode, KeyCombo, Modifiers, MouseButton,
+    Point, RpcError, ScrollDirection, TextMethod,
+};
+use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+use objc2_foundation::NSString;
+
+use crate::ax::{AxRefStore, require_accessibility};
+use crate::ffi::{
+    self, CGEventRef, CGPoint, CfOwned, K_CG_EVENT_FLAG_MASK_ALTERNATE,
+    K_CG_EVENT_FLAG_MASK_COMMAND, K_CG_EVENT_FLAG_MASK_CONTROL, K_CG_EVENT_FLAG_MASK_SECONDARY_FN,
+    K_CG_EVENT_FLAG_MASK_SHIFT, K_CG_EVENT_LEFT_MOUSE_DOWN, K_CG_EVENT_LEFT_MOUSE_DRAGGED,
+    K_CG_EVENT_LEFT_MOUSE_UP, K_CG_EVENT_MOUSE_MOVED, K_CG_EVENT_OTHER_MOUSE_DOWN,
+    K_CG_EVENT_OTHER_MOUSE_UP, K_CG_EVENT_RIGHT_MOUSE_DOWN, K_CG_EVENT_RIGHT_MOUSE_UP,
+    K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE, K_CG_EVENT_SOURCE_USER_DATA, K_CG_HID_EVENT_TAP,
+    K_CG_MOUSE_BUTTON_CENTER, K_CG_MOUSE_BUTTON_LEFT, K_CG_MOUSE_BUTTON_RIGHT,
+    K_CG_MOUSE_EVENT_CLICK_STATE, K_CG_SCROLL_EVENT_UNIT_LINE, SYNTHETIC_MARK,
+};
+use crate::windows;
+
+fn event_source() -> Result<CfOwned, RpcError> {
+    // SAFETY: `CGEventSourceCreate` returns an owned +1 CGEventSourceRef.
+    unsafe {
+        CfOwned::from_owned(
+            ffi::CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE).cast_const(),
+        )
+    }
+    .ok_or_else(|| RpcError::new(ErrorCode::BackendError, "CGEventSourceCreate failed"))
+}
+
+fn modifier_flags(mods: Modifiers) -> u64 {
+    let mut f = 0u64;
+    if mods.cmd {
+        f |= K_CG_EVENT_FLAG_MASK_COMMAND;
+    }
+    if mods.ctrl {
+        f |= K_CG_EVENT_FLAG_MASK_CONTROL;
+    }
+    if mods.alt {
+        f |= K_CG_EVENT_FLAG_MASK_ALTERNATE;
+    }
+    if mods.shift {
+        f |= K_CG_EVENT_FLAG_MASK_SHIFT;
+    }
+    if mods.fn_key {
+        f |= K_CG_EVENT_FLAG_MASK_SECONDARY_FN;
+    }
+    f
+}
+
+fn check_stop(stop: &AtomicBool) -> Result<(), RpcError> {
+    if stop.load(Ordering::Acquire) {
+        return Err(RpcError::with_next(
+            ErrorCode::StoppedByUser,
+            "stopped by the user during action",
+            "Pause and check with the user before resuming.",
+        ));
+    }
+    Ok(())
+}
+
+fn post_event(ev: CfOwned, mods: Modifiers, stop: &AtomicBool) -> Result<(), RpcError> {
+    check_stop(stop)?;
+    let flags = modifier_flags(mods);
+    // SAFETY: `ev` is a valid retained CGEventRef.
+    unsafe {
+        if flags != 0 {
+            ffi::CGEventSetFlags(ev.as_mut_ptr(), flags);
+        }
+        ffi::CGEventSetIntegerValueField(
+            ev.as_mut_ptr(),
+            K_CG_EVENT_SOURCE_USER_DATA,
+            SYNTHETIC_MARK,
+        );
+        ffi::CGEventPost(K_CG_HID_EVENT_TAP, ev.as_mut_ptr());
+    }
+    Ok(())
+}
+
+fn current_cursor_location() -> Option<CGPoint> {
+    // SAFETY: `CGEventCreate(NULL)` captures the current mouse location.
+    let ev = unsafe { CfOwned::from_owned(ffi::CGEventCreate(std::ptr::null_mut()).cast_const()) }?;
+    Some(unsafe { ffi::CGEventGetLocation(ev.as_mut_ptr()) })
+}
+
+/// Temporarily save previous frontmost app + cursor position when `FocusMode::Auto` must
+/// briefly borrow focus, then restore both on drop.
+struct FocusRestoreGuard {
+    prev_pid: Option<i32>,
+    prev_cursor: Option<CGPoint>,
+    active: bool,
+}
+
+impl FocusRestoreGuard {
+    fn enter(target_pid: Option<i32>, focus_mode: FocusMode) -> Self {
+        if focus_mode != FocusMode::Auto {
+            if focus_mode == FocusMode::Foreground
+                && let Some(pid) = target_pid
+            {
+                windows::activate_pid(pid);
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            return Self {
+                prev_pid: None,
+                prev_cursor: None,
+                active: false,
+            };
+        }
+        let prev_pid = windows::frontmost_pid();
+        let prev_cursor = current_cursor_location();
+        let needs_switch = target_pid.is_some() && target_pid != prev_pid;
+        if needs_switch && let Some(pid) = target_pid {
+            windows::activate_pid(pid);
+            std::thread::sleep(Duration::from_millis(35));
+        }
+        Self {
+            prev_pid: if needs_switch { prev_pid } else { None },
+            prev_cursor,
+            active: true,
+        }
+    }
+}
+
+impl Drop for FocusRestoreGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(pt) = self.prev_cursor
+            && let Ok(src) = event_source()
+        {
+            // SAFETY: Move pointer back silently without marking a click.
+            if let Some(ev) = unsafe {
+                CfOwned::from_owned(
+                    ffi::CGEventCreateMouseEvent(
+                        src.as_mut_ptr(),
+                        K_CG_EVENT_MOUSE_MOVED,
+                        pt,
+                        K_CG_MOUSE_BUTTON_LEFT,
+                    )
+                    .cast_const(),
+                )
+            } {
+                unsafe {
+                    ffi::CGEventSetIntegerValueField(
+                        ev.as_mut_ptr(),
+                        K_CG_EVENT_SOURCE_USER_DATA,
+                        SYNTHETIC_MARK,
+                    );
+                    ffi::CGEventPost(K_CG_HID_EVENT_TAP, ev.as_mut_ptr());
+                }
+            }
+        }
+        if let Some(pid) = self.prev_pid {
+            std::thread::sleep(Duration::from_millis(20));
+            windows::activate_pid(pid);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn click_ref(
+    refs: &AxRefStore,
+    stop: &AtomicBool,
+    ref_id: &str,
+    button: MouseButton,
+    count: u8,
+    mods: Modifiers,
+    click_mode: ClickMode,
+    focus_mode: FocusMode,
+) -> Result<StepExecInfo, RpcError> {
+    require_accessibility()?;
+    check_stop(stop)?;
+    let live = refs.get(ref_id)?;
+
+    // Tier 1: Zero-focus semantic AXPress (fastest, zero cursor warp, works in background).
+    let can_semantic = click_mode != ClickMode::Pointer
+        && button == MouseButton::Left
+        && count == 1
+        && mods.is_empty()
+        && live.actions.contains(&ElementAction::Press);
+
+    if can_semantic {
+        if live.element.perform_action("AXPress").is_ok() {
+            return Ok(StepExecInfo {
+                detail: format!(
+                    "pressed {ref_id} in {} via AXPress (background)",
+                    live.app.name
+                ),
+                used_background: true,
+            });
+        }
+        if click_mode == ClickMode::Semantic {
+            return Err(RpcError::with_next(
+                ErrorCode::BackendError,
+                format!("AXPress failed on {ref_id}"),
+                "Retry with mode=\"auto\" or mode=\"pointer\".",
+            ));
+        }
+    }
+
+    if focus_mode == FocusMode::Background {
+        return Err(RpcError::with_next(
+            ErrorCode::RequiresFocus,
+            format!(
+                "{ref_id} in {} requires foreground pointer input",
+                live.app.name
+            ),
+            "Retry with focus_mode=\"auto\" (brief focus-and-restore) or focus_mode=\"foreground\".",
+        ));
+    }
+
+    let bounds = live.element.bounds().ok_or_else(|| {
+        RpcError::with_next(
+            ErrorCode::StaleRef,
+            format!("{ref_id} has no visible bounding box"),
+            "Take a fresh snapshot.",
+        )
+    })?;
+    let _guard = FocusRestoreGuard::enter(live.app.pid.map(|p| p as i32), focus_mode);
+    let info = click_point_raw(stop, bounds.center(), button, count, mods)?;
+    Ok(StepExecInfo {
+        detail: format!("clicked {ref_id} in {} ({})", live.app.name, info.detail),
+        used_background: false,
+    })
+}
+
+pub fn click_point(
+    stop: &AtomicBool,
+    point: Point,
+    button: MouseButton,
+    count: u8,
+    mods: Modifiers,
+    focus_mode: FocusMode,
+) -> Result<StepExecInfo, RpcError> {
+    require_accessibility()?;
+    if focus_mode == FocusMode::Background {
+        return Err(RpcError::with_next(
+            ErrorCode::RequiresFocus,
+            "raw coordinate clicks require foreground HID pointer input on macOS",
+            "Target an @eN ref from snapshot for background AXPress, or use focus_mode=\"auto\".",
+        ));
+    }
+    let _guard = if focus_mode == FocusMode::Auto {
+        FocusRestoreGuard::enter(None, FocusMode::Auto)
+    } else {
+        FocusRestoreGuard::enter(None, FocusMode::Foreground)
+    };
+    click_point_raw(stop, point, button, count, mods)
+}
+
+fn click_point_raw(
+    stop: &AtomicBool,
+    point: Point,
+    button: MouseButton,
+    count: u8,
+    mods: Modifiers,
+) -> Result<StepExecInfo, RpcError> {
+    let src = event_source()?;
+    let pt = CGPoint {
+        x: point.x,
+        y: point.y,
+    };
+    let (down_ty, up_ty, btn) = match button {
+        MouseButton::Left => (
+            K_CG_EVENT_LEFT_MOUSE_DOWN,
+            K_CG_EVENT_LEFT_MOUSE_UP,
+            K_CG_MOUSE_BUTTON_LEFT,
+        ),
+        MouseButton::Right => (
+            K_CG_EVENT_RIGHT_MOUSE_DOWN,
+            K_CG_EVENT_RIGHT_MOUSE_UP,
+            K_CG_MOUSE_BUTTON_RIGHT,
+        ),
+        MouseButton::Middle => (
+            K_CG_EVENT_OTHER_MOUSE_DOWN,
+            K_CG_EVENT_OTHER_MOUSE_UP,
+            K_CG_MOUSE_BUTTON_CENTER,
+        ),
+    };
+
+    let mv = make_mouse(&src, K_CG_EVENT_MOUSE_MOVED, pt, btn)?;
+    post_event(mv, Modifiers::default(), stop)?;
+    std::thread::sleep(Duration::from_millis(20));
+
+    for click_state in 1..=count.max(1) {
+        for ty in [down_ty, up_ty] {
+            let ev = make_mouse(&src, ty, pt, btn)?;
+            // SAFETY: Sets clickState (1, 2, 3) for single/double/triple clicks.
+            unsafe {
+                ffi::CGEventSetIntegerValueField(
+                    ev.as_mut_ptr(),
+                    K_CG_MOUSE_EVENT_CLICK_STATE,
+                    i64::from(click_state),
+                );
+            }
+            post_event(ev, mods, stop)?;
+        }
+        if click_state < count {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    Ok(StepExecInfo {
+        detail: format!("clicked ({:.0}, {:.0})", point.x, point.y),
+        used_background: false,
+    })
+}
+
+pub fn hover_point(stop: &AtomicBool, point: Point) -> Result<StepExecInfo, RpcError> {
+    require_accessibility()?;
+    let src = event_source()?;
+    let ev = make_mouse(
+        &src,
+        K_CG_EVENT_MOUSE_MOVED,
+        CGPoint {
+            x: point.x,
+            y: point.y,
+        },
+        K_CG_MOUSE_BUTTON_LEFT,
+    )?;
+    post_event(ev, Modifiers::default(), stop)?;
+    Ok(StepExecInfo {
+        detail: format!("hovered ({:.0}, {:.0})", point.x, point.y),
+        used_background: false,
+    })
+}
+
+pub fn drag(
+    stop: &AtomicBool,
+    from: Point,
+    to: Point,
+    mods: Modifiers,
+    focus_mode: FocusMode,
+) -> Result<StepExecInfo, RpcError> {
+    require_accessibility()?;
+    if focus_mode == FocusMode::Background {
+        return Err(RpcError::with_next(
+            ErrorCode::RequiresFocus,
+            "drag requires foreground pointer input",
+            "Use focus_mode=\"auto\" or \"foreground\".",
+        ));
+    }
+    let src = event_source()?;
+    let p1 = CGPoint {
+        x: from.x,
+        y: from.y,
+    };
+    let p2 = CGPoint { x: to.x, y: to.y };
+
+    post_event(
+        make_mouse(&src, K_CG_EVENT_MOUSE_MOVED, p1, K_CG_MOUSE_BUTTON_LEFT)?,
+        Modifiers::default(),
+        stop,
+    )?;
+    std::thread::sleep(Duration::from_millis(25));
+    post_event(
+        make_mouse(&src, K_CG_EVENT_LEFT_MOUSE_DOWN, p1, K_CG_MOUSE_BUTTON_LEFT)?,
+        mods,
+        stop,
+    )?;
+
+    let steps = 12;
+    for step in 1..=steps {
+        let t = f64::from(step) / f64::from(steps);
+        let cur = CGPoint {
+            x: p1.x + (p2.x - p1.x) * t,
+            y: p1.y + (p2.y - p1.y) * t,
+        };
+        post_event(
+            make_mouse(
+                &src,
+                K_CG_EVENT_LEFT_MOUSE_DRAGGED,
+                cur,
+                K_CG_MOUSE_BUTTON_LEFT,
+            )?,
+            mods,
+            stop,
+        )?;
+        std::thread::sleep(Duration::from_millis(12));
+    }
+
+    post_event(
+        make_mouse(&src, K_CG_EVENT_LEFT_MOUSE_UP, p2, K_CG_MOUSE_BUTTON_LEFT)?,
+        mods,
+        stop,
+    )?;
+    Ok(StepExecInfo {
+        detail: format!(
+            "dragged ({:.0},{:.0}) -> ({:.0},{:.0})",
+            from.x, from.y, to.x, to.y
+        ),
+        used_background: false,
+    })
+}
+
+pub fn scroll(
+    stop: &AtomicBool,
+    point: Point,
+    direction: ScrollDirection,
+    amount: u32,
+    _focus_mode: FocusMode,
+) -> Result<StepExecInfo, RpcError> {
+    require_accessibility()?;
+    let src = event_source()?;
+    let pt = CGPoint {
+        x: point.x,
+        y: point.y,
+    };
+    post_event(
+        make_mouse(&src, K_CG_EVENT_MOUSE_MOVED, pt, K_CG_MOUSE_BUTTON_LEFT)?,
+        Modifiers::default(),
+        stop,
+    )?;
+    std::thread::sleep(Duration::from_millis(15));
+    let amt = amount as i32;
+    let (dx, dy) = match direction {
+        ScrollDirection::Up => (0, amt),
+        ScrollDirection::Down => (0, -amt),
+        ScrollDirection::Left => (amt, 0),
+        ScrollDirection::Right => (-amt, 0),
+    };
+    // SAFETY: Creates a line-unit scroll wheel CGEvent.
+    let ev = unsafe {
+        CfOwned::from_owned(
+            ffi::CGEventCreateScrollWheelEvent2(
+                src.as_mut_ptr(),
+                K_CG_SCROLL_EVENT_UNIT_LINE,
+                2,
+                dy,
+                dx,
+                0,
+            )
+            .cast_const(),
+        )
+    }
+    .ok_or_else(|| RpcError::new(ErrorCode::BackendError, "scroll event creation failed"))?;
+    post_event(ev, Modifiers::default(), stop)?;
+    Ok(StepExecInfo {
+        detail: format!("scrolled {direction:?} by {amount}"),
+        used_background: false,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn set_text(
+    refs: &AxRefStore,
+    stop: &AtomicBool,
+    ref_id: Option<&str>,
+    text: &str,
+    replace: bool,
+    submit: bool,
+    method: TextMethod,
+    focus_mode: FocusMode,
+) -> Result<StepExecInfo, RpcError> {
+    require_accessibility()?;
+    check_stop(stop)?;
+
+    // Tier 1: Direct zero-focus AXSetValue (<5 ms, works in background).
+    if matches!(method, TextMethod::Auto | TextMethod::Ax)
+        && let Some(rid) = ref_id
+    {
+        let live = refs.get(rid)?;
+        let current = live.element.string_attr("AXValue").unwrap_or_default();
+        let target_val = if replace || current.is_empty() {
+            text.to_string()
+        } else {
+            format!("{current}{text}")
+        };
+        if live.element.set_string_attr("AXValue", &target_val).is_ok() {
+            if submit {
+                let _ = live.element.perform_action("AXConfirm");
+            }
+            return Ok(StepExecInfo {
+                detail: format!(
+                    "set {} chars on {rid} via AXSetValue (background)",
+                    text.chars().count()
+                ),
+                used_background: true,
+            });
+        }
+        if method == TextMethod::Ax {
+            return Err(RpcError::with_next(
+                ErrorCode::BackendError,
+                format!("AXSetValue not supported on {rid}"),
+                "Retry with method=\"auto\" or \"paste\".",
+            ));
+        }
+    }
+
+    if focus_mode == FocusMode::Background {
+        return Err(RpcError::with_next(
+            ErrorCode::RequiresFocus,
+            "control does not support background AXSetValue",
+            "Retry with focus_mode=\"auto\" (brief focus-and-restore) or focus_mode=\"foreground\".",
+        ));
+    }
+
+    // Focus the target ref if provided.
+    let target_pid = if let Some(rid) = ref_id {
+        let live = refs.get(rid)?;
+        let _ = live.element.set_bool_true("AXFocused");
+        live.app.pid.map(|p| p as i32)
+    } else {
+        None
+    };
+
+    let _guard = FocusRestoreGuard::enter(target_pid, focus_mode);
+
+    if let Some(rid) = ref_id
+        && let Ok(live) = refs.get(rid)
+        && let Some(bounds) = live.element.bounds()
+        && !live.element.bool_attr("AXFocused").unwrap_or(false)
+    {
+        let _ = click_point_raw(
+            stop,
+            bounds.center(),
+            MouseButton::Left,
+            1,
+            Modifiers::default(),
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    if replace {
+        press_key_raw(
+            stop,
+            KeyCombo {
+                key: KeyCode::A,
+                modifiers: Modifiers {
+                    cmd: true,
+                    ..Modifiers::default()
+                },
+            },
+            1,
+        )?;
+        std::thread::sleep(Duration::from_millis(15));
+    }
+
+    let is_short_ascii =
+        text.len() <= 16 && text.is_ascii() && !text.contains('\n') && !text.contains('\r');
+
+    let used_method = match method {
+        TextMethod::Type => {
+            type_unicode_chunks(stop, text)?;
+            "type"
+        }
+        TextMethod::Paste => {
+            paste_with_clipboard_restore(stop, text)?;
+            "paste"
+        }
+        TextMethod::Auto | TextMethod::Ax => {
+            if is_short_ascii {
+                type_unicode_chunks(stop, text)?;
+                "type"
+            } else {
+                paste_with_clipboard_restore(stop, text)?;
+                "paste"
+            }
+        }
+    };
+
+    if submit {
+        std::thread::sleep(Duration::from_millis(15));
+        press_key_raw(
+            stop,
+            KeyCombo {
+                key: KeyCode::Return,
+                modifiers: Modifiers::default(),
+            },
+            1,
+        )?;
+    }
+
+    Ok(StepExecInfo {
+        detail: format!("entered {} chars via {used_method}", text.chars().count()),
+        used_background: false,
+    })
+}
+
+/// Fastest bulk text entry: save current NSPasteboard string, paste via Cmd+V, restore original.
+fn paste_with_clipboard_restore(stop: &AtomicBool, text: &str) -> Result<(), RpcError> {
+    let pb = NSPasteboard::generalPasteboard();
+    // SAFETY: `NSPasteboardTypeString` is a static AppKit constant.
+    let saved = unsafe { pb.stringForType(NSPasteboardTypeString) }.map(|s| s.to_string());
+    let _ = pb.clearContents();
+    let ns_text = NSString::from_str(text);
+    // SAFETY: `NSPasteboardTypeString` is valid and `ns_text` is a retained NSString.
+    let ok = unsafe { pb.setString_forType(&ns_text, NSPasteboardTypeString) };
+    if !ok {
+        return type_unicode_chunks(stop, text);
+    }
+    let after_write_count = pb.changeCount();
+
+    let paste_res = press_key_raw(
+        stop,
+        KeyCombo {
+            key: KeyCode::V,
+            modifiers: Modifiers {
+                cmd: true,
+                ..Modifiers::default()
+            },
+        },
+        1,
+    );
+    std::thread::sleep(Duration::from_millis(35));
+
+    // Only restore if nothing else modified the clipboard in the meantime.
+    if pb.changeCount() == after_write_count {
+        let _ = pb.clearContents();
+        if let Some(prev) = saved {
+            let ns_prev = NSString::from_str(&prev);
+            unsafe {
+                let _ = pb.setString_forType(&ns_prev, NSPasteboardTypeString);
+            }
+        }
+    }
+    paste_res
+}
+
+fn type_unicode_chunks(stop: &AtomicBool, text: &str) -> Result<(), RpcError> {
+    let src = event_source()?;
+    for (line_idx, line) in text.split('\n').enumerate() {
+        if line_idx > 0 {
+            press_key_raw(
+                stop,
+                KeyCombo {
+                    key: KeyCode::Return,
+                    modifiers: Modifiers::default(),
+                },
+                1,
+            )?;
+        }
+        // Chunk by whole Unicode scalar values, <= 16 UTF-16 code units per event so surrogate
+        // pairs never split across CGEvents.
+        let mut chunk: Vec<u16> = Vec::with_capacity(16);
+        let flush = |buf: &mut Vec<u16>| -> Result<(), RpcError> {
+            if buf.is_empty() {
+                return Ok(());
+            }
+            for down in [true, false] {
+                let ev = make_key(&src, 0, down)?;
+                // SAFETY: `buf` is valid UTF-16 for `buf.len()` code units.
+                unsafe {
+                    ffi::CGEventKeyboardSetUnicodeString(ev.as_mut_ptr(), buf.len(), buf.as_ptr());
+                }
+                post_event(ev, Modifiers::default(), stop)?;
+            }
+            buf.clear();
+            std::thread::sleep(Duration::from_millis(6));
+            Ok(())
+        };
+
+        for ch in line.chars() {
+            let mut tmp = [0u16; 2];
+            let units = ch.encode_utf16(&mut tmp);
+            if chunk.len() + units.len() > 16 {
+                flush(&mut chunk)?;
+            }
+            chunk.extend_from_slice(units);
+        }
+        flush(&mut chunk)?;
+    }
+    Ok(())
+}
+
+pub fn press_key_combo(
+    stop: &AtomicBool,
+    combo: KeyCombo,
+    repeat: u8,
+    focus_mode: FocusMode,
+) -> Result<StepExecInfo, RpcError> {
+    require_accessibility()?;
+    if focus_mode == FocusMode::Background {
+        // Attempt `CGEventPostToPid` to focused app if known, otherwise explain focus needed.
+        if let Some(pid) = windows::frontmost_pid() {
+            let src = event_source()?;
+            let code = combo.key.macos_keycode();
+            for _ in 0..repeat.max(1) {
+                check_stop(stop)?;
+                for down in [true, false] {
+                    let ev = make_key(&src, code, down)?;
+                    let flags = modifier_flags(combo.modifiers);
+                    unsafe {
+                        if flags != 0 {
+                            ffi::CGEventSetFlags(ev.as_mut_ptr(), flags);
+                        }
+                        ffi::CGEventSetIntegerValueField(
+                            ev.as_mut_ptr(),
+                            K_CG_EVENT_SOURCE_USER_DATA,
+                            SYNTHETIC_MARK,
+                        );
+                        ffi::CGEventPostToPid(pid, ev.as_mut_ptr());
+                    }
+                }
+            }
+            return Ok(StepExecInfo {
+                detail: format!("posted {:?} x{repeat} to pid {pid}", combo.key),
+                used_background: true,
+            });
+        }
+    }
+    press_key_raw(stop, combo, repeat)?;
+    Ok(StepExecInfo {
+        detail: format!("pressed {:?} x{repeat}", combo.key),
+        used_background: false,
+    })
+}
+
+fn press_key_raw(stop: &AtomicBool, combo: KeyCombo, repeat: u8) -> Result<(), RpcError> {
+    let src = event_source()?;
+    let code = combo.key.macos_keycode();
+    for i in 0..repeat.max(1) {
+        for down in [true, false] {
+            let ev = make_key(&src, code, down)?;
+            post_event(ev, combo.modifiers, stop)?;
+        }
+        if i + 1 < repeat {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+    Ok(())
+}
+
+fn make_mouse(
+    src: &CfOwned,
+    event_type: u32,
+    point: CGPoint,
+    button: u32,
+) -> Result<CfOwned, RpcError> {
+    // SAFETY: `src` is a valid CGEventSourceRef.
+    unsafe {
+        CfOwned::from_owned(
+            ffi::CGEventCreateMouseEvent(src.as_mut_ptr(), event_type, point, button).cast_const(),
+        )
+    }
+    .ok_or_else(|| RpcError::new(ErrorCode::BackendError, "CGEventCreateMouseEvent failed"))
+}
+
+fn make_key(src: &CfOwned, code: u16, down: bool) -> Result<CfOwned, RpcError> {
+    // SAFETY: `src` is a valid CGEventSourceRef.
+    unsafe {
+        CfOwned::from_owned(
+            ffi::CGEventCreateKeyboardEvent(src.as_mut_ptr(), code, down).cast_const(),
+        )
+    }
+    .ok_or_else(|| RpcError::new(ErrorCode::BackendError, "CGEventCreateKeyboardEvent failed"))
+}
+
+#[allow(dead_code)]
+fn _keep_cgeventref(_: Option<CGEventRef>) {}

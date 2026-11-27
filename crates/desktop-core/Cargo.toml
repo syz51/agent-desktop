@@ -1,0 +1,28 @@
+[package]
+name = "desktop-core"
+description = "Session lease, opt-in policy, batch runner, AX tree search, and PlatformBackend trait"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+testing = []
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+desktop-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

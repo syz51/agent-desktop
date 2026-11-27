@@ -1,0 +1,34 @@
+[package]
+name = "desktop-daemon"
+description = "Persistent per-machine desktopd daemon for agent-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "desktopd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+desktop-core.workspace = true
+desktop-macos.workspace = true
+desktop-proto.workspace = true
+dirs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+desktop-core = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

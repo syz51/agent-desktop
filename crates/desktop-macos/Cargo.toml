@@ -1,0 +1,66 @@
+[package]
+name = "desktop-macos"
+description = "Native macOS backend for agent-desktop (AXUIElement, ScreenCaptureKit, CGEvent, IOKit, AppKit)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+desktop-core.workspace = true
+desktop-proto.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSAlert",
+    "NSApplication",
+    "NSButton",
+    "NSColor",
+    "NSControl",
+    "NSEvent",
+    "NSFont",
+    "NSPanel",
+    "NSPasteboard",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSScreen",
+    "NSTextField",
+    "NSView",
+    "NSWindow",
+    "NSWorkspace",
+    "block2",
+] }
+objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
+objc2-core-graphics = { version = "0.3", features = ["CGImage"] }
+objc2-foundation = { version = "0.3", features = [
+    "NSArray",
+    "NSBundle",
+    "NSError",
+    "NSGeometry",
+    "NSObjCRuntime",
+    "NSString",
+    "NSURL",
+    "NSValue",
+    "block2",
+] }
+objc2-screen-capture-kit = { version = "0.3", features = [
+    "SCScreenshotManager",
+    "SCShareableContent",
+    "SCStream",
+    "block2",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+] }
+
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
