@@ -1,9 +1,9 @@
 use std::ptr;
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock, mpsc};
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
-use desktop_core::{AnnotateBox, RawScreenshot};
+use desktop_core::{AnnotateBox, RawScreenshot, visual_signature_from_pixels};
 use desktop_proto::{
     ErrorCode, FocusMode, ImageFormat, Rect, RpcError, ScreenshotTarget, fit_screenshot,
 };
@@ -21,12 +21,34 @@ use crate::ffi::{
     self, CGImageRef, CGRect, CfOwned, K_CF_NUMBER_FLOAT64_TYPE,
     K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST, cf_string,
 };
+use crate::stream::WarmDisplayStream;
 use crate::windows;
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(6);
+const SHAREABLE_CONTENT_TTL: Duration = Duration::from_millis(150);
+
+struct SendContent(Retained<SCShareableContent>);
+
+// SAFETY: `SCShareableContent` is an immutable snapshot object delivered on background GCD queues.
+unsafe impl Send for SendContent {}
+
+static CONTENT_CACHE: OnceLock<Mutex<Option<(Instant, SendContent)>>> = OnceLock::new();
+
+/// Clear the cached `SCShareableContent` snapshot after window/app changes.
+pub fn invalidate_shareable_content_cache() {
+    if let Some(cache) = CONTENT_CACHE.get()
+        && let Ok(mut guard) = cache.lock()
+    {
+        *guard = None;
+    }
+}
 
 /// Capture a display, background/foreground window, app, or region in memory via ScreenCaptureKit.
+///
+/// Uses the on-demand warm `SCStream` frame ring for sub-15 ms display grabs when a fresh
+/// post-mutation frame is ready, and caches `SCShareableContent` briefly for fast window captures.
 pub fn capture(
+    stream: &WarmDisplayStream,
     target: &ScreenshotTarget,
     format: ImageFormat,
     annotate: &[AnnotateBox],
@@ -40,8 +62,38 @@ pub fn capture(
         ));
     }
 
-    let content = fetch_shareable_content()?;
     let displays = windows::displays()?;
+
+    // Fast path: serve live warm SCStream frame directly in memory (~3-8 ms!) for Display targets.
+    if let ScreenshotTarget::Display { index } = target {
+        let disp_info = match index {
+            Some(i) => displays.get(*i as usize).ok_or_else(|| {
+                RpcError::new(
+                    ErrorCode::NotFound,
+                    format!("display {i} not found ({} displays active)", displays.len()),
+                )
+            })?,
+            None => displays
+                .iter()
+                .find(|d| d.main)
+                .or_else(|| displays.first())
+                .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "no active displays"))?,
+        };
+        if let Some(frame) = stream.latest_frame(disp_info.id) {
+            return encode_rgba_frame(
+                &frame.rgba,
+                frame.width,
+                frame.height,
+                frame.display_bounds,
+                format,
+                annotate,
+                frame.visual_sig,
+            );
+        }
+    }
+
+    let force_fresh_content = focus_mode == FocusMode::Foreground;
+    let content = fetch_shareable_content(force_fresh_content)?;
 
     let (filter, config, out_w, out_h, display_bounds) = match target {
         ScreenshotTarget::Display { index } => {
@@ -58,9 +110,11 @@ pub fn capture(
                     .or_else(|| displays.first())
                     .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "no active displays"))?,
             };
+            // SAFETY: `content` is a valid retained SCShareableContent snapshot.
             let sc_displays = unsafe { content.displays() };
             let sc_display = sc_displays
                 .iter()
+                // SAFETY: `displayID` is a read-only property on valid SCDisplay.
                 .find(|d| unsafe { d.displayID() } == disp_info.id)
                 .ok_or_else(|| {
                     RpcError::new(
@@ -68,8 +122,11 @@ pub fn capture(
                         format!("ScreenCaptureKit display {} not found", disp_info.id),
                     )
                 })?;
+            // Warm up the persistent low-FPS SCStream in the background for subsequent grabs.
+            stream.ensure_started(disp_info, &sc_display);
             let (w, h) = fit_screenshot(disp_info.pixel_width, disp_info.pixel_height);
             let empty_windows = NSArray::new();
+            // SAFETY: `sc_display` and `empty_windows` are valid ObjC objects.
             let filter = unsafe {
                 SCContentFilter::initWithDisplay_excludingWindows(
                     SCContentFilter::alloc(),
@@ -77,7 +134,9 @@ pub fn capture(
                     &empty_windows,
                 )
             };
+            // SAFETY: Allocates and configures a new SCStreamConfiguration.
             let cfg = unsafe { SCStreamConfiguration::new() };
+            // SAFETY: Configures capture dimensions and cursor visibility.
             unsafe {
                 cfg.setWidth(w as usize);
                 cfg.setHeight(h as usize);
@@ -180,10 +239,14 @@ pub fn capture(
     };
 
     let cg_image = capture_image(&filter, &config)?;
-    let final_image = if annotate.is_empty() {
-        cg_image
+    let (final_image, visual_sig) = if annotate.is_empty() {
+        let sig = compute_cg_image_signature(&cg_image);
+        (cg_image, sig)
     } else {
-        draw_annotations(&cg_image, display_bounds, annotate).unwrap_or(cg_image)
+        match draw_annotations(&cg_image, display_bounds, annotate) {
+            Some((img, sig)) => (img, sig),
+            None => (cg_image, None),
+        }
     };
 
     let bytes = encode_cg_image(&final_image, format)?;
@@ -193,6 +256,89 @@ pub fn capture(
         display_bounds,
         mime_type: format.mime_type().into(),
         bytes,
+        visual_sig,
+    })
+}
+
+fn encode_rgba_frame(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    display_bounds: Rect,
+    format: ImageFormat,
+    annotate: &[AnnotateBox],
+    visual_sig: Option<[u8; 64]>,
+) -> Result<RawScreenshot, RpcError> {
+    let w = width as usize;
+    let h = height as usize;
+    let bpr = w * 4;
+    if w == 0 || h == 0 || rgba.len() < h * bpr {
+        return Err(RpcError::new(
+            ErrorCode::BackendError,
+            "invalid warm stream RGBA frame dimensions",
+        ));
+    }
+    // SAFETY: Creates an owned DeviceRGB color space.
+    let cs = unsafe { CfOwned::from_owned(ffi::CGColorSpaceCreateDeviceRGB().cast_const()) }
+        .ok_or_else(|| {
+            RpcError::new(
+                ErrorCode::BackendError,
+                "CGColorSpaceCreateDeviceRGB failed",
+            )
+        })?;
+    // SAFETY: Creates an owned RGBA8 bitmap context backed by CoreGraphics memory.
+    let ctx = unsafe {
+        CfOwned::from_owned(
+            ffi::CGBitmapContextCreate(
+                ptr::null_mut(),
+                w,
+                h,
+                8,
+                bpr,
+                cs.as_mut_ptr(),
+                K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
+            )
+            .cast_const(),
+        )
+    }
+    .ok_or_else(|| RpcError::new(ErrorCode::BackendError, "CGBitmapContextCreate failed"))?;
+
+    // SAFETY: Queries the backing data pointer of the valid bitmap context.
+    let data = unsafe { ffi::CGBitmapContextGetData(ctx.as_mut_ptr()) };
+    // SAFETY: Queries the row stride of the valid bitmap context.
+    let ctx_bpr = unsafe { ffi::CGBitmapContextGetBytesPerRow(ctx.as_mut_ptr()) };
+    if data.is_null() || ctx_bpr < bpr {
+        return Err(RpcError::new(
+            ErrorCode::BackendError,
+            "CGBitmapContext backing buffer unavailable",
+        ));
+    }
+    // SAFETY: `data` points to `h * ctx_bpr` writable RGBA bytes owned by `ctx`.
+    let pixels = unsafe { std::slice::from_raw_parts_mut(data, h * ctx_bpr) };
+    if ctx_bpr == bpr {
+        pixels[..h * bpr].copy_from_slice(&rgba[..h * bpr]);
+    } else {
+        for y in 0..h {
+            pixels[y * ctx_bpr..y * ctx_bpr + bpr].copy_from_slice(&rgba[y * bpr..(y + 1) * bpr]);
+        }
+    }
+    if !annotate.is_empty() {
+        desktop_core::draw_annotations_rgba(pixels, w, h, ctx_bpr, display_bounds, annotate);
+    }
+
+    // SAFETY: Produces an owned CGImage snapshot of the populated bitmap context.
+    let cg_img = unsafe {
+        CfOwned::from_owned(ffi::CGBitmapContextCreateImage(ctx.as_mut_ptr()).cast_const())
+    }
+    .ok_or_else(|| RpcError::new(ErrorCode::BackendError, "CGBitmapContextCreateImage failed"))?;
+    let bytes = encode_cg_image(&cg_img, format)?;
+    Ok(RawScreenshot {
+        width,
+        height,
+        display_bounds,
+        mime_type: format.mime_type().into(),
+        bytes,
+        visual_sig,
     })
 }
 
@@ -210,20 +356,50 @@ fn capture_window_filter(
     window_id: u32,
     focus_mode: FocusMode,
 ) -> Result<CapturePlan, RpcError> {
-    if focus_mode == FocusMode::Foreground {
+    // If foreground focus is requested, focus the window first and refresh shareable content so
+    // the returned window frame reflects its live post-focus geometry.
+    let fresh_after_focus = if focus_mode == FocusMode::Foreground {
         let _ = windows::focus_window(window_id);
-    }
-    let sc_windows = unsafe { content.windows() };
-    let sc_win = sc_windows
+        Some(fetch_shareable_content(true)?)
+    } else {
+        None
+    };
+    let active_content = fresh_after_focus.as_deref().unwrap_or(content);
+    // SAFETY: `active_content` is a valid retained SCShareableContent snapshot.
+    let sc_windows = unsafe { active_content.windows() };
+    let maybe_win = sc_windows
         .iter()
-        .find(|w| unsafe { w.windowID() } == window_id)
-        .ok_or_else(|| {
-            RpcError::with_next(
-                ErrorCode::NotFound,
-                format!("window w{window_id} is not available in ScreenCaptureKit"),
-                "The window may be minimized or on another Space. Unminimize it or switch to its Space.",
-            )
-        })?;
+        // SAFETY: `windowID` is a read-only property on valid SCWindow.
+        .find(|w| unsafe { w.windowID() } == window_id);
+
+    // On a cached miss (e.g. a window opened within the 150 ms cache TTL), refresh once live.
+    let refreshed;
+    let sc_win = if let Some(found) = maybe_win {
+        found
+    } else if fresh_after_focus.is_none() {
+        refreshed = fetch_shareable_content(true)?;
+        // SAFETY: `refreshed` is a valid retained SCShareableContent snapshot.
+        let live_windows = unsafe { refreshed.windows() };
+        live_windows
+            .iter()
+            // SAFETY: `windowID` is a read-only property on valid SCWindow.
+            .find(|w| unsafe { w.windowID() } == window_id)
+            .ok_or_else(|| {
+                RpcError::with_next(
+                    ErrorCode::NotFound,
+                    format!("window w{window_id} is not available in ScreenCaptureKit"),
+                    "The window may be minimized or on another Space. Unminimize it or switch to its Space.",
+                )
+            })?
+    } else {
+        return Err(RpcError::with_next(
+            ErrorCode::NotFound,
+            format!("window w{window_id} is not available in ScreenCaptureKit"),
+            "The window may be minimized or on another Space. Unminimize it or switch to its Space.",
+        ));
+    };
+
+    // SAFETY: `frame` is a read-only property on valid SCWindow.
     let frame = unsafe { sc_win.frame() };
     let bounds = Rect {
         x: frame.origin.x,
@@ -261,7 +437,16 @@ fn capture_window_filter(
     })
 }
 
-fn fetch_shareable_content() -> Result<Retained<SCShareableContent>, RpcError> {
+fn fetch_shareable_content(force_fresh: bool) -> Result<Retained<SCShareableContent>, RpcError> {
+    let cache = CONTENT_CACHE.get_or_init(|| Mutex::new(None));
+    if !force_fresh
+        && let Ok(guard) = cache.lock()
+        && let Some((ts, cached)) = guard.as_ref()
+        && ts.elapsed() <= SHAREABLE_CONTENT_TTL
+    {
+        return Ok(cached.0.clone());
+    }
+
     let (tx, rx) = mpsc::sync_channel::<Result<Retained<SCShareableContent>, String>>(1);
     let block = RcBlock::new(move |content: *mut SCShareableContent, err: *mut NSError| {
         let res = if !err.is_null() {
@@ -287,7 +472,12 @@ fn fetch_shareable_content() -> Result<Retained<SCShareableContent>, RpcError> {
     }
 
     match rx.recv_timeout(CAPTURE_TIMEOUT) {
-        Ok(Ok(content)) => Ok(content),
+        Ok(Ok(content)) => {
+            if let Ok(mut guard) = cache.lock() {
+                *guard = Some((Instant::now(), SendContent(content.clone())));
+            }
+            Ok(content)
+        }
         Ok(Err(msg)) => Err(RpcError::with_next(
             ErrorCode::BackendError,
             format!("SCShareableContent failed: {msg}"),
@@ -423,22 +613,76 @@ fn encode_cg_image(image: &CfOwned, format: ImageFormat) -> Result<Vec<u8>, RpcE
     }
 }
 
-/// Draw crisp Set-of-Marks bounding boxes and `@eN` tags directly onto an RGBA bitmap copy.
+/// Compute the 8x8 area-averaged visual signature directly from the full-resolution `CGImage`
+/// so one-shot captures and warm `SCStream` frames share identical signature math.
+fn compute_cg_image_signature(image: &CfOwned) -> Option<[u8; 64]> {
+    // SAFETY: Queries pixel dimensions of the valid CGImage.
+    let w = unsafe { ffi::CGImageGetWidth(image.as_mut_ptr()) };
+    // SAFETY: Queries pixel dimensions of the valid CGImage.
+    let h = unsafe { ffi::CGImageGetHeight(image.as_mut_ptr()) };
+    if w < 8 || h < 8 {
+        return None;
+    }
+    // SAFETY: Creates an owned DeviceRGB color space.
+    let cs = unsafe { CfOwned::from_owned(ffi::CGColorSpaceCreateDeviceRGB().cast_const()) }?;
+    // SAFETY: Creates an owned RGBA8 bitmap context matching the CGImage dimensions.
+    let ctx = unsafe {
+        CfOwned::from_owned(
+            ffi::CGBitmapContextCreate(
+                ptr::null_mut(),
+                w,
+                h,
+                8,
+                w * 4,
+                cs.as_mut_ptr(),
+                K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
+            )
+            .cast_const(),
+        )
+    }?;
+    let rect = CGRect {
+        origin: ffi::CGPoint { x: 0.0, y: 0.0 },
+        size: ffi::CGSize {
+            width: w as f64,
+            height: h as f64,
+        },
+    };
+    // SAFETY: `ctx` and `image` are valid retained CoreGraphics objects.
+    unsafe {
+        ffi::CGContextDrawImage(ctx.as_mut_ptr(), rect, image.as_mut_ptr());
+    }
+    // SAFETY: Queries the readable RGBA buffer pointer owned by `ctx`.
+    let data = unsafe { ffi::CGBitmapContextGetData(ctx.as_mut_ptr()) };
+    // SAFETY: Queries the row stride of the valid bitmap context.
+    let bpr = unsafe { ffi::CGBitmapContextGetBytesPerRow(ctx.as_mut_ptr()) };
+    if data.is_null() || bpr < w * 4 {
+        return None;
+    }
+    // SAFETY: `data` points to `h * bpr` readable RGBA bytes owned by `ctx`.
+    let pixels = unsafe { std::slice::from_raw_parts(data, h * bpr) };
+    visual_signature_from_pixels(pixels, w, h, bpr, false)
+}
+
+/// Draw crisp Set-of-Marks bounding boxes and `@eN` tags directly onto an RGBA bitmap copy,
+/// returning both the annotated `CGImage` and the pre-annotation 8x8 visual signature.
 fn draw_annotations(
     image: &CfOwned,
     display_bounds: Rect,
     boxes: &[AnnotateBox],
-) -> Option<CfOwned> {
+) -> Option<(CfOwned, Option<[u8; 64]>)> {
     if display_bounds.is_empty() {
         return None;
     }
     // SAFETY: Query dimensions of the valid CGImage.
     let img_w = unsafe { ffi::CGImageGetWidth(image.as_mut_ptr()) };
+    // SAFETY: Query dimensions of the valid CGImage.
     let img_h = unsafe { ffi::CGImageGetHeight(image.as_mut_ptr()) };
     if img_w == 0 || img_h == 0 {
         return None;
     }
+    // SAFETY: Creates an owned DeviceRGB color space.
     let cs = unsafe { CfOwned::from_owned(ffi::CGColorSpaceCreateDeviceRGB().cast_const()) }?;
+    // SAFETY: Creates an owned RGBA8 bitmap context matching the CGImage dimensions.
     let ctx = unsafe {
         CfOwned::from_owned(
             ffi::CGBitmapContextCreate(
@@ -467,17 +711,23 @@ fn draw_annotations(
         ffi::CGContextDrawImage(ctx.as_mut_ptr(), full, image.as_mut_ptr());
     }
 
+    // SAFETY: Queries the writable backing buffer pointer owned by `ctx`.
     let data = unsafe { ffi::CGBitmapContextGetData(ctx.as_mut_ptr()) };
+    // SAFETY: Queries row stride of the valid bitmap context.
     let bpr = unsafe { ffi::CGBitmapContextGetBytesPerRow(ctx.as_mut_ptr()) };
     if data.is_null() || bpr < img_w * 4 {
         return None;
     }
     // SAFETY: `data` points to `img_h * bpr` writable RGBA bytes owned by `ctx`.
     let pixels = unsafe { std::slice::from_raw_parts_mut(data, img_h * bpr) };
+    let visual_sig = visual_signature_from_pixels(pixels, img_w, img_h, bpr, false);
     desktop_core::draw_annotations_rgba(pixels, img_w, img_h, bpr, display_bounds, boxes);
 
     // SAFETY: Creates a new CGImage from the annotated bitmap context.
-    unsafe { CfOwned::from_owned(ffi::CGBitmapContextCreateImage(ctx.as_mut_ptr()).cast_const()) }
+    let out = unsafe {
+        CfOwned::from_owned(ffi::CGBitmapContextCreateImage(ctx.as_mut_ptr()).cast_const())
+    }?;
+    Some((out, visual_sig))
 }
 
 #[allow(dead_code)]
@@ -536,7 +786,7 @@ mod tests {
             "valid PNG signature"
         );
 
-        let annotated = draw_annotations(
+        let (annotated, _) = draw_annotations(
             &img,
             Rect {
                 x: 0.0,

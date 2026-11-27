@@ -21,6 +21,8 @@ pub struct RawScreenshot {
     pub display_bounds: Rect,
     pub mime_type: String,
     pub bytes: Vec<u8>,
+    /// Optional 8x8 area-averaged luma thumbnail computed from raw pixels before encoding.
+    pub visual_sig: Option<[u8; 64]>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +55,8 @@ pub trait PlatformBackend: Send + Sync {
     fn wake_display(&self) -> Result<bool, RpcError>;
     /// Hold or release a `PreventUserIdleDisplaySleep` assertion during an active session.
     fn set_display_awake(&self, active: bool);
+    /// Invalidate any backend-side warm capture/window caches after a mutating UI action.
+    fn invalidate_caches(&self) {}
 
     /// Show, update, or hide the floating Stop (Esc) status pill.
     fn set_overlay(&self, text: Option<&str>);

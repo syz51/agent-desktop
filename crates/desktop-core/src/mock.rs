@@ -364,6 +364,7 @@ impl PlatformBackend for MockBackend {
             },
             mime_type: format.mime_type().into(),
             bytes,
+            visual_sig: None,
         })
     }
 
