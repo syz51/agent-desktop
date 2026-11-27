@@ -646,7 +646,7 @@ impl PlatformBackend for LinuxBackend {
 mod linux_live_tests {
     use std::sync::Arc;
 
-    use desktop_core::{AuditLog, DesktopEngine, PlatformBackend as _, PolicyStore, SystemClock};
+    use desktop_core::{AuditLog, DesktopEngine, PolicyStore, SystemClock};
     use desktop_proto::{
         ActParams, ActionStep, FocusMode, ImageFormat, PostAction, RpcMethod, RpcResult,
         ScreenshotParams, ScreenshotTarget, SnapshotParams, Target,
