@@ -147,8 +147,8 @@ mod macos_backend {
             Ok(windows::find_app(query))
         }
 
-        fn open_app(&self, app: &str) -> Result<AppInfo, RpcError> {
-            windows::open_app(app)
+        fn open_app(&self, app: &str, focus_mode: FocusMode) -> Result<AppInfo, RpcError> {
+            windows::open_app(app, focus_mode)
         }
 
         fn focus_window(&self, window_id: u32) -> Result<WindowInfo, RpcError> {

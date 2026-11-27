@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::ptr;
 
-use desktop_proto::{AppInfo, DisplayInfo, ErrorCode, Point, Rect, RpcError, WindowInfo};
+use desktop_proto::{
+    AppInfo, DisplayInfo, ErrorCode, FocusMode, Point, Rect, RpcError, WindowInfo,
+};
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
 use objc2_foundation::{NSBundle, NSString, NSURL};
 
@@ -203,7 +205,30 @@ pub fn find_app(query: &str) -> Option<AppInfo> {
     None
 }
 
-pub fn open_app(query: &str) -> Result<AppInfo, RpcError> {
+pub(crate) fn should_activate_running(focus_mode: FocusMode) -> bool {
+    focus_mode == FocusMode::Foreground
+}
+
+pub(crate) fn open_command_args(
+    app_path: Option<&str>,
+    query: &str,
+    focus_mode: FocusMode,
+) -> Vec<String> {
+    let mut args = Vec::with_capacity(3);
+    if focus_mode != FocusMode::Foreground {
+        args.push("-g".into());
+    }
+    if let Some(path) = app_path {
+        args.push(path.into());
+    } else {
+        let flag = if query.contains('.') { "-b" } else { "-a" };
+        args.push(flag.into());
+        args.push(query.into());
+    }
+    args
+}
+
+pub fn open_app(query: &str, focus_mode: FocusMode) -> Result<AppInfo, RpcError> {
     let app = find_app(query).ok_or_else(|| {
         RpcError::with_next(
             ErrorCode::NotFound,
@@ -211,34 +236,23 @@ pub fn open_app(query: &str) -> Result<AppInfo, RpcError> {
             "Pass a valid macOS application name (e.g. \"Notes\") or bundle ID (e.g. \"com.apple.Notes\").",
         )
     })?;
-    if let Some(pid) = app.pid
-        && activate_pid(pid as i32)
-    {
-        return Ok(app);
-    }
-    if let Some(path) = &app.path {
-        let status = std::process::Command::new("/usr/bin/open")
-            .arg(path)
-            .status()
-            .map_err(|e| RpcError::new(ErrorCode::BackendError, format!("open failed: {e}")))?;
-        if !status.success() {
-            return Err(RpcError::new(
-                ErrorCode::BackendError,
-                format!("open {path} exited with {status}"),
-            ));
+    if let Some(pid) = app.pid {
+        if !should_activate_running(focus_mode) {
+            return Ok(app);
         }
-        return Ok(app);
+        if activate_pid(pid as i32) {
+            return Ok(app);
+        }
     }
-    // Fallback to `open -a` or `open -b`.
-    let flag = if query.contains('.') { "-b" } else { "-a" };
+    let args = open_command_args(app.path.as_deref(), query, focus_mode);
     let status = std::process::Command::new("/usr/bin/open")
-        .args([flag, query])
+        .args(&args)
         .status()
         .map_err(|e| RpcError::new(ErrorCode::BackendError, format!("open failed: {e}")))?;
     if !status.success() {
         return Err(RpcError::new(
             ErrorCode::BackendError,
-            format!("open {flag} {query} exited with {status}"),
+            format!("open {} exited with {status}", args.join(" ")),
         ));
     }
     Ok(app)
@@ -396,3 +410,64 @@ pub fn focus_window(window_id: u32) -> Result<WindowInfo, RpcError> {
 
 #[allow(dead_code)]
 fn _keep_nsurl_import(_: Option<&NSURL>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_app_respects_focus_mode_activation_and_command_args() {
+        assert!(!should_activate_running(FocusMode::Background));
+        assert!(!should_activate_running(FocusMode::Auto));
+        assert!(should_activate_running(FocusMode::Foreground));
+
+        assert_eq!(
+            open_command_args(
+                Some("/Applications/Notes.app"),
+                "Notes",
+                FocusMode::Background
+            ),
+            vec!["-g", "/Applications/Notes.app"]
+        );
+        assert_eq!(
+            open_command_args(Some("/Applications/Notes.app"), "Notes", FocusMode::Auto),
+            vec!["-g", "/Applications/Notes.app"]
+        );
+        assert_eq!(
+            open_command_args(
+                Some("/Applications/Notes.app"),
+                "Notes",
+                FocusMode::Foreground
+            ),
+            vec!["/Applications/Notes.app"]
+        );
+
+        assert_eq!(
+            open_command_args(None, "Notes", FocusMode::Background),
+            vec!["-g", "-a", "Notes"]
+        );
+        assert_eq!(
+            open_command_args(None, "com.apple.Notes", FocusMode::Auto),
+            vec!["-g", "-b", "com.apple.Notes"]
+        );
+        assert_eq!(
+            open_command_args(None, "com.apple.Notes", FocusMode::Foreground),
+            vec!["-b", "com.apple.Notes"]
+        );
+    }
+
+    #[test]
+    fn open_app_running_finder_in_background_and_auto_does_not_steal_focus() {
+        let Some(finder) = find_app("Finder").filter(|a| a.pid.is_some()) else {
+            return;
+        };
+        let before = frontmost_pid();
+        let app_bg = open_app("Finder", FocusMode::Background).unwrap();
+        assert_eq!(app_bg.bundle_id.as_deref(), Some("com.apple.finder"));
+        let app_auto = open_app("Finder", FocusMode::Auto).unwrap();
+        assert_eq!(app_auto.bundle_id.as_deref(), Some("com.apple.finder"));
+        if before != finder.pid.map(|p| p as i32) {
+            assert_eq!(frontmost_pid(), before);
+        }
+    }
+}
