@@ -16,15 +16,17 @@ pub use keys::{
     KeyCode, KeyCombo, Modifiers, char_to_x11_keysym, parse_key_combo, parse_modifiers,
 };
 pub use rpc::{
-    ActParams, ErrorCode, FindParams, ListWindowsParams, MenuParams, ReadTextParams, RpcError,
-    RpcMethod, RpcRequest, RpcResponse, RpcResult, ScreenshotParams, SessionStartParams,
-    SnapshotParams, WaitParams,
+    ActParams, ErrorCode, FindParams, ListWindowsParams, MAX_READ_TEXT_CHARS, MenuParams,
+    ReadTextParams, RpcError, RpcMethod, RpcRequest, RpcResponse, RpcResult, ScreenshotParams,
+    SessionStartParams, SnapshotParams, WaitParams,
 };
 pub use types::{
     ActResult, ActionStep, AppInfo, AppMatchRank, ClickMode, DisplayInfo, ElementAction, FindMatch,
     FocusMode, HostStatus, ImageFormat, LeaseInfo, MouseButton, PermissionsStatus, Point,
     PolicyConfig, PolicyMode, PostAction, ReadTextMode, ReadTextResult, Rect, ScreenState,
-    ScreenshotResult, ScreenshotTarget, ScrollDirection, Snapshot, StepOutcome, Target, TextMethod,
-    UiNode, WaitCondition, WindowInfo, best_matching_window, filter_windows_by_app, fit_screenshot,
-    sanitize_text, screenshot_to_global,
+    ScreenshotResult, ScreenshotTarget, ScrollDirection, Snapshot, SnapshotRenderOptions,
+    StepOutcome, Target, TextMethod, UiNode, WaitCondition, WindowInfo, best_matching_window,
+    filter_render_actions, filter_windows_by_app, fit_screenshot, is_input_value_role,
+    rendered_display_name, sanitize_text, screenshot_to_global, truncate_read_text,
+    write_visible_actions,
 };

@@ -752,9 +752,8 @@ impl PlatformBackend for LinuxBackend {
             } else {
                 wayland::read_wayland_clipboard()?
             };
-            let sanitized = desktop_proto::sanitize_text(&raw, 16_384);
             return Ok(ReadTextResult {
-                text: sanitized,
+                text: raw,
                 source: "clipboard".into(),
             });
         }

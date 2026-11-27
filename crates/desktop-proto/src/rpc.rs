@@ -11,6 +11,7 @@ use crate::types::{
 
 pub const MAX_BATCH_STEPS: usize = 25;
 pub const MAX_TEXT_CHARS: usize = 100_000;
+pub const MAX_READ_TEXT_CHARS: usize = 16_384;
 pub const MAX_SLEEP_MS: u64 = 5_000;
 pub const MAX_WAIT_TIMEOUT_MS: u64 = 15_000;
 pub const MAX_SNAPSHOT_DEPTH: usize = 32;
@@ -174,6 +175,9 @@ pub struct SnapshotParams {
     pub max_nodes: Option<usize>,
     #[serde(default)]
     pub focus_mode: FocusMode,
+    /// Include per-element `[x,y wxh]` pixel bounds in compact snapshot text (omitted by default).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_bounds: bool,
 }
 
 impl SnapshotParams {
@@ -602,5 +606,20 @@ mod tests {
         let encoded_res = serde_json::to_value(&legacy_result).unwrap();
         assert!(encoded_res.get("released").is_none());
         assert!(encoded_res["steps"][0].get("text").is_none());
+
+        // Legacy /v1 SnapshotParams without include_bounds still deserializes cleanly,
+        // and default false is omitted on the wire for older daemons.
+        let legacy_snap: SnapshotParams = serde_json::from_str(r#"{"app":"Notes"}"#).unwrap();
+        assert!(!legacy_snap.include_bounds);
+        let encoded_snap = serde_json::to_value(&legacy_snap).unwrap();
+        assert!(encoded_snap.get("include_bounds").is_none());
+
+        let with_bounds: SnapshotParams =
+            serde_json::from_str(r#"{"app":"Notes","include_bounds":true}"#).unwrap();
+        assert!(with_bounds.include_bounds);
+        assert_eq!(
+            serde_json::to_value(&with_bounds).unwrap()["include_bounds"],
+            serde_json::Value::Bool(true)
+        );
     }
 }

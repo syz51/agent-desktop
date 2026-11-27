@@ -1,11 +1,14 @@
 use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use desktop_proto::{
-    ActParams, FindParams, ListWindowsParams, MenuParams, ReadTextParams, RpcMethod, RpcResult,
-    ScreenshotParams, SessionStartParams, SnapshotParams, WaitParams,
+    ActParams, FindParams, HostEntryStatus, HostStatus, ListWindowsParams, MenuParams,
+    ReadTextParams, RpcMethod, RpcResult, ScreenshotParams, SessionStartParams, SnapshotParams,
+    SnapshotRenderOptions, WaitParams, is_input_value_role, rendered_display_name, sanitize_text,
+    write_visible_actions,
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
@@ -17,17 +20,16 @@ use serde_json::{Value, json};
 
 use crate::client::DesktopClient;
 
-const INSTRUCTIONS: &str = "Fast Rust desktop control across your machines. Prefer `snapshot` or \
-`find` (fast Accessibility tree with @eN refs) over `screenshot` when interacting with standard UI \
-controls. Collapse multi-turn latency by chaining steps inside one `act` call: e.g., chain \
-`open_app` + `wait` (with `after: \"snapshot\"`) to launch and inspect an app in one turn, and \
-chain `click` + `read_text` + `menu` with `release_after: true` (or a trailing `session_end` step) \
-to act, read back values/clipboard, and release the control lease in a single turn. Use \
-`focus_mode: \"background\"` to operate on unfocused windows without stealing focus or moving the \
-cursor, `\"auto\"` (default) to try background AX first and keep `open_app` in the background \
-(falling back to brief focus-and-restore only when HID input is required), or `\"foreground\"` to \
-explicitly activate/raise windows. Sessions auto-start in open policy mode; set `release_after: true` \
-on your final `act` call or call `session_end` to release the control lease early.";
+const INSTRUCTIONS: &str = "Fast desktop control across machines (`host`, default \"local\"). \
+Prefer `snapshot`/`find` (@eN refs) over `screenshot`. Chain `act` steps to cut turns: \
+`open_app`+`wait` (`after:\"snapshot\"`), or `click`+`read_text`+`menu` (`release_after:true` or \
+trailing `session_end`). `focus_mode`: \"auto\" (default: bg AX + bg `open_app`, brief \
+focus-restore for HID), \"background\" (zero-focus), \"foreground\" (activates window).";
+
+#[must_use]
+pub fn instructions() -> &'static str {
+    INSTRUCTIONS
+}
 
 pub struct DesktopMcp {
     client: Arc<DesktopClient>,
@@ -60,13 +62,12 @@ impl DesktopMcp {
             .and_then(|m| m.remove("host"))
             .and_then(|v| v.as_str().map(str::to_string));
 
+        let mut snap_opts = SnapshotRenderOptions::default();
+
         let method = match name {
             "list_hosts" => {
                 let hosts = self.client.list_hosts().await;
-                return Ok(vec![ContentBlock::text(
-                    serde_json::to_string_pretty(&json!({ "hosts": hosts }))
-                        .unwrap_or_else(|_| "{}".into()),
-                )]);
+                return Ok(vec![ContentBlock::text(render_hosts(&hosts))]);
             }
             "status" => RpcMethod::Status,
             "session_start" => {
@@ -80,6 +81,7 @@ impl DesktopMcp {
             }
             "snapshot" => {
                 let p: SnapshotParams = parse_args(name, args)?;
+                snap_opts.include_bounds = p.include_bounds;
                 RpcMethod::Snapshot(p)
             }
             "find" => {
@@ -117,7 +119,7 @@ impl DesktopMcp {
             .await
             .map_err(|e| e.to_string())?;
 
-        Ok(render_result(result))
+        Ok(render_result_with_options(result, snap_opts))
     }
 }
 
@@ -125,9 +127,109 @@ fn parse_args<T: serde::de::DeserializeOwned>(name: &str, args: Value) -> Result
     serde_json::from_value(args).map_err(|err| format!("invalid arguments for {name}: {err}"))
 }
 
-fn render_result(result: RpcResult) -> Vec<ContentBlock> {
+fn format_status_line(st: &HostStatus) -> String {
+    let screen = match st.screen_state {
+        desktop_proto::ScreenState::Unlocked => "unlocked",
+        desktop_proto::ScreenState::DisplayAsleep => "display_asleep",
+        desktop_proto::ScreenState::ScreenLocked => "screen_locked",
+    };
+    let policy = match st.policy_mode {
+        desktop_proto::PolicyMode::Open => "open",
+        desktop_proto::PolicyMode::Confirm => "confirm",
+    };
+    let ax = if st.permissions.accessibility {
+        "ok"
+    } else {
+        "missing"
+    };
+    let sc = if st.permissions.screen_recording {
+        "ok"
+    } else {
+        "missing"
+    };
+    let lease = match &st.active_lease {
+        Some(l) => format!("{} ({})", l.owner, l.session_id),
+        None => "none".into(),
+    };
+    format!(
+        "{} ({}) v{} · {} · displays={} · ax={} sc={} · policy={} · lease={}",
+        st.host, st.os, st.version, screen, st.displays, ax, sc, policy, lease
+    )
+}
+
+/// Render `list_hosts` concisely (1 line per host, omitting private socket paths on online peers).
+#[must_use]
+pub fn render_hosts(hosts: &[HostEntryStatus]) -> String {
+    if hosts.is_empty() {
+        return "no hosts configured".into();
+    }
+    let mut out = String::new();
+    for (i, h) in hosts.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if let Some(st) = &h.status {
+            let _ = write!(
+                out,
+                "{}: online ({}ms) · {}",
+                h.alias,
+                h.latency_ms,
+                format_status_line(st)
+            );
+        } else {
+            let err = sanitize_text(h.error.as_deref().unwrap_or("unreachable"), 120);
+            let _ = write!(out, "{}: offline ({}ms) · {}", h.alias, h.latency_ms, err);
+        }
+    }
+    out
+}
+
+/// Render an RPC result into compact MCP content blocks using default snapshot options.
+#[must_use]
+pub fn render_result(result: RpcResult) -> Vec<ContentBlock> {
+    render_result_with_options(result, SnapshotRenderOptions::default())
+}
+
+/// Render an RPC result into compact MCP content blocks with explicit snapshot rendering options.
+#[must_use]
+pub fn render_result_with_options(
+    result: RpcResult,
+    snap_opts: SnapshotRenderOptions,
+) -> Vec<ContentBlock> {
     match result {
-        RpcResult::Snapshot(snap) => vec![ContentBlock::text(snap.render_compact())],
+        RpcResult::Status(st) => vec![ContentBlock::text(format_status_line(&st))],
+        RpcResult::Windows { displays, windows } => {
+            vec![ContentBlock::text(render_windows(&displays, &windows))]
+        }
+        RpcResult::Session {
+            lease,
+            woke_display,
+        } => {
+            let ttl_mins = (lease.expires_at - lease.acquired_at).num_minutes().max(0);
+            let mut line = format!(
+                "session: {} · owner={} · ttl={}m",
+                lease.session_id, lease.owner, ttl_mins
+            );
+            if let Some(apps) = &lease.apps
+                && !apps.is_empty()
+            {
+                let _ = write!(line, " · apps=[{}]", apps.join(","));
+            }
+            if woke_display {
+                line.push_str(" · woke_display");
+            }
+            vec![ContentBlock::text(line)]
+        }
+        RpcResult::Released { message } => vec![ContentBlock::text(message)],
+        RpcResult::Snapshot(snap) => {
+            vec![ContentBlock::text(
+                snap.render_compact_with_options(snap_opts),
+            )]
+        }
+        RpcResult::Find {
+            snapshot_id,
+            matches,
+        } => vec![ContentBlock::text(render_find(&snapshot_id, &matches))],
         RpcResult::Screenshot(shot) => render_screenshot(&shot),
         RpcResult::Act(act) => {
             let mut blocks = Vec::new();
@@ -142,17 +244,25 @@ fn render_result(result: RpcResult) -> Vec<ContentBlock> {
                 summary.push_str(" · session released");
             }
             if let Some(err) = &act.error {
-                summary.push_str(&format!("\nerror: {err}"));
+                let _ = write!(summary, "\nerror: {err}");
             }
             for step in &act.steps {
-                summary.push_str(&format!(
+                let detail = if step.used_background {
+                    step.detail
+                        .strip_suffix(" (background)")
+                        .unwrap_or(&step.detail)
+                } else {
+                    step.detail.as_str()
+                };
+                let _ = write!(
+                    summary,
                     "\n  [{}] {} ({}{}ms): {}",
                     step.index,
                     step.op,
                     if step.used_background { "bg, " } else { "" },
                     step.duration_ms,
-                    step.detail
-                ));
+                    detail
+                );
             }
             if let Some(snap) = &act.snapshot {
                 summary.push_str("\n\n");
@@ -164,10 +274,157 @@ fn render_result(result: RpcResult) -> Vec<ContentBlock> {
             }
             blocks
         }
+        RpcResult::ReadText(rt) => {
+            let line = if rt.text.is_empty() {
+                format!("read_text ({}): (empty)", rt.source)
+            } else {
+                format!("read_text ({}): {}", rt.source, rt.text)
+            };
+            vec![ContentBlock::text(line)]
+        }
+        RpcResult::Menu { detail } => vec![ContentBlock::text(detail)],
+        RpcResult::Wait {
+            matched,
+            elapsed_ms,
+            detail,
+        } => {
+            let state = if matched { "matched" } else { "timed out" };
+            vec![ContentBlock::text(format!(
+                "wait: {state} in {elapsed_ms}ms ({detail})"
+            ))]
+        }
         other => vec![ContentBlock::text(
-            serde_json::to_string_pretty(&other).unwrap_or_else(|_| "{}".into()),
+            serde_json::to_string(&other).unwrap_or_else(|_| "{}".into()),
         )],
     }
+}
+
+fn render_windows(
+    displays: &[desktop_proto::DisplayInfo],
+    windows: &[desktop_proto::WindowInfo],
+) -> String {
+    if displays.is_empty() && windows.is_empty() {
+        return "no windows".into();
+    }
+    let mut out = String::new();
+    for d in displays {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let _ = write!(
+            out,
+            "d{}{} {:.0}x{:.0} [{:.0},{:.0}] ({}x{}px {:.1}x)",
+            d.index,
+            if d.main { " main" } else { "" },
+            d.bounds.width,
+            d.bounds.height,
+            d.bounds.x,
+            d.bounds.y,
+            d.pixel_width,
+            d.pixel_height,
+            d.scale
+        );
+    }
+    for w in windows {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let _ = write!(out, "w{} [{}", w.id, w.app.name);
+        if let Some(bid) = &w.app.bundle_id
+            && !bid.is_empty()
+        {
+            let _ = write!(out, " ({bid})");
+        }
+        out.push(']');
+        let title = sanitize_text(&w.title, 80);
+        if !title.is_empty() {
+            let _ = write!(out, " {title:?}");
+        }
+        let _ = write!(
+            out,
+            " [{:.0},{:.0} {:.0}x{:.0}]",
+            w.bounds.x, w.bounds.y, w.bounds.width, w.bounds.height
+        );
+        if let Some(di) = w.display_index {
+            let _ = write!(out, " d{di}");
+        }
+        if w.focused {
+            out.push_str(" focused");
+        }
+        if w.minimized {
+            out.push_str(" minimized");
+        }
+        if !w.on_screen {
+            out.push_str(" offscreen");
+        }
+        if w.layer != 0 {
+            let _ = write!(out, " layer={}", w.layer);
+        }
+        if (w.alpha - 1.0).abs() > 0.01 {
+            let _ = write!(out, " alpha={:.2}", w.alpha);
+        }
+    }
+    out
+}
+
+fn render_find(snapshot_id: &str, matches: &[desktop_proto::FindMatch]) -> String {
+    let mut out = format!("snapshot_id: {snapshot_id} · {} match(es)", matches.len());
+    for m in matches {
+        let _ = write!(out, "\n{} {}", m.ref_id, m.role);
+        let name = rendered_display_name(m.title.as_deref(), m.label.as_deref());
+        let val = m
+            .value
+            .as_deref()
+            .map(|s| sanitize_text(s, 120))
+            .filter(|s| !s.is_empty());
+        let folded_text_value =
+            name.is_none() && matches!(m.role.as_str(), "text" | "heading") && val.is_some();
+        if let Some(n) = &name {
+            let _ = write!(out, " {n:?}");
+        } else if folded_text_value && let Some(v) = &val {
+            let _ = write!(out, " {v:?}");
+        }
+        if !folded_text_value && let Some(v) = &val {
+            let duplicates_name =
+                !is_input_value_role(&m.role) && name.as_deref().is_some_and(|n| n == v.as_str());
+            if !duplicates_name {
+                let _ = write!(out, " value={v:?}");
+            }
+        }
+        write_visible_actions(&mut out, &m.role, &m.actions);
+        let compact_path = compact_find_path(&m.path);
+        if !compact_path.is_empty() {
+            let _ = write!(out, " · path: {compact_path}");
+        }
+    }
+    out
+}
+
+fn compact_find_path(path: &[String]) -> String {
+    let window_title = path
+        .first()
+        .and_then(|s| s.strip_prefix("window:"))
+        .map(str::trim);
+    let filtered: Vec<String> = path
+        .iter()
+        .filter(|seg| {
+            if seg.starts_with("window:") || seg.as_str() == "window" {
+                return false;
+            }
+            if seg.starts_with("webarea:") || seg.as_str() == "webarea" {
+                return false;
+            }
+            if let Some(wt) = window_title
+                && seg.strip_prefix("group:") == Some(wt)
+            {
+                return false;
+            }
+            true
+        })
+        .map(|seg| sanitize_text(seg, 40))
+        .collect();
+    let keep = filtered.len().saturating_sub(3);
+    filtered[keep..].join(" > ")
 }
 
 fn render_screenshot(shot: &desktop_proto::ScreenshotResult) -> Vec<ContentBlock> {
@@ -190,10 +447,11 @@ fn render_screenshot(shot: &desktop_proto::ScreenshotResult) -> Vec<ContentBlock
         meta.push_str(" · unchanged (omitted image)");
     }
     if let Some(sid) = &shot.snapshot_id {
-        meta.push_str(&format!(
+        let _ = write!(
+            meta,
             " · snapshot_id={sid} · annotated={} refs",
             shot.annotated_refs.len()
-        ));
+        );
     }
     blocks.push(ContentBlock::text(meta));
     blocks
@@ -210,83 +468,72 @@ fn make_tool(name: &'static str, description: &'static str, schema: Value) -> To
 
 #[must_use]
 pub fn tools() -> Vec<Tool> {
-    let host_prop = json!({
-        "type": "string",
-        "description": "Target host alias (default: \"local\")."
-    });
+    let host_prop = json!({ "type": "string" });
     let focus_prop = json!({
         "type": "string",
-        "enum": ["auto", "background", "foreground"],
-        "description": "auto (default: background AX + background open_app, brief focus-restore fallback only when HID input is required), background (strict zero-focus; never pops windows or moves cursor), or foreground (explicitly activates/raises target window)."
+        "enum": ["auto", "background", "foreground"]
     });
     let target_point_or_ref = json!({
         "type": "object",
-        "description": "Target element or coordinate: either {\"ref\": \"@eN\"} or {\"x\": <number>, \"y\": <number>, \"display\"?: <integer>}.",
+        "description": "{ref} or {x,y,display?} (screenshot px)",
         "properties": {
-            "ref": { "type": "string", "description": "Element ref from snapshot/find (e.g. \"@e12\")." },
-            "x": { "type": "number", "description": "Horizontal pixel coordinate in the latest screenshot (or display point)." },
-            "y": { "type": "number", "description": "Vertical pixel coordinate in the latest screenshot (or display point)." },
-            "display": { "type": "integer", "minimum": 0, "description": "Optional display index for point coordinates." }
+            "ref": { "type": "string" },
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "display": { "type": "integer" }
         },
         "additionalProperties": false
     });
     let screenshot_target_schema = json!({
         "type": "object",
         "required": ["kind"],
-        "description": "Capture target tagged with \"kind\": {\"kind\":\"display\",\"index\"?:0} | {\"kind\":\"window\",\"window_id\":123} | {\"kind\":\"app\",\"app\":\"Notes\"} | {\"kind\":\"region\",\"x\":0,\"y\":0,\"width\":400,\"height\":300,\"display\"?:0}.",
+        "description": "display{index?}|window{window_id}|app{app}|region{x,y,width,height,display?}",
         "properties": {
-            "kind": {
-                "type": "string",
-                "enum": ["display", "window", "app", "region"],
-                "description": "Screenshot target kind."
-            },
-            "index": { "type": "integer", "minimum": 0, "description": "display: optional display index (default: primary display)." },
-            "window_id": { "type": "integer", "minimum": 0, "description": "window: window ID from list_windows/snapshot." },
-            "app": { "type": "string", "description": "app: application name or bundle ID." },
-            "x": { "type": "number", "description": "region: left coordinate." },
-            "y": { "type": "number", "description": "region: top coordinate." },
-            "width": { "type": "number", "description": "region: positive width." },
-            "height": { "type": "number", "description": "region: positive height." },
-            "display": { "type": "integer", "minimum": 0, "description": "region: optional display index." }
+            "kind": { "type": "string", "enum": ["display", "window", "app", "region"] },
+            "index": { "type": "integer" },
+            "window_id": { "type": "integer" },
+            "app": { "type": "string" },
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "width": { "type": "number" },
+            "height": { "type": "number" },
+            "display": { "type": "integer" }
         },
         "additionalProperties": false
     });
     let wait_condition_schema = json!({
         "type": "object",
         "required": ["kind"],
-        "description": "Condition tagged with \"kind\": exists {query, role?, app?} | gone {ref?, query?, app?} | focused_app {app} | window_title_contains {text, app?} | visual_change {target?}.",
+        "description": "exists{query,role?,app?}|gone{ref?,query?,app?}|focused_app{app}|window_title_contains{text,app?}|visual_change{target?}",
         "properties": {
-            "kind": {
-                "type": "string",
-                "enum": ["exists", "gone", "focused_app", "window_title_contains", "visual_change"],
-                "description": "Condition kind: exists (AX element appears), gone (ref becomes stale or query disappears), focused_app (frontmost app matches), window_title_contains (any window title contains substring), or visual_change (frame diff on target)."
-            },
-            "query": { "type": "string", "description": "exists|gone: case-insensitive text substring to match in the AX tree." },
-            "role": { "type": "string", "description": "exists: optional AX role filter (e.g. \"button\", \"textfield\")." },
-            "ref": { "type": "string", "description": "gone: optional @eN ref to wait until stale/removed." },
-            "app": { "type": "string", "description": "exists|gone|focused_app|window_title_contains: app name or bundle ID (required for focused_app, optional filter for others)." },
-            "text": { "type": "string", "description": "window_title_contains: case-insensitive substring to match in a window title." },
-            "target": screenshot_target_schema
+            "kind": { "type": "string", "enum": ["exists", "gone", "focused_app", "window_title_contains", "visual_change"] },
+            "query": { "type": "string" },
+            "role": { "type": "string" },
+            "ref": { "type": "string" },
+            "app": { "type": "string" },
+            "text": { "type": "string" },
+            "target": { "type": "object", "description": "display|window|app|region (see screenshot.target)" }
         },
         "additionalProperties": false
     });
     let action_step_schema = json!({
         "type": "object",
         "required": ["op"],
-        "description": "ActionStep tagged with \"op\": \
-            click {ref | (x, y, display?), button?: left|right|middle, count?: 1..3, modifiers?: string[], mode?: auto|semantic|pointer} | \
-            hover {ref | (x, y, display?)} | \
-            drag {from: {ref|(x,y,display?)}, to: {ref|(x,y,display?)}, modifiers?: string[]} | \
-            scroll {ref | (x, y, display?), direction: up|down|left|right, amount?: 1..100} | \
-            set_text {text, ref?, replace?: bool, submit?: bool, method?: auto|ax|paste|type} | \
-            key {combo, repeat?: 1..50} | \
-            open_app {app} | \
-            focus_window {window_id} | \
-            menu {app, path: string[]} | \
-            read_text {mode?: value|selection|clipboard, ref?, window_id?} | \
-            wait {until: WaitCondition, timeout_ms?: 1..15000} | \
-            sleep {ms: 0..5000} | \
-            session_end {} (must be final step).",
+        "description": concat!(
+            "click{ref|(x,y,display?),button?,count?,modifiers?,mode?:auto|semantic|pointer}|",
+            "hover{ref|(x,y,display?)}|",
+            "drag{from,to,modifiers?}|",
+            "scroll{ref|(x,y,display?),direction,amount?}|",
+            "set_text{text,ref?,replace?:false,submit?,method?}|",
+            "key{combo,repeat?}|",
+            "open_app{app}|",
+            "focus_window{window_id}|",
+            "menu{app,path}|",
+            "read_text{mode?:value|selection|clipboard,ref?,window_id?}|",
+            "wait{until,timeout_ms?}|",
+            "sleep{ms}|",
+            "session_end{}(final)"
+        ),
         "properties": {
             "op": {
                 "type": "string",
@@ -304,115 +551,35 @@ pub fn tools() -> Vec<Tool> {
                     "wait",
                     "sleep",
                     "session_end"
-                ],
-                "description": "Step operation kind."
+                ]
             },
-            "ref": {
-                "type": "string",
-                "description": "click|hover|scroll|set_text|read_text: target element ref from snapshot/find (e.g. \"@e3\")."
-            },
-            "x": {
-                "type": "number",
-                "description": "click|hover|scroll: horizontal coordinate (use instead of ref)."
-            },
-            "y": {
-                "type": "number",
-                "description": "click|hover|scroll: vertical coordinate (use instead of ref)."
-            },
-            "display": {
-                "type": "integer",
-                "minimum": 0,
-                "description": "click|hover|scroll: optional display index when using x/y coordinates."
-            },
-            "button": {
-                "type": "string",
-                "enum": ["left", "right", "middle"],
-                "description": "click: mouse button (default: \"left\")."
-            },
-            "count": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 3,
-                "description": "click: click count 1..=3 (default: 1)."
-            },
-            "modifiers": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "click|drag: optional modifier keys (e.g. [\"shift\"], [\"mod\"], [\"cmd\"], [\"ctrl\"], [\"alt\"])."
-            },
+            "ref": { "type": "string" },
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "display": { "type": "integer" },
+            "button": { "type": "string", "enum": ["left", "right", "middle"] },
+            "count": { "type": "integer" },
+            "modifiers": { "type": "array", "items": { "type": "string" } },
             "mode": {
                 "type": "string",
-                "enum": ["auto", "semantic", "pointer", "value", "selection", "clipboard"],
-                "description": "click: auto|semantic|pointer (default: \"auto\"). read_text: value|selection|clipboard (default: \"value\")."
+                "enum": ["auto", "semantic", "pointer", "value", "selection", "clipboard"]
             },
             "from": target_point_or_ref,
             "to": target_point_or_ref,
-            "direction": {
-                "type": "string",
-                "enum": ["up", "down", "left", "right"],
-                "description": "scroll: scroll direction (required for scroll)."
-            },
-            "amount": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 100,
-                "description": "scroll: scroll notches 1..=100 (default: 3)."
-            },
-            "text": {
-                "type": "string",
-                "description": "set_text: text to insert or replace (required for set_text)."
-            },
-            "replace": {
-                "type": "boolean",
-                "description": "set_text: replace existing field value instead of appending (default: false)."
-            },
-            "submit": {
-                "type": "boolean",
-                "description": "set_text: press Return after entering text (default: false)."
-            },
-            "method": {
-                "type": "string",
-                "enum": ["auto", "ax", "paste", "type"],
-                "description": "set_text: entry tier — auto (AXSetValue -> paste/type), ax, paste, or type (default: \"auto\")."
-            },
-            "combo": {
-                "type": "string",
-                "description": "key: portable key combo such as \"Return\", \"Escape\", \"mod+s\", \"shift+tab\" (required for key)."
-            },
-            "repeat": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 50,
-                "description": "key: repeat count 1..=50 (default: 1)."
-            },
-            "app": {
-                "type": "string",
-                "description": "open_app|menu: application name or bundle ID (e.g. \"Notes\" or \"com.apple.Notes\"). open_app respects focus_mode (background in auto/background, activates only in foreground)."
-            },
-            "window_id": {
-                "type": "integer",
-                "minimum": 0,
-                "description": "focus_window|read_text: target window ID (required for focus_window, optional for read_text)."
-            },
-            "path": {
-                "type": "array",
-                "minItems": 1,
-                "items": { "type": "string" },
-                "description": "menu: menu-bar item path, e.g. [\"File\", \"New Note\"] (required for menu)."
-            },
+            "direction": { "type": "string", "enum": ["up", "down", "left", "right"] },
+            "amount": { "type": "integer" },
+            "text": { "type": "string" },
+            "replace": { "type": "boolean" },
+            "submit": { "type": "boolean" },
+            "method": { "type": "string", "enum": ["auto", "ax", "paste", "type"] },
+            "combo": { "type": "string", "description": "e.g. Return, Escape, mod+s" },
+            "repeat": { "type": "integer" },
+            "app": { "type": "string" },
+            "window_id": { "type": "integer" },
+            "path": { "type": "array", "items": { "type": "string" } },
             "until": wait_condition_schema,
-            "timeout_ms": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 15000,
-                "description": "wait: timeout in milliseconds 1..=15000 (default: 5000)."
-            },
-            "ms": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 5000,
-                "description": "sleep: settle delay in milliseconds 0..=5000 (required for sleep)."
-            }
+            "timeout_ms": { "type": "integer" },
+            "ms": { "type": "integer" }
         },
         "additionalProperties": false
     });
@@ -420,49 +587,41 @@ pub fn tools() -> Vec<Tool> {
     vec![
         make_tool(
             "list_hosts",
-            "List reachable machines with OS, display/lock state, permissions, and active lease.",
+            "List reachable hosts with status, permissions, and lease.",
             json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         ),
         make_tool(
             "status",
-            "Check daemon health, TCC permissions, screen lock/display state, policy mode, and active lease.",
-            json!({
-                "type": "object",
-                "properties": { "host": host_prop },
-                "additionalProperties": false
-            }),
+            "Check daemon health, permissions, screen lock, policy, and lease.",
+            json!({ "type": "object", "properties": { "host": host_prop }, "additionalProperties": false }),
         ),
         make_tool(
             "session_start",
-            "Explicitly acquire the control lease on a host (optional in open mode; auto-wakes sleeping unlocked display).",
+            "Acquire control lease (optional in open mode; wakes sleeping display).",
             json!({
                 "type": "object",
                 "properties": {
                     "host": host_prop,
                     "reason": { "type": "string" },
-                    "apps": { "type": "array", "items": { "type": "string" }, "description": "Optional app scope; omit for all apps." },
-                    "wait_for_lease_ms": { "type": "integer", "minimum": 0, "maximum": 15000 }
+                    "apps": { "type": "array", "items": { "type": "string" } },
+                    "wait_for_lease_ms": { "type": "integer" }
                 },
                 "additionalProperties": false
             }),
         ),
         make_tool(
             "session_end",
-            "Release the active control lease and hide the status overlay.",
-            json!({
-                "type": "object",
-                "properties": { "host": host_prop },
-                "additionalProperties": false
-            }),
+            "Release active control lease.",
+            json!({ "type": "object", "properties": { "host": host_prop }, "additionalProperties": false }),
         ),
         make_tool(
             "list_windows",
-            "List active displays and visible windows without capturing pixels.",
+            "List displays and visible windows.",
             json!({
                 "type": "object",
                 "properties": {
                     "host": host_prop,
-                    "app": { "type": "string", "description": "Optional app name or bundle ID filter." },
+                    "app": { "type": "string" },
                     "include_displays": { "type": "boolean", "default": true }
                 },
                 "additionalProperties": false
@@ -470,24 +629,25 @@ pub fn tools() -> Vec<Tool> {
         ),
         make_tool(
             "snapshot",
-            "Capture a fast, compact Accessibility tree with @eN element refs and bounds (works on unfocused background windows).",
+            "Capture compact Accessibility tree with @eN refs (works in background).",
             json!({
                 "type": "object",
                 "properties": {
                     "host": host_prop,
                     "app": { "type": "string" },
                     "window_id": { "type": "integer" },
-                    "root_ref": { "type": "string", "description": "Drill down into an existing @eN subtree." },
-                    "max_depth": { "type": "integer", "minimum": 1, "maximum": 32 },
-                    "max_nodes": { "type": "integer", "minimum": 1, "maximum": 1000 },
-                    "focus_mode": focus_prop
+                    "root_ref": { "type": "string" },
+                    "max_depth": { "type": "integer" },
+                    "max_nodes": { "type": "integer" },
+                    "focus_mode": focus_prop,
+                    "include_bounds": { "type": "boolean", "default": false }
                 },
                 "additionalProperties": false
             }),
         ),
         make_tool(
             "find",
-            "Search the Accessibility tree by text/label/value/role and return matching @eN refs.",
+            "Search Accessibility tree by text/role and return matching @eN refs.",
             json!({
                 "type": "object",
                 "required": ["query"],
@@ -497,22 +657,22 @@ pub fn tools() -> Vec<Tool> {
                     "role": { "type": "string" },
                     "app": { "type": "string" },
                     "window_id": { "type": "integer" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 }
+                    "limit": { "type": "integer" }
                 },
                 "additionalProperties": false
             }),
         ),
         make_tool(
             "screenshot",
-            "Capture a display, background/foreground window, app, or region crop, with optional @eN Set-of-Marks boxes and unchanged short-circuit.",
+            "Capture display, window, app, or region with optional @eN Set-of-Marks.",
             json!({
                 "type": "object",
                 "properties": {
                     "host": host_prop,
                     "target": screenshot_target_schema,
-                    "annotate": { "type": "boolean", "default": false, "description": "Draw numbered @eN boxes from the live AX snapshot." },
+                    "annotate": { "type": "boolean", "default": false },
                     "format": { "type": "string", "enum": ["jpeg", "png"], "default": "jpeg" },
-                    "if_changed_since": { "type": "string", "description": "Previous screenshot hash; skips image payload if unchanged." },
+                    "if_changed_since": { "type": "string" },
                     "focus_mode": focus_prop
                 },
                 "additionalProperties": false
@@ -520,7 +680,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         make_tool(
             "act",
-            "Execute 1 to 25 ordered UI steps atomically in one turn (click, hover, drag, scroll, set_text, key, open_app, focus_window, menu, read_text, wait, sleep, session_end) with optional post-action snapshot/screenshot and release_after.",
+            "Run 1..25 ordered UI steps atomically with optional post-action capture and release_after.",
             json!({
                 "type": "object",
                 "required": ["steps"],
@@ -528,22 +688,19 @@ pub fn tools() -> Vec<Tool> {
                     "host": host_prop,
                     "steps": {
                         "type": "array",
-                        "minItems": 1,
-                        "maxItems": 25,
-                        "items": action_step_schema,
-                        "description": "Ordered ActionStep objects. Chain open_app + wait, or click + read_text + menu, to minimize turns."
+                        "items": action_step_schema
                     },
-                    "after": { "type": "string", "enum": ["none", "snapshot", "screenshot", "annotated"], "default": "none", "description": "Optional post-batch perception capture." },
-                    "expect_snapshot": { "type": "string", "description": "Abort with stale_ref if current snapshot_id differs." },
+                    "after": { "type": "string", "enum": ["none", "snapshot", "screenshot", "annotated"], "default": "none" },
+                    "expect_snapshot": { "type": "string" },
                     "focus_mode": focus_prop,
-                    "release_after": { "type": "boolean", "default": false, "description": "Release the control lease after the batch (and any `after` capture) completes, avoiding an extra session_end turn." }
+                    "release_after": { "type": "boolean", "default": false }
                 },
                 "additionalProperties": false
             }),
         ),
         make_tool(
             "read_text",
-            "Read text directly from an @eN element value, focused selection, or clipboard without OCR.",
+            "Read text from @eN element value, selection, or clipboard.",
             json!({
                 "type": "object",
                 "properties": {
@@ -557,28 +714,28 @@ pub fn tools() -> Vec<Tool> {
         ),
         make_tool(
             "menu",
-            "Invoke a native application menu-bar item directly via Accessibility (background, no cascading menu animation).",
+            "Invoke native menu-bar item by path via Accessibility.",
             json!({
                 "type": "object",
                 "required": ["app", "path"],
                 "properties": {
                     "host": host_prop,
                     "app": { "type": "string" },
-                    "path": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+                    "path": { "type": "array", "items": { "type": "string" } }
                 },
                 "additionalProperties": false
             }),
         ),
         make_tool(
             "wait",
-            "Wait for a UI condition (exists, gone, focused_app, window_title_contains, visual_change) up to timeout_ms.",
+            "Wait for a UI condition up to timeout_ms.",
             json!({
                 "type": "object",
                 "required": ["condition"],
                 "properties": {
                     "host": host_prop,
                     "condition": wait_condition_schema,
-                    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 15000, "default": 5000 }
+                    "timeout_ms": { "type": "integer", "default": 5000 }
                 },
                 "additionalProperties": false
             }),
@@ -664,12 +821,41 @@ mod tests {
         // Verify exact 12-tool surface.
         assert_eq!(tools().len(), 12);
 
-        // Snapshot works directly (auto-lease).
+        // Snapshot works directly (auto-lease) and omits child bounds by default.
         let snap_blocks = mcp.dispatch("snapshot", json!({})).await.unwrap();
         assert_eq!(snap_blocks.len(), 1);
-        let snap_txt = format!("{:?}", snap_blocks[0]);
+        let snap_txt = snap_blocks[0].as_text().unwrap().text.as_str();
         assert!(snap_txt.contains("snapshot_id: s1"));
-        assert!(snap_txt.contains("@e3 button"));
+        assert!(snap_txt.contains("@e3 button \"Save\""));
+        assert!(!snap_txt.contains("actions=[press]"));
+
+        // Opt-in include_bounds=true emits element bounds.
+        let snap_bounds_blocks = mcp
+            .dispatch("snapshot", json!({ "include_bounds": true }))
+            .await
+            .unwrap();
+        let snap_bounds_txt = snap_bounds_blocks[0].as_text().unwrap().text.as_str();
+        assert!(snap_bounds_txt.contains("@e3 button \"Save\" ["));
+
+        // Compact list_windows, status, find, read_text omit pretty-JSON bloat.
+        let status_blocks = mcp.dispatch("status", json!({})).await.unwrap();
+        let status_txt = status_blocks[0].as_text().unwrap().text.as_str();
+        assert!(status_txt.contains("mock-mac"));
+        assert!(!status_txt.starts_with('{'));
+
+        let lw_blocks = mcp.dispatch("list_windows", json!({})).await.unwrap();
+        let lw_txt = lw_blocks[0].as_text().unwrap().text.as_str();
+        assert!(lw_txt.contains("w101 [Notes"));
+        assert!(!lw_txt.starts_with('{'));
+
+        let find_blocks = mcp
+            .dispatch("find", json!({ "query": "Save" }))
+            .await
+            .unwrap();
+        let find_txt = find_blocks[0].as_text().unwrap().text.as_str();
+        assert!(find_txt.contains("snapshot_id:"));
+        assert!(find_txt.contains("@e3 button \"Save\""));
+        assert!(!find_txt.starts_with('{'));
 
         // Screenshot returns image + metadata, then unchanged omits image.
         let shot_blocks = mcp
@@ -697,15 +883,18 @@ mod tests {
             )
             .await
             .unwrap();
-        let act_txt = format!("{:?}", act_blocks[0]);
+        let act_txt = act_blocks[0].as_text().unwrap().text.as_str();
         assert!(act_txt.contains("5/5 steps succeeded"));
         assert!(act_txt.contains("session released"));
         assert!(act_txt.contains("mock-Value-@e2"));
         assert!(act_txt.contains("snapshot_id:"));
+        assert!(!act_txt.contains("(background)"));
 
         // Explicit session_end remains safe & idempotent after release_after.
         let end_blocks = mcp.dispatch("session_end", json!({})).await.unwrap();
-        assert!(format!("{:?}", end_blocks[0]).contains("No matching active session"));
+        let end_txt = end_blocks[0].as_text().unwrap().text.as_str();
+        assert!(end_txt.contains("No matching active session"));
+        assert!(!end_txt.starts_with('{'));
 
         let _ = tx.send(true);
         let _ = server.await;
@@ -821,6 +1010,13 @@ mod tests {
             );
         }
 
+        let snapshot = all_tools.iter().find(|t| t.name == "snapshot").unwrap();
+        let snapshot_schema = Value::Object((*snapshot.input_schema).clone());
+        assert_eq!(
+            snapshot_schema["properties"]["include_bounds"]["type"],
+            "boolean"
+        );
+
         let screenshot = all_tools.iter().find(|t| t.name == "screenshot").unwrap();
         let screenshot_schema = Value::Object((*screenshot.input_schema).clone());
         assert_eq!(
@@ -866,5 +1062,31 @@ mod tests {
         assert!(INSTRUCTIONS.contains("read_text"));
         assert!(INSTRUCTIONS.contains("menu"));
         assert!(INSTRUCTIONS.contains("release_after"));
+        assert!(INSTRUCTIONS.len() < 550);
+
+        let total_tools_bytes: usize = all_tools
+            .iter()
+            .map(|t| serde_json::to_string(t).unwrap().len())
+            .sum();
+        assert!(
+            total_tools_bytes < 7_500,
+            "tools/list compact JSON ({total_tools_bytes} B) exceeded 7500 B ceiling"
+        );
+
+        // Verify find preserves explicit `value=` on populated input fields matching their title.
+        let find_input = render_find(
+            "s9",
+            &[desktop_proto::FindMatch {
+                ref_id: "@e4".into(),
+                role: "textfield".into(),
+                title: Some("Search".into()),
+                label: None,
+                value: Some("Search".into()),
+                bounds: None,
+                actions: vec![desktop_proto::ElementAction::SetValue],
+                path: vec!["window:App".into(), "toolbar".into()],
+            }],
+        );
+        assert!(find_input.contains("@e4 textfield \"Search\" value=\"Search\""));
     }
 }

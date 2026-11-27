@@ -8,10 +8,11 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::DateTime;
 use desktop_proto::{
     ActParams, ActResult, ActionStep, AppInfo, ErrorCode, FocusMode, HostStatus, ImageFormat,
-    LeaseInfo, ListWindowsParams, Point, PolicyConfig, PolicyMode, PostAction, ReadTextMode, Rect,
-    RpcError, RpcMethod, RpcResult, ScreenState, ScreenshotParams, ScreenshotResult,
-    ScreenshotTarget, SessionStartParams, Snapshot, SnapshotParams, StepOutcome, Target,
-    WaitCondition, parse_key_combo, parse_modifiers, screenshot_to_global,
+    LeaseInfo, ListWindowsParams, MAX_READ_TEXT_CHARS, Point, PolicyConfig, PolicyMode, PostAction,
+    ReadTextMode, Rect, RpcError, RpcMethod, RpcResult, ScreenState, ScreenshotParams,
+    ScreenshotResult, ScreenshotTarget, SessionStartParams, Snapshot, SnapshotParams, StepOutcome,
+    Target, WaitCondition, parse_key_combo, parse_modifiers, screenshot_to_global,
+    truncate_read_text,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -216,6 +217,7 @@ impl DesktopEngine {
                     max_depth: Some(16),
                     max_nodes: Some(500),
                     focus_mode: FocusMode::Background,
+                    include_bounds: false,
                 };
                 let snap = self.capture_snapshot(&snap_params, &policy)?;
                 let matches =
@@ -262,12 +264,13 @@ impl DesktopEngine {
                     &policy,
                     SessionAccess::Observe,
                 )?;
-                let res = self.backend.read_text(
+                let mut res = self.backend.read_text(
                     params.ref_id.as_deref(),
                     params.window_id,
                     params.mode,
                     policy.redact_passwords,
                 )?;
+                res.text = truncate_read_text(res.text, MAX_READ_TEXT_CHARS);
                 Ok(RpcResult::ReadText(res))
             }
             RpcMethod::Menu(params) => {
@@ -1432,12 +1435,13 @@ impl DesktopEngine {
                         self.ensure_app_allowed(&app, policy)?;
                     }
                 }
-                let res = self.backend.read_text(
+                let mut res = self.backend.read_text(
                     ref_id.as_deref(),
                     window_id,
                     mode,
                     policy.redact_passwords,
                 )?;
+                res.text = truncate_read_text(res.text, MAX_READ_TEXT_CHARS);
                 let mode_label = match mode {
                     ReadTextMode::Value => "value",
                     ReadTextMode::Selection => "selection",
