@@ -1029,23 +1029,27 @@ impl DesktopEngine {
         post_target: Option<&ActPostTarget>,
         policy: &PolicyConfig,
     ) -> (Option<Snapshot>, Option<ScreenshotResult>) {
+        if after == PostAction::None {
+            return (None, None);
+        }
+
         let usable_target = match post_target {
             Some(ActPostTarget::Window(wid)) => Some(ActPostTarget::Window(*wid)),
             Some(ActPostTarget::App(app)) => {
-                // Only target the tracked app when it currently has at least one visible window
-                // (avoiding empty/application-only snapshots right after launch or Quit).
-                let has_visible = self
-                    .backend
-                    .windows(Some(app))
-                    .ok()
-                    .is_some_and(|wins| wins.iter().any(|w| w.on_screen && !w.minimized));
+                // Only target the tracked app when it currently has at least one visible normal
+                // (`layer == 0`) window, avoiding empty/application-only snapshots or menu-bar/backdrop
+                // captures right after launch or Quit.
+                let has_visible = self.backend.windows(Some(app)).ok().is_some_and(|wins| {
+                    wins.iter()
+                        .any(|w| w.on_screen && !w.minimized && w.layer == 0)
+                });
                 has_visible.then(|| ActPostTarget::App(app.clone()))
             }
             None => None,
         };
 
         match after {
-            PostAction::None => (None, None),
+            PostAction::None => unreachable!("handled above"),
             PostAction::Snapshot => {
                 let targeted = match &usable_target {
                     Some(ActPostTarget::Window(wid)) => Some(self.capture_snapshot(
@@ -1463,7 +1467,31 @@ impl DesktopEngine {
                         "Take a snapshot or screenshot to inspect current UI state.",
                     ));
                 }
-                Ok(StepRun::mutating(detail, true))
+                let post_target = match &until {
+                    WaitCondition::FocusedApp { app } => {
+                        let key = self
+                            .backend
+                            .focused_app()
+                            .ok()
+                            .flatten()
+                            .filter(|focused| focused.matches_query(app))
+                            .map(|focused| app_target_key(&focused, app))
+                            .unwrap_or_else(|| app.clone());
+                        Some(ActPostTarget::App(key))
+                    }
+                    WaitCondition::Exists { app: Some(app), .. }
+                    | WaitCondition::WindowTitleContains { app: Some(app), .. } => {
+                        Some(ActPostTarget::App(app.clone()))
+                    }
+                    WaitCondition::VisualChange {
+                        target: ScreenshotTarget::Window { window_id },
+                    } => Some(ActPostTarget::Window(*window_id)),
+                    WaitCondition::VisualChange {
+                        target: ScreenshotTarget::App { app },
+                    } => Some(ActPostTarget::App(app.clone())),
+                    _ => None,
+                };
+                Ok(StepRun::mutating(detail, true).with_optional_target(post_target))
             }
             ActionStep::Sleep { ms } => {
                 let deadline = Instant::now() + StdDuration::from_millis(ms);

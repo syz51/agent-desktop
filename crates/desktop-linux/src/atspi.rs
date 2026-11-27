@@ -780,6 +780,7 @@ async fn find_atspi_target(
             };
             let rank = probe.match_rank(explicit).or_else(|| {
                 win_hint
+                    .filter(|w| w.app.matches_query(explicit))
                     .map(|w| w.app.name.as_str())
                     .and_then(|hint_name| probe.match_rank(hint_name))
             });

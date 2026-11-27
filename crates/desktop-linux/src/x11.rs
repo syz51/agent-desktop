@@ -219,10 +219,15 @@ impl X11Session {
 
     /// List visible top-level windows using EWMH `_NET_CLIENT_LIST_STACKING`, with WM-less fallback.
     pub fn windows(&self, app_filter: Option<&str>) -> Result<Vec<WindowInfo>, RpcError> {
-        if let Some(filter) = app_filter
-            && filter.trim().is_empty()
-        {
-            return Ok(Vec::new());
+        if let Some(filter) = app_filter {
+            let q = filter.trim().to_lowercase();
+            let q_no_ext = q.strip_suffix(".app").unwrap_or(&q).trim();
+            if q.is_empty()
+                || q_no_ext.is_empty()
+                || (q.ends_with('.') && q.trim_end_matches('.').is_empty())
+            {
+                return Ok(Vec::new());
+            }
         }
         let root = self.root();
         let displays = self.displays()?;

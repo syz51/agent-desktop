@@ -245,11 +245,8 @@ impl PlatformBackend for MockBackend {
     }
 
     fn open_app(&self, app: &str, focus_mode: FocusMode) -> Result<AppInfo, RpcError> {
-        let matched = self
-            .all_windows()
-            .into_iter()
-            .find(|w| w.app.matches_query(app))
-            .map(|w| w.app);
+        let all_wins = self.all_windows();
+        let matched = best_matching_window(&all_wins, app).map(|w| w.app.clone());
         let mut st = self.state.lock().unwrap();
         st.open_app_calls.push((app.to_string(), focus_mode));
         st.actions_log.push(format!("open:{app}:{focus_mode:?}"));
@@ -2099,6 +2096,115 @@ mod tests {
             .expect("graceful fallback when targeted window disappears");
         assert_eq!(vanished_snap.app.name, "Notes");
         assert_eq!(vanished_snap.window_id, Some(101));
+
+        // 7. An app that only has a non-normal layer window (e.g. menu-bar extra at layer=25)
+        //    is treated as having no usable window and falls back gracefully to frontmost (Notes).
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .extra_windows
+            .push(WindowInfo {
+                id: 205,
+                title: String::new(),
+                app: AppInfo {
+                    name: "MenuBarOnly".into(),
+                    bundle_id: Some("com.example.menubaronly".into()),
+                    pid: Some(2050),
+                    path: None,
+                    running: true,
+                },
+                bounds: Rect {
+                    x: 1200.0,
+                    y: 0.0,
+                    width: 24.0,
+                    height: 24.0,
+                },
+                layer: 25,
+                alpha: 1.0,
+                focused: false,
+                minimized: false,
+                on_screen: true,
+                display_index: Some(0),
+            });
+        let act_menubar = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::OpenApp {
+                        app: "MenuBarOnly".into(),
+                    }],
+                    after: PostAction::Snapshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Background,
+                    release_after: false,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        let menubar_fallback = act_menubar
+            .snapshot
+            .expect("fallback snapshot when app only has layer!=0 windows");
+        assert_eq!(menubar_fallback.app.name, "Notes");
+        assert_eq!(menubar_fallback.window_id, Some(101));
+
+        // 8. Wait(FocusedApp) overrides a prior ref target from another app.
+        {
+            let mut st = backend.state.lock().unwrap();
+            st.resolved_ref_app = None;
+            st.resolved_ref_window_id = Some(101);
+            st.focused = Some(AppInfo {
+                name: "Calculator".into(),
+                bundle_id: Some("com.apple.calculator".into()),
+                pid: Some(2020),
+                path: Some("/System/Applications/Calculator.app".into()),
+                running: true,
+            });
+        }
+        let act_wait_switch = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![
+                        ActionStep::Click {
+                            target: Target::Ref {
+                                ref_id: "@e3".into(),
+                            },
+                            button: MouseButton::Left,
+                            count: 1,
+                            modifiers: vec![],
+                            mode: ClickMode::Auto,
+                        },
+                        ActionStep::Wait {
+                            until: WaitCondition::FocusedApp {
+                                app: "Calculator".into(),
+                            },
+                            timeout_ms: 500,
+                        },
+                    ],
+                    after: PostAction::Snapshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Background,
+                    release_after: false,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        let wait_snap = act_wait_switch
+            .snapshot
+            .expect("post-action snapshot after Wait(FocusedApp)");
+        assert_eq!(wait_snap.app.name, "Calculator");
+        assert_eq!(wait_snap.window_id, Some(202));
     }
 
     #[test]
