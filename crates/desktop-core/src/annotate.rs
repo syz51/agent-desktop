@@ -20,6 +20,9 @@ pub fn draw_annotations_rgba(
     let sx = img_w as f64 / display_bounds.width;
     let sy = img_h as f64 / display_bounds.height;
 
+    // Collect visible pixel rects first so all outlines are drawn under all `@eN` badges
+    // (preventing later outlines from cutting across earlier badges).
+    let mut visible: Vec<(isize, isize, isize, isize, &str)> = Vec::with_capacity(boxes.len());
     for b in boxes {
         let x0 = ((b.bounds.x - display_bounds.x) * sx).round() as isize;
         let y0 = ((b.bounds.y - display_bounds.y) * sy).round() as isize;
@@ -40,7 +43,11 @@ pub fn draw_annotations_rgba(
             y1,
             [255, 68, 58, 255],
         );
-        draw_badge(pixels, img_w, img_h, bpr, x0, y0, &b.ref_id);
+        visible.push((x0, y0, x1, y1, b.ref_id.as_str()));
+    }
+
+    for (x0, y0, _x1, _y1, ref_id) in visible {
+        draw_badge(pixels, img_w, img_h, bpr, x0, y0, ref_id);
     }
 }
 
@@ -91,8 +98,10 @@ fn draw_badge(
     let short = label.trim_start_matches('@');
     let bw = (short.len() as isize) * 6 + 6;
     let bh = 11isize;
-    let bx = x0.max(0);
-    let by = (y0 - bh).max(0);
+    let max_bx = (w as isize - bw).max(0);
+    let max_by = (h as isize - bh).max(0);
+    let bx = x0.clamp(0, max_bx);
+    let by = (y0 - bh).clamp(0, max_by);
     for dy in 0..bh {
         for dx in 0..bw {
             set_px(pixels, w, h, bpr, bx + dx, by + dy, [220, 38, 38, 255]);
@@ -205,5 +214,50 @@ mod tests {
         // Top-left border pixel of @e1 at (10, 15) should be red [255, 68, 58, 255].
         let off = 15 * w * 4 + 10 * 4;
         assert_eq!(&pixels[off..off + 4], &[255, 68, 58, 255]);
+    }
+
+    #[test]
+    fn clamps_right_edge_badge_inside_frame_and_draws_badges_above_outlines() {
+        let w = 80;
+        let h = 60;
+        let mut pixels = vec![0u8; w * h * 4];
+        draw_annotations_rgba(
+            &mut pixels,
+            w,
+            h,
+            w * 4,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 80.0,
+                height: 60.0,
+            },
+            &[
+                // Right-edge button whose badge (`e12`, width 24) would overflow without clamping.
+                AnnotateBox {
+                    ref_id: "@e12".into(),
+                    bounds: Rect {
+                        x: 70.0,
+                        y: 20.0,
+                        width: 9.0,
+                        height: 14.0,
+                    },
+                },
+                // Second box whose outline crosses through @e12's badge area (y = 9..20).
+                AnnotateBox {
+                    ref_id: "@e13".into(),
+                    bounds: Rect {
+                        x: 50.0,
+                        y: 12.0,
+                        width: 28.0,
+                        height: 25.0,
+                    },
+                },
+            ],
+        );
+        // Badge for @e12 is clamped to x = 80 - 24 = 56, y = 9..20; its top-left pixel (56, 9)
+        // must be the badge red [220, 38, 38, 255], not overwritten by the second box's outline.
+        let off = 9 * w * 4 + 56 * 4;
+        assert_eq!(&pixels[off..off + 4], &[220, 38, 38, 255]);
     }
 }
