@@ -149,6 +149,27 @@ impl TailscaleWhoisCache {
         }
     }
 
+    /// Fast non-blocking check whether `peer_ip` is already verified in the TTL cache.
+    #[must_use]
+    pub fn is_verified_cached(&self, peer_ip: IpAddr) -> bool {
+        if peer_ip.is_loopback() {
+            return true;
+        }
+        if !is_tailscale_ip(peer_ip) {
+            return false;
+        }
+        let guard = self.verified.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(&peer_ip).is_some_and(|exp| Instant::now() < *exp)
+    }
+
+    /// Pre-populate `self_user_id` off the request hot path at daemon startup so the first cold
+    /// `verify_peer` call avoids spawning a second `tailscale status --json` subprocess.
+    pub fn prewarm_self_user_id(&self) {
+        if let Some(bin) = find_tailscale_bin() {
+            let _ = self.self_user_id(&bin);
+        }
+    }
+
     /// Verify that a Tailscale peer IP is in the Tailscale CGNAT/ULA range (or loopback) and,
     /// when `tailscale whois` is reachable, belongs to our own Tailscale user.
     pub fn verify_peer(&self, peer_ip: IpAddr) -> Result<(), String> {
@@ -261,5 +282,13 @@ utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280
             parse_ip_addr_tailscale_ipv4(linux_sample),
             Some(IpAddr::V4(Ipv4Addr::new(100, 64, 12, 34)))
         );
+    }
+
+    #[test]
+    fn whois_cache_fast_path_recognizes_loopback_and_rejects_uncached_peers() {
+        let cache = TailscaleWhoisCache::new();
+        assert!(cache.is_verified_cached(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!cache.is_verified_cached(IpAddr::V4(Ipv4Addr::new(100, 64, 1, 2))));
+        assert!(!cache.is_verified_cached(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))));
     }
 }

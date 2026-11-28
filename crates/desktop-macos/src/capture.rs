@@ -1,9 +1,10 @@
 use std::ptr;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
-use desktop_core::{AnnotateBox, RawScreenshot, visual_signature_from_pixels};
+use desktop_core::{AnnotateBox, RawScreenshot, VisualSample, visual_signature_from_pixels};
 use desktop_proto::{
     ErrorCode, FocusMode, ImageFormat, Rect, RpcError, ScreenshotTarget, fit_screenshot,
 };
@@ -14,14 +15,14 @@ use objc2_core_foundation::CGRect as ObjcCGRect;
 use objc2_core_graphics::CGImage;
 use objc2_foundation::{NSArray, NSError};
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
+    SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration, SCWindow,
 };
 
 use crate::ffi::{
-    self, CGImageRef, CGRect, CfOwned, K_CF_NUMBER_FLOAT64_TYPE,
+    self, CGImageRef, CGRect, CfOwned, K_CF_NUMBER_FLOAT64_TYPE, K_CG_BITMAP_INFO_BGRA,
     K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST, cf_string,
 };
-use crate::stream::WarmDisplayStream;
+use crate::stream::{StreamKey, WarmCaptureStream};
 use crate::windows;
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(6);
@@ -45,10 +46,10 @@ pub fn invalidate_shareable_content_cache() {
 
 /// Capture a display, background/foreground window, app, or region in memory via ScreenCaptureKit.
 ///
-/// Uses the on-demand warm `SCStream` frame ring for sub-15 ms display grabs when a fresh
-/// post-mutation frame is ready, and caches `SCShareableContent` briefly for fast window captures.
+/// Uses the on-demand warm `SCStream` frame buffer for sub-15 ms display and background-window grabs
+/// when a fresh post-mutation frame is ready, and caches `SCShareableContent` briefly otherwise.
 pub fn capture(
-    stream: &WarmDisplayStream,
+    stream: &WarmCaptureStream,
     target: &ScreenshotTarget,
     format: ImageFormat,
     annotate: &[AnnotateBox],
@@ -64,38 +65,161 @@ pub fn capture(
 
     let displays = windows::displays()?;
 
-    // Fast path: serve live warm SCStream frame directly in memory (~3-8 ms!) for Display targets.
-    if let ScreenshotTarget::Display { index } = target {
-        let disp_info = match index {
-            Some(i) => displays.get(*i as usize).ok_or_else(|| {
-                RpcError::new(
-                    ErrorCode::NotFound,
-                    format!("display {i} not found ({} displays active)", displays.len()),
-                )
-            })?,
-            None => displays
-                .iter()
-                .find(|d| d.main)
-                .or_else(|| displays.first())
-                .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "no active displays"))?,
-        };
-        if let Some(frame) = stream.latest_frame(disp_info.id) {
-            return encode_rgba_frame(
-                &frame.rgba,
-                frame.width,
-                frame.height,
-                frame.display_bounds,
-                format,
-                annotate,
-                frame.visual_sig,
-            );
-        }
+    // Fast path: serve live warm SCStream BGRA frame directly in memory (~3-10 ms!) for Display
+    // and non-foreground Window/App targets without any RGBA swizzle.
+    if focus_mode != FocusMode::Foreground
+        && let Some(key) = resolve_stream_key(target, &displays)?
+        && let Some(frame) = stream.latest_frame(key)
+    {
+        return encode_bgra_frame(
+            &frame.bgra,
+            frame.width,
+            frame.height,
+            frame.display_bounds,
+            format,
+            annotate,
+            frame.visual_sig,
+        );
     }
 
     let force_fresh_content = focus_mode == FocusMode::Foreground;
     let content = fetch_shareable_content(force_fresh_content)?;
 
-    let (filter, config, out_w, out_h, display_bounds) = match target {
+    let (filter, config, out_w, out_h, display_bounds) =
+        build_capture_plan(stream, &content, &displays, target, focus_mode)?;
+
+    let cg_image = capture_image(&filter, &config)?;
+    let (final_image, visual_sig) = if annotate.is_empty() {
+        let sig = compute_cg_image_signature(&cg_image);
+        (cg_image, sig)
+    } else {
+        match draw_annotations(&cg_image, display_bounds, annotate) {
+            Some((img, sig)) => (img, sig),
+            None => (cg_image, None),
+        }
+    };
+
+    let bytes = encode_cg_image(&final_image, format)?;
+    Ok(RawScreenshot {
+        width: out_w,
+        height: out_h,
+        display_bounds,
+        mime_type: format.mime_type().into(),
+        bytes,
+        visual_sig,
+    })
+}
+
+/// Capture ONLY the 8x8 luma visual signature for `wait(visual_change)`, skipping ImageIO JPEG
+/// encoding and SHA-256 hashing completely.
+pub fn capture_visual_signature(
+    stream: &WarmCaptureStream,
+    target: &ScreenshotTarget,
+) -> Result<VisualSample, RpcError> {
+    if !crate::power::permissions().screen_recording {
+        return Err(RpcError::with_next(
+            ErrorCode::PermissionDenied,
+            "Screen Recording permission is not granted",
+            "Grant Screen Recording to AgentDesktop.app in System Settings > Privacy & Security.",
+        ));
+    }
+
+    let displays = windows::displays()?;
+    if let Some(key) = resolve_stream_key(target, &displays)?
+        && let Some(sig) = stream.latest_visual_sig(key)
+    {
+        return Ok(VisualSample {
+            sha: None,
+            visual_sig: Some(sig),
+        });
+    }
+
+    let content = fetch_shareable_content(false)?;
+    let (filter, config, _, _, _) =
+        build_capture_plan(stream, &content, &displays, target, FocusMode::Background)?;
+    let cg_image = capture_image(&filter, &config)?;
+    let visual_sig = compute_cg_image_signature(&cg_image);
+    Ok(VisualSample {
+        sha: None,
+        visual_sig,
+    })
+}
+
+/// Wait up to `timeout` for the warm `SCStream` backing `target` to push a fresh frame.
+pub fn wait_for_visual_frame(
+    stream: &WarmCaptureStream,
+    target: &ScreenshotTarget,
+    timeout: Duration,
+    stop: &AtomicBool,
+) {
+    if let Ok(displays) = windows::displays()
+        && let Ok(Some(key)) = resolve_stream_key(target, &displays)
+    {
+        let _ = stream.wait_for_frame(key, timeout, stop);
+        return;
+    }
+    std::thread::sleep(timeout.min(Duration::from_millis(40)));
+}
+
+fn resolve_stream_key(
+    target: &ScreenshotTarget,
+    displays: &[desktop_proto::DisplayInfo],
+) -> Result<Option<StreamKey>, RpcError> {
+    match target {
+        ScreenshotTarget::Display { index } => {
+            let disp_info = match index {
+                Some(i) => displays.get(*i as usize).ok_or_else(|| {
+                    RpcError::new(
+                        ErrorCode::NotFound,
+                        format!("display {i} not found ({} displays active)", displays.len()),
+                    )
+                })?,
+                None => displays
+                    .iter()
+                    .find(|d| d.main)
+                    .or_else(|| displays.first())
+                    .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "no active displays"))?,
+            };
+            Ok(Some(StreamKey::Display(disp_info.id)))
+        }
+        ScreenshotTarget::Window { window_id } => Ok(Some(StreamKey::Window(*window_id))),
+        ScreenshotTarget::App { app } => {
+            let wins = windows::windows(Some(app))?;
+            let first = wins
+                .iter()
+                .find(|w| w.layer == 0)
+                .or_else(|| wins.first())
+                .ok_or_else(|| {
+                    RpcError::with_next(
+                        ErrorCode::NotFound,
+                        format!("no visible window found for app {app:?}"),
+                        "Open the app or call list_windows to inspect available windows.",
+                    )
+                })?;
+            Ok(Some(StreamKey::Window(first.id)))
+        }
+        ScreenshotTarget::Region { .. } => Ok(None),
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn build_capture_plan(
+    stream: &WarmCaptureStream,
+    content: &SCShareableContent,
+    displays: &[desktop_proto::DisplayInfo],
+    target: &ScreenshotTarget,
+    focus_mode: FocusMode,
+) -> Result<
+    (
+        Retained<SCContentFilter>,
+        Retained<SCStreamConfiguration>,
+        u32,
+        u32,
+        Rect,
+    ),
+    RpcError,
+> {
+    Ok(match target {
         ScreenshotTarget::Display { index } => {
             let disp_info = match index {
                 Some(i) => displays.get(*i as usize).ok_or_else(|| {
@@ -123,7 +247,7 @@ pub fn capture(
                     )
                 })?;
             // Warm up the persistent low-FPS SCStream in the background for subsequent grabs.
-            stream.ensure_started(disp_info, &sc_display);
+            stream.ensure_started_display(disp_info, &sc_display);
             let (w, h) = fit_screenshot(disp_info.pixel_width, disp_info.pixel_height);
             let empty_windows = NSArray::new();
             // SAFETY: `sc_display` and `empty_windows` are valid ObjC objects.
@@ -145,7 +269,14 @@ pub fn capture(
             (filter, cfg, w, h, disp_info.bounds)
         }
         ScreenshotTarget::Window { window_id } => {
-            let plan = capture_window_filter(&content, &displays, *window_id, focus_mode)?;
+            let plan = capture_window_filter(content, displays, *window_id, focus_mode)?;
+            stream.ensure_started_window(
+                *window_id,
+                plan.display_bounds,
+                plan.width,
+                plan.height,
+                &plan.sc_win,
+            );
             (
                 plan.filter,
                 plan.config,
@@ -167,7 +298,14 @@ pub fn capture(
                         "Open the app or call list_windows to inspect available windows.",
                     )
                 })?;
-            let plan = capture_window_filter(&content, &displays, first.id, focus_mode)?;
+            let plan = capture_window_filter(content, displays, first.id, focus_mode)?;
+            stream.ensure_started_window(
+                first.id,
+                plan.display_bounds,
+                plan.width,
+                plan.height,
+                &plan.sc_win,
+            );
             (
                 plan.filter,
                 plan.config,
@@ -240,32 +378,11 @@ pub fn capture(
                 },
             )
         }
-    };
-
-    let cg_image = capture_image(&filter, &config)?;
-    let (final_image, visual_sig) = if annotate.is_empty() {
-        let sig = compute_cg_image_signature(&cg_image);
-        (cg_image, sig)
-    } else {
-        match draw_annotations(&cg_image, display_bounds, annotate) {
-            Some((img, sig)) => (img, sig),
-            None => (cg_image, None),
-        }
-    };
-
-    let bytes = encode_cg_image(&final_image, format)?;
-    Ok(RawScreenshot {
-        width: out_w,
-        height: out_h,
-        display_bounds,
-        mime_type: format.mime_type().into(),
-        bytes,
-        visual_sig,
     })
 }
 
-fn encode_rgba_frame(
-    rgba: &[u8],
+fn encode_bgra_frame(
+    bgra: &[u8],
     width: u32,
     height: u32,
     display_bounds: Rect,
@@ -276,10 +393,10 @@ fn encode_rgba_frame(
     let w = width as usize;
     let h = height as usize;
     let bpr = w * 4;
-    if w == 0 || h == 0 || rgba.len() < h * bpr {
+    if w == 0 || h == 0 || bgra.len() < h * bpr {
         return Err(RpcError::new(
             ErrorCode::BackendError,
-            "invalid warm stream RGBA frame dimensions",
+            "invalid warm stream BGRA frame dimensions",
         ));
     }
     // SAFETY: Creates an owned DeviceRGB color space.
@@ -290,7 +407,8 @@ fn encode_rgba_frame(
                 "CGColorSpaceCreateDeviceRGB failed",
             )
         })?;
-    // SAFETY: Creates an owned RGBA8 bitmap context backed by CoreGraphics memory.
+    // SAFETY: Creates an owned 32-bit little-endian premultiplied BGRA8 bitmap context backed by
+    // CoreGraphics memory (matching ScreenCaptureKit's native pixel order with zero swizzle).
     let ctx = unsafe {
         CfOwned::from_owned(
             ffi::CGBitmapContextCreate(
@@ -300,7 +418,7 @@ fn encode_rgba_frame(
                 8,
                 bpr,
                 cs.as_mut_ptr(),
-                K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
+                K_CG_BITMAP_INFO_BGRA,
             )
             .cast_const(),
         )
@@ -317,17 +435,17 @@ fn encode_rgba_frame(
             "CGBitmapContext backing buffer unavailable",
         ));
     }
-    // SAFETY: `data` points to `h * ctx_bpr` writable RGBA bytes owned by `ctx`.
+    // SAFETY: `data` points to `h * ctx_bpr` writable BGRA bytes owned by `ctx`.
     let pixels = unsafe { std::slice::from_raw_parts_mut(data, h * ctx_bpr) };
     if ctx_bpr == bpr {
-        pixels[..h * bpr].copy_from_slice(&rgba[..h * bpr]);
+        pixels[..h * bpr].copy_from_slice(&bgra[..h * bpr]);
     } else {
         for y in 0..h {
-            pixels[y * ctx_bpr..y * ctx_bpr + bpr].copy_from_slice(&rgba[y * bpr..(y + 1) * bpr]);
+            pixels[y * ctx_bpr..y * ctx_bpr + bpr].copy_from_slice(&bgra[y * bpr..(y + 1) * bpr]);
         }
     }
     if !annotate.is_empty() {
-        desktop_core::draw_annotations_rgba(pixels, w, h, ctx_bpr, display_bounds, annotate);
+        desktop_core::draw_annotations_bgra(pixels, w, h, ctx_bpr, display_bounds, annotate);
     }
 
     // SAFETY: Produces an owned CGImage snapshot of the populated bitmap context.
@@ -349,6 +467,7 @@ fn encode_rgba_frame(
 struct CapturePlan {
     filter: Retained<SCContentFilter>,
     config: Retained<SCStreamConfiguration>,
+    sc_win: Retained<SCWindow>,
     width: u32,
     height: u32,
     display_bounds: Rect,
@@ -435,6 +554,7 @@ fn capture_window_filter(
     Ok(CapturePlan {
         filter,
         config: cfg,
+        sc_win,
         width: w,
         height: h,
         display_bounds: bounds,
@@ -617,8 +737,8 @@ fn encode_cg_image(image: &CfOwned, format: ImageFormat) -> Result<Vec<u8>, RpcE
     }
 }
 
-/// Compute the 8x8 area-averaged visual signature directly from the full-resolution `CGImage`
-/// so one-shot captures and warm `SCStream` frames share identical signature math.
+/// Compute the 8x8 area-averaged visual signature by downscaling `CGImage` directly into a tiny
+/// 32x32 RGBA bitmap (4 KB instead of allocating a full-resolution ~5 MB bitmap).
 fn compute_cg_image_signature(image: &CfOwned) -> Option<[u8; 64]> {
     // SAFETY: Queries pixel dimensions of the valid CGImage.
     let w = unsafe { ffi::CGImageGetWidth(image.as_mut_ptr()) };
@@ -627,17 +747,19 @@ fn compute_cg_image_signature(image: &CfOwned) -> Option<[u8; 64]> {
     if w < 8 || h < 8 {
         return None;
     }
+    let thumb_w = w.min(32);
+    let thumb_h = h.min(32);
     // SAFETY: Creates an owned DeviceRGB color space.
     let cs = unsafe { CfOwned::from_owned(ffi::CGColorSpaceCreateDeviceRGB().cast_const()) }?;
-    // SAFETY: Creates an owned RGBA8 bitmap context matching the CGImage dimensions.
+    // SAFETY: Creates a tiny owned RGBA8 bitmap context (<= 4 KB) for fast CoreGraphics downscale.
     let ctx = unsafe {
         CfOwned::from_owned(
             ffi::CGBitmapContextCreate(
                 ptr::null_mut(),
-                w,
-                h,
+                thumb_w,
+                thumb_h,
                 8,
-                w * 4,
+                thumb_w * 4,
                 cs.as_mut_ptr(),
                 K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
             )
@@ -647,8 +769,8 @@ fn compute_cg_image_signature(image: &CfOwned) -> Option<[u8; 64]> {
     let rect = CGRect {
         origin: ffi::CGPoint { x: 0.0, y: 0.0 },
         size: ffi::CGSize {
-            width: w as f64,
-            height: h as f64,
+            width: thumb_w as f64,
+            height: thumb_h as f64,
         },
     };
     // SAFETY: `ctx` and `image` are valid retained CoreGraphics objects.
@@ -659,12 +781,12 @@ fn compute_cg_image_signature(image: &CfOwned) -> Option<[u8; 64]> {
     let data = unsafe { ffi::CGBitmapContextGetData(ctx.as_mut_ptr()) };
     // SAFETY: Queries the row stride of the valid bitmap context.
     let bpr = unsafe { ffi::CGBitmapContextGetBytesPerRow(ctx.as_mut_ptr()) };
-    if data.is_null() || bpr < w * 4 {
+    if data.is_null() || bpr < thumb_w * 4 {
         return None;
     }
-    // SAFETY: `data` points to `h * bpr` readable RGBA bytes owned by `ctx`.
-    let pixels = unsafe { std::slice::from_raw_parts(data, h * bpr) };
-    visual_signature_from_pixels(pixels, w, h, bpr, false)
+    // SAFETY: `data` points to `thumb_h * bpr` readable RGBA bytes owned by `ctx`.
+    let pixels = unsafe { std::slice::from_raw_parts(data, thumb_h * bpr) };
+    visual_signature_from_pixels(pixels, thumb_w, thumb_h, bpr, false)
 }
 
 /// Draw crisp Set-of-Marks bounding boxes and `@eN` tags directly onto an RGBA bitmap copy,
@@ -814,5 +936,44 @@ mod tests {
         let ann_png = encode_cg_image(&annotated, ImageFormat::Png).unwrap();
         assert_ne!(ann_png, png);
         assert_eq!(&ann_png[..4], &[0x89, b'P', b'N', b'G']);
+    }
+
+    #[test]
+    fn encodes_native_bgra_frame_and_downscaled_signature_detects_change() {
+        let w = 64u32;
+        let h = 64u32;
+        let bgra = [80u8, 40, 20, 255].repeat((w * h) as usize);
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 64.0,
+            height: 64.0,
+        };
+        let shot = encode_bgra_frame(
+            &bgra,
+            w,
+            h,
+            bounds,
+            ImageFormat::Png,
+            &[AnnotateBox {
+                ref_id: "@e1".into(),
+                bounds: Rect {
+                    x: 8.0,
+                    y: 16.0,
+                    width: 24.0,
+                    height: 16.0,
+                },
+            }],
+            Some([30u8; 64]),
+        )
+        .unwrap();
+        assert_eq!(&shot.bytes[..4], &[0x89, b'P', b'N', b'G']);
+        assert_eq!(shot.visual_sig, Some([30u8; 64]));
+
+        let dark = make_solid_image(128, 128, [30, 30, 30, 255]);
+        let bright = make_solid_image(128, 128, [220, 220, 220, 255]);
+        let sig_dark = compute_cg_image_signature(&dark).unwrap();
+        let sig_bright = compute_cg_image_signature(&bright).unwrap();
+        assert!(desktop_core::max_visual_delta(&sig_dark, &sig_bright) >= 150);
     }
 }

@@ -88,7 +88,7 @@ fn current_cursor_location() -> Option<CGPoint> {
 }
 
 /// Temporarily save previous frontmost app + cursor position when `FocusMode::Auto` must
-/// briefly borrow focus, then restore both on drop.
+/// briefly borrow focus or pointer, then restore both on drop if they changed.
 struct FocusRestoreGuard {
     prev_pid: Option<i32>,
     prev_cursor: Option<CGPoint>,
@@ -118,7 +118,7 @@ impl FocusRestoreGuard {
             std::thread::sleep(Duration::from_millis(35));
         }
         Self {
-            prev_pid: if needs_switch { prev_pid } else { None },
+            prev_pid,
             prev_cursor,
             active: true,
         }
@@ -155,9 +155,16 @@ impl Drop for FocusRestoreGuard {
                 }
             }
         }
+        // Only restore focus if the frontmost application actually changed during the HID action
+        // (covers both explicit target_pid activation and implicit activation from click_point/drag/scroll).
         if let Some(pid) = self.prev_pid {
-            std::thread::sleep(Duration::from_millis(20));
-            windows::activate_pid(pid);
+            // Brief settle so macOS finishes processing activation from the click before checking.
+            if windows::frontmost_pid() == Some(pid) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if windows::frontmost_pid() != Some(pid) {
+                windows::activate_pid(pid);
+            }
         }
     }
 }
@@ -311,8 +318,19 @@ fn click_point_raw(
     })
 }
 
-pub fn hover_point(stop: &AtomicBool, point: Point) -> Result<StepExecInfo, RpcError> {
+pub fn hover_point(
+    stop: &AtomicBool,
+    point: Point,
+    focus_mode: FocusMode,
+) -> Result<StepExecInfo, RpcError> {
     require_accessibility()?;
+    if focus_mode == FocusMode::Background {
+        return Err(RpcError::with_next(
+            ErrorCode::RequiresFocus,
+            "hover requires physical pointer movement on macOS",
+            "Retry with focus_mode=\"auto\" or focus_mode=\"foreground\".",
+        ));
+    }
     let src = event_source()?;
     let ev = make_mouse(
         &src,
@@ -345,6 +363,7 @@ pub fn drag(
             "Use focus_mode=\"auto\" or \"foreground\".",
         ));
     }
+    let _guard = FocusRestoreGuard::enter(None, focus_mode);
     let src = event_source()?;
     let p1 = CGPoint {
         x: from.x,
@@ -398,14 +417,123 @@ pub fn drag(
     })
 }
 
+pub fn scroll_ref(
+    refs: &AxRefStore,
+    stop: &AtomicBool,
+    ref_id: &str,
+    direction: ScrollDirection,
+    amount: u32,
+    focus_mode: FocusMode,
+) -> Result<StepExecInfo, RpcError> {
+    require_accessibility()?;
+    check_stop(stop)?;
+    let live = refs.get(ref_id)?;
+
+    // Tier 1: Zero-focus, zero-cursor background AX scroll via ancestor AXScrollArea scrollbar.
+    if try_ax_scroll(&live.element, direction, amount) {
+        return Ok(StepExecInfo {
+            detail: format!(
+                "scrolled {ref_id} {direction:?} in {} via AXScrollBar (background)",
+                live.app.name
+            ),
+            used_background: true,
+        });
+    }
+
+    if focus_mode == FocusMode::Background {
+        return Err(RpcError::with_next(
+            ErrorCode::RequiresFocus,
+            format!(
+                "{ref_id} in {} does not expose a writable AXScrollBar for background scrolling",
+                live.app.name
+            ),
+            "Retry with focus_mode=\"auto\" (cursor-restoring scroll) or focus_mode=\"foreground\".",
+        ));
+    }
+
+    let bounds = live.element.bounds().ok_or_else(|| {
+        RpcError::with_next(
+            ErrorCode::StaleRef,
+            format!("{ref_id} has no visible bounding box"),
+            "Take a fresh snapshot.",
+        )
+    })?;
+    let center = bounds.center();
+    // macOS delivers wheel events to unfocused visible windows without activating them; only
+    // temporarily activate `live.app.pid` if another window currently occludes `center`.
+    let occluded = windows::app_at_point(center)
+        .ok()
+        .flatten()
+        .is_some_and(|top| top.pid != live.app.pid);
+    let target_pid = if occluded || focus_mode == FocusMode::Foreground {
+        live.app.pid.map(|p| p as i32)
+    } else {
+        None
+    };
+    let _guard = FocusRestoreGuard::enter(target_pid, focus_mode);
+    scroll_point_raw(stop, center, direction, amount)
+}
+
+/// Try adjusting an element's own or nearest ancestor `AXScrollArea`'s `AXVerticalScrollBar` /
+/// `AXHorizontalScrollBar` value directly via Accessibility without moving the cursor or focusing.
+fn try_ax_scroll(el: &crate::ax::AxElement, direction: ScrollDirection, amount: u32) -> bool {
+    let bar_attr = match direction {
+        ScrollDirection::Up | ScrollDirection::Down => "AXVerticalScrollBar",
+        ScrollDirection::Left | ScrollDirection::Right => "AXHorizontalScrollBar",
+    };
+    let sign = match direction {
+        ScrollDirection::Up | ScrollDirection::Left => -1.0,
+        ScrollDirection::Down | ScrollDirection::Right => 1.0,
+    };
+    let delta = (f64::from(amount.clamp(1, 50)) * 0.05).clamp(0.02, 0.5);
+
+    let mut cur = Some(el.clone());
+    for _ in 0..16 {
+        let Some(node) = cur else { break };
+        let role = node.string_attr("AXRole").unwrap_or_default();
+        let bar = if role == "AXScrollBar" {
+            Some(node.clone())
+        } else {
+            node.element_attr(bar_attr)
+        };
+        if let Some(sb) = bar
+            && let Some(val) = sb.f64_attr("AXValue")
+        {
+            let next = (val + sign * delta).clamp(0.0, 1.0);
+            if (next - val).abs() > 1e-4 && sb.set_f64_attr("AXValue", next).is_ok() {
+                return true;
+            }
+        }
+        cur = node.element_attr("AXParent");
+    }
+    false
+}
+
 pub fn scroll(
     stop: &AtomicBool,
     point: Point,
     direction: ScrollDirection,
     amount: u32,
-    _focus_mode: FocusMode,
+    focus_mode: FocusMode,
 ) -> Result<StepExecInfo, RpcError> {
     require_accessibility()?;
+    if focus_mode == FocusMode::Background {
+        return Err(RpcError::with_next(
+            ErrorCode::RequiresFocus,
+            "raw coordinate scroll requires physical pointer input on macOS",
+            "Target an @eN ref for background AX scrolling, or use focus_mode=\"auto\".",
+        ));
+    }
+    let _guard = FocusRestoreGuard::enter(None, focus_mode);
+    scroll_point_raw(stop, point, direction, amount)
+}
+
+fn scroll_point_raw(
+    stop: &AtomicBool,
+    point: Point,
+    direction: ScrollDirection,
+    amount: u32,
+) -> Result<StepExecInfo, RpcError> {
     let src = event_source()?;
     let pt = CGPoint {
         x: point.x,
@@ -753,3 +881,27 @@ fn make_key(src: &CfOwned, code: u16, down: bool) -> Result<CfOwned, RpcError> {
 
 #[allow(dead_code)]
 fn _keep_cgeventref(_: Option<CGEventRef>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_hover_and_raw_scroll_refuse_pointer_movement() {
+        let stop = AtomicBool::new(false);
+        let pt = Point { x: 100.0, y: 100.0 };
+
+        let hover_err = hover_point(&stop, pt, FocusMode::Background).unwrap_err();
+        assert!(matches!(
+            hover_err.code,
+            ErrorCode::RequiresFocus | ErrorCode::PermissionDenied
+        ));
+
+        let scroll_err =
+            scroll(&stop, pt, ScrollDirection::Down, 3, FocusMode::Background).unwrap_err();
+        assert!(matches!(
+            scroll_err.code,
+            ErrorCode::RequiresFocus | ErrorCode::PermissionDenied
+        ));
+    }
+}

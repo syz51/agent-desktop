@@ -7,8 +7,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::DateTime;
 use desktop_proto::{
-    ActParams, ActResult, ActionStep, AppInfo, ErrorCode, FocusMode, HostStatus, ImageFormat,
-    LeaseInfo, ListWindowsParams, MAX_READ_TEXT_CHARS, Point, PolicyConfig, PolicyMode, PostAction,
+    ActParams, ActResult, ActionStep, AppInfo, ErrorCode, FocusMode, HostStatus, LeaseInfo,
+    ListWindowsParams, MAX_READ_TEXT_CHARS, Point, PolicyConfig, PolicyMode, PostAction,
     ReadTextMode, Rect, RpcError, RpcMethod, RpcResult, ScreenState, ScreenshotParams,
     ScreenshotResult, ScreenshotTarget, SessionStartParams, Snapshot, SnapshotParams, StepOutcome,
     Target, WaitCondition, parse_key_combo, parse_modifiers, screenshot_to_global,
@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::audit::{AuditEvent, AuditLog};
 use crate::backend::{PlatformBackend, RawScreenshot};
 use crate::clock::{Clock, default_lease_ttl};
-use crate::frame_ring::{DEFAULT_WARM_FRAME_TTL_MS, FrameKey, FrameRing, has_visual_change};
+use crate::frame_ring::{DEFAULT_WARM_FRAME_TTL_MS, FrameKey, FrameRing};
 use crate::policy::{PolicyStore, check_app_policy};
 use crate::tree::{collect_annotate_boxes, find_in_snapshot};
 
@@ -881,15 +881,18 @@ impl DesktopEngine {
                 ScreenshotTarget::Window { window_id } => SnapshotParams {
                     window_id: Some(*window_id),
                     focus_mode: params.focus_mode,
+                    include_bounds: true,
                     ..SnapshotParams::default()
                 },
                 ScreenshotTarget::App { app } => SnapshotParams {
                     app: Some(app.clone()),
                     focus_mode: params.focus_mode,
+                    include_bounds: true,
                     ..SnapshotParams::default()
                 },
                 _ => SnapshotParams {
                     focus_mode: params.focus_mode,
+                    include_bounds: true,
                     ..SnapshotParams::default()
                 },
             };
@@ -1304,7 +1307,7 @@ impl DesktopEngine {
                 if let Some(app) = self.backend.app_at_point(p)? {
                     self.ensure_app_allowed(&app, policy)?;
                 }
-                let info = self.backend.hover_point(p)?;
+                let info = self.backend.hover_point(p, focus_mode)?;
                 Ok(StepRun::mutating(info.detail, info.used_background)
                     .with_optional_target(post_target))
             }
@@ -1330,15 +1333,27 @@ impl DesktopEngine {
                 target,
                 direction,
                 amount,
-            } => {
-                let (p, post_target) = self.resolve_target_point(&target)?;
-                if let Some(app) = self.backend.app_at_point(p)? {
-                    self.ensure_app_allowed(&app, policy)?;
+            } => match target {
+                Target::Ref { ref_id } => {
+                    let resolved = self.backend.resolve_ref(&ref_id)?;
+                    self.ensure_app_allowed(&resolved.app, policy)?;
+                    let post_target = post_target_from_resolved(&resolved);
+                    let info = self
+                        .backend
+                        .scroll_ref(&ref_id, direction, amount, focus_mode)?;
+                    Ok(StepRun::mutating(info.detail, info.used_background)
+                        .with_optional_target(post_target))
                 }
-                let info = self.backend.scroll(p, direction, amount, focus_mode)?;
-                Ok(StepRun::mutating(info.detail, info.used_background)
-                    .with_optional_target(post_target))
-            }
+                point_target @ Target::Point { .. } => {
+                    let (p, post_target) = self.resolve_target_point(&point_target)?;
+                    if let Some(app) = self.backend.app_at_point(p)? {
+                        self.ensure_app_allowed(&app, policy)?;
+                    }
+                    let info = self.backend.scroll(p, direction, amount, focus_mode)?;
+                    Ok(StepRun::mutating(info.detail, info.used_background)
+                        .with_optional_target(post_target))
+                }
+            },
             ActionStep::SetText {
                 ref_id,
                 text,
@@ -1527,18 +1542,17 @@ impl DesktopEngine {
         let start = Instant::now();
         let deadline = start + StdDuration::from_millis(timeout_ms);
 
-        // Capture initial hash + 8x8 visual signature for VisualChange comparisons.
+        // Capture initial lightweight visual sample for VisualChange comparisons without
+        // forcing JPEG encoding when the backend supports direct pixel signatures.
         let initial_visual = if let WaitCondition::VisualChange { target } = condition {
-            let raw =
-                self.backend
-                    .capture(target, ImageFormat::Jpeg, &[], FocusMode::Background)?;
-            Some((short_sha256(&raw.bytes), raw.visual_sig))
+            Some(self.backend.capture_visual_signature(target)?)
         } else {
             None
         };
 
         loop {
             self.check_session_not_stopped(active_sid)?;
+            let mut observe_pid: Option<u32> = None;
             match condition {
                 WaitCondition::Exists { query, role, app } => {
                     let snap = self.capture_snapshot(
@@ -1549,6 +1563,7 @@ impl DesktopEngine {
                         },
                         policy,
                     )?;
+                    observe_pid = snap.app.pid;
                     let hits = find_in_snapshot(&snap, query, role.as_deref(), 1);
                     if let Some(hit) = hits.first() {
                         return Ok((
@@ -1560,12 +1575,15 @@ impl DesktopEngine {
                 }
                 WaitCondition::Gone { ref_id, query, app } => {
                     if let Some(r) = ref_id {
-                        if self.backend.resolve_ref(r).is_err() {
-                            return Ok((
-                                true,
-                                start.elapsed().as_millis() as u64,
-                                format!("{r} is gone"),
-                            ));
+                        match self.backend.resolve_ref(r) {
+                            Err(_) => {
+                                return Ok((
+                                    true,
+                                    start.elapsed().as_millis() as u64,
+                                    format!("{r} is gone"),
+                                ));
+                            }
+                            Ok(resolved) => observe_pid = resolved.app.pid,
                         }
                     } else if let Some(q) = query {
                         let snap = self.capture_snapshot(
@@ -1576,6 +1594,7 @@ impl DesktopEngine {
                             },
                             policy,
                         )?;
+                        observe_pid = snap.app.pid;
                         if find_in_snapshot(&snap, q, None, 1).is_empty() {
                             return Ok((
                                 true,
@@ -1586,19 +1605,21 @@ impl DesktopEngine {
                     }
                 }
                 WaitCondition::FocusedApp { app } => {
-                    if let Some(focused) = self.backend.focused_app()?
-                        && focused.matches_query(app)
-                    {
-                        return Ok((
-                            true,
-                            start.elapsed().as_millis() as u64,
-                            format!("{} is focused", focused.name),
-                        ));
+                    if let Some(focused) = self.backend.focused_app()? {
+                        observe_pid = focused.pid;
+                        if focused.matches_query(app) {
+                            return Ok((
+                                true,
+                                start.elapsed().as_millis() as u64,
+                                format!("{} is focused", focused.name),
+                            ));
+                        }
                     }
                 }
                 WaitCondition::WindowTitleContains { text, app } => {
                     let needle = text.to_ascii_lowercase();
                     let wins = self.backend.windows(app.as_deref())?;
+                    observe_pid = wins.first().and_then(|w| w.app.pid);
                     if let Some(w) = wins
                         .iter()
                         .find(|w| w.title.to_ascii_lowercase().contains(&needle))
@@ -1611,38 +1632,53 @@ impl DesktopEngine {
                     }
                 }
                 WaitCondition::VisualChange { target } => {
-                    let raw = self.backend.capture(
-                        target,
-                        ImageFormat::Jpeg,
-                        &[],
-                        FocusMode::Background,
-                    )?;
-                    let h = short_sha256(&raw.bytes);
-                    if let Some((base_sha, base_sig)) = &initial_visual
-                        && has_visual_change(
-                            base_sha,
-                            base_sig.as_ref(),
-                            &h,
-                            raw.visual_sig.as_ref(),
-                        )
-                    {
-                        return Ok((
-                            true,
-                            start.elapsed().as_millis() as u64,
-                            format!("visual change detected ({h})"),
-                        ));
+                    let sample = self.backend.capture_visual_signature(target)?;
+                    if let Some(base) = &initial_visual {
+                        let changed = match (&base.visual_sig, &sample.visual_sig) {
+                            (Some(a), Some(b)) => {
+                                if base.sha.is_some() && base.sha == sample.sha {
+                                    false
+                                } else {
+                                    crate::frame_ring::max_visual_delta(a, b)
+                                        >= crate::frame_ring::DEFAULT_VISUAL_DIFF_THRESHOLD
+                                }
+                            }
+                            _ => match (base.sha.as_deref(), sample.sha.as_deref()) {
+                                (Some(a), Some(b)) => a != b,
+                                _ => false,
+                            },
+                        };
+                        if changed {
+                            let tag = sample.sha.as_deref().unwrap_or("sig");
+                            return Ok((
+                                true,
+                                start.elapsed().as_millis() as u64,
+                                format!("visual change detected ({tag})"),
+                            ));
+                        }
                     }
                 }
             }
 
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 return Ok((
                     false,
                     start.elapsed().as_millis() as u64,
                     "condition not met before timeout".into(),
                 ));
             }
-            std::thread::sleep(StdDuration::from_millis(40));
+            let rem = deadline.saturating_duration_since(now);
+            match condition {
+                WaitCondition::VisualChange { target } => {
+                    self.backend
+                        .wait_for_visual_frame(target, rem.min(StdDuration::from_millis(120)));
+                }
+                _ => {
+                    self.backend
+                        .wait_for_ui_event(observe_pid, rem.min(StdDuration::from_millis(150)));
+                }
+            }
         }
     }
 }

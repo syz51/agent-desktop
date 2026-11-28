@@ -82,6 +82,10 @@ pub async fn bind_http(
         require_tailscale: listen.require_tailscale,
         whois: TailscaleWhoisCache::new(),
     });
+    if listen.require_tailscale {
+        let prewarm = Arc::clone(&state);
+        tokio::task::spawn_blocking(move || prewarm.whois.prewarm_self_user_id());
+    }
 
     let router = Router::new()
         .route("/v1/health", get(handle_health))
@@ -113,8 +117,8 @@ pub async fn serve_http_listener(
     .context("serve desktopd HTTP listener")
 }
 
-fn verify_auth(
-    state: &RemoteState,
+async fn verify_auth(
+    state: &Arc<RemoteState>,
     peer: SocketAddr,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<Value>)> {
@@ -138,10 +142,20 @@ fn verify_auth(
         ));
     }
 
-    if state.require_tailscale
-        && let Err(reason) = state.whois.verify_peer(peer.ip())
-    {
-        return Err((StatusCode::FORBIDDEN, Json(json!({ "error": reason }))));
+    if state.require_tailscale && !state.whois.is_verified_cached(peer.ip()) {
+        let whois_state = Arc::clone(state);
+        let peer_ip = peer.ip();
+        let res = tokio::task::spawn_blocking(move || whois_state.whois.verify_peer(peer_ip))
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("whois worker failed: {e}") })),
+                )
+            })?;
+        if let Err(reason) = res {
+            return Err((StatusCode::FORBIDDEN, Json(json!({ "error": reason }))));
+        }
     }
     Ok(())
 }
@@ -159,7 +173,7 @@ async fn handle_health(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    verify_auth(&state, peer, &headers)?;
+    verify_auth(&state, peer, &headers).await?;
     Ok(Json(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
@@ -172,7 +186,7 @@ async fn handle_rpc(
     headers: HeaderMap,
     Json(req): Json<RpcRequest>,
 ) -> Result<Json<RpcResponse>, (StatusCode, Json<Value>)> {
-    verify_auth(&state, peer, &headers)?;
+    verify_auth(&state, peer, &headers).await?;
     let client_id = parse_client_id(&headers);
     let id = req.id;
     let engine = Arc::clone(&state.engine);
@@ -203,7 +217,7 @@ async fn handle_screenshot_binary(
     headers: HeaderMap,
     Json(req): Json<BinaryScreenshotRequest>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
-    verify_auth(&state, peer, &headers)?;
+    verify_auth(&state, peer, &headers).await?;
     let client_id = parse_client_id(&headers);
     let engine = Arc::clone(&state.engine);
     let res = tokio::task::spawn_blocking(move || {
@@ -273,7 +287,7 @@ async fn handle_disconnect(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    verify_auth(&state, peer, &headers)?;
+    verify_auth(&state, peer, &headers).await?;
     if let Some(client_id) = parse_client_id(&headers) {
         let engine = Arc::clone(&state.engine);
         let _ = tokio::task::spawn_blocking(move || engine.on_client_disconnect(client_id)).await;

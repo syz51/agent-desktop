@@ -554,7 +554,7 @@ impl PlatformBackend for LinuxBackend {
         })
     }
 
-    fn hover_point(&self, point: Point) -> Result<StepExecInfo, RpcError> {
+    fn hover_point(&self, point: Point, _focus_mode: FocusMode) -> Result<StepExecInfo, RpcError> {
         if self.session.is_wayland() && self.session.x11_display().is_none() {
             return wayland::wayland_hover_point(point);
         }

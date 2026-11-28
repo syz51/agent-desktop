@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::c_void;
 use std::ptr;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use desktop_core::ResolvedRef;
@@ -15,9 +16,10 @@ use desktop_proto::{
 use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
 
 use crate::ffi::{
-    self, AXError, AXUIElementRef, CFArrayRef, CFTypeRef, CGPoint, CGSize, CfOwned,
-    K_AX_ERROR_SUCCESS, K_AX_VALUE_CGPOINT_TYPE, K_AX_VALUE_CGSIZE_TYPE, cf_string, cf_to_bool,
-    cf_to_string,
+    self, AXError, AXObserverRef, AXUIElementRef, CFArrayRef, CFRunLoopRef, CFStringRef, CFTypeRef,
+    CGPoint, CGSize, CfOwned, K_AX_COPY_MULTIPLE_ATTRIBUTE_OPTION_NONE, K_AX_ERROR_SUCCESS,
+    K_AX_VALUE_CGPOINT_TYPE, K_AX_VALUE_CGSIZE_TYPE, K_CF_NUMBER_FLOAT64_TYPE, cf_string,
+    cf_to_bool, cf_to_f64, cf_to_string,
 };
 use crate::windows;
 
@@ -89,6 +91,117 @@ impl AxElement {
         let val = self.copy_attr(name).ok()?;
         // SAFETY: `val` is a valid retained CFTypeRef.
         unsafe { cf_to_bool(val.as_ptr()) }
+    }
+
+    pub fn f64_attr(&self, name: &str) -> Option<f64> {
+        let val = self.copy_attr(name).ok()?;
+        // SAFETY: `val` is a valid retained CFTypeRef.
+        unsafe { cf_to_f64(val.as_ptr()) }
+    }
+
+    pub fn set_f64_attr(&self, name: &str, value: f64) -> Result<(), AXError> {
+        let attr = cf_string(name);
+        // SAFETY: Creates an owned CFNumber wrapping `value`.
+        let num = unsafe {
+            CfOwned::from_owned(ffi::CFNumberCreate(
+                ptr::null(),
+                K_CF_NUMBER_FLOAT64_TYPE,
+                (&value as *const f64).cast(),
+            ))
+        }
+        .ok_or(-25200)?;
+        // SAFETY: `self.as_raw()`, `attr`, and `num` are valid CF refs.
+        let err = unsafe {
+            ffi::AXUIElementSetAttributeValue(self.as_raw(), attr.as_ptr(), num.as_ptr())
+        };
+        if err == K_AX_ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(err)
+        }
+    }
+
+    /// Fetch core snapshot attributes in a single `AXUIElementCopyMultipleAttributeValues` IPC
+    /// round-trip (cutting 9-11 serial Mach IPCs per element down to 1), falling back to
+    /// individual reads if the target app rejects batch queries.
+    pub fn read_node_attrs(&self, include_bounds: bool) -> BatchedNodeAttrs {
+        let keys = cached_snapshot_attr_keys(include_bounds);
+        let mut raw_values: CFArrayRef = ptr::null();
+        // SAFETY: `self.as_raw()` and `keys` are valid retained CF refs; `raw_values` receives
+        // an owned +1 CFArray on `K_AX_ERROR_SUCCESS`.
+        let err = unsafe {
+            ffi::AXUIElementCopyMultipleAttributeValues(
+                self.as_raw(),
+                keys.as_ptr(),
+                K_AX_COPY_MULTIPLE_ATTRIBUTE_OPTION_NONE,
+                &mut raw_values,
+            )
+        };
+        if err == K_AX_ERROR_SUCCESS
+            && let Some(arr) = (unsafe { CfOwned::from_owned(raw_values) })
+        {
+            let expected = if include_bounds { 11 } else { 9 };
+            // SAFETY: `arr` is an owned CFArray returned by `AXUIElementCopyMultipleAttributeValues`.
+            let count = unsafe { ffi::CFArrayGetCount(arr.as_ptr()) };
+            if count >= expected {
+                // SAFETY: Indices `0..expected` are in bounds; `cf_to_*` and `unpack_ax_bounds`
+                // validate CFTypeIDs so `kAXValueAXErrorType` placeholders cleanly yield `None`.
+                unsafe {
+                    let get = |i: isize| ffi::CFArrayGetValueAtIndex(arr.as_ptr(), i);
+                    let raw_role = cf_to_string(get(0)).unwrap_or_default();
+                    let raw_subrole = cf_to_string(get(1));
+                    let title = cf_to_string(get(2)).filter(|s| !s.trim().is_empty());
+                    let label = cf_to_string(get(3))
+                        .or_else(|| cf_to_string(get(4)))
+                        .filter(|s| !s.trim().is_empty());
+                    let value = cf_to_string(get(5)).filter(|s| !s.is_empty());
+                    let focused = cf_to_bool(get(6)).unwrap_or(false);
+                    let selected = cf_to_bool(get(7)).unwrap_or(false);
+                    let enabled = cf_to_bool(get(8)).unwrap_or(true);
+                    let bounds = if include_bounds {
+                        unpack_ax_bounds(get(9), get(10))
+                    } else {
+                        None
+                    };
+                    return BatchedNodeAttrs {
+                        raw_role,
+                        raw_subrole,
+                        title,
+                        label,
+                        value,
+                        focused,
+                        selected,
+                        enabled,
+                        bounds,
+                    };
+                }
+            }
+        }
+
+        // Fallback for apps that do not support `AXUIElementCopyMultipleAttributeValues`.
+        let raw_role = self.string_attr("AXRole").unwrap_or_default();
+        let raw_subrole = self.string_attr("AXSubrole");
+        let title = self.string_attr("AXTitle").filter(|s| !s.trim().is_empty());
+        let label = self
+            .string_attr("AXDescription")
+            .or_else(|| self.string_attr("AXHelp"))
+            .filter(|s| !s.trim().is_empty());
+        let value = self.string_attr("AXValue").filter(|s| !s.is_empty());
+        let focused = self.bool_attr("AXFocused").unwrap_or(false);
+        let selected = self.bool_attr("AXSelected").unwrap_or(false);
+        let enabled = self.bool_attr("AXEnabled").unwrap_or(true);
+        let bounds = if include_bounds { self.bounds() } else { None };
+        BatchedNodeAttrs {
+            raw_role,
+            raw_subrole,
+            title,
+            label,
+            value,
+            focused,
+            selected,
+            enabled,
+            bounds,
+        }
     }
 
     pub fn element_attr(&self, name: &str) -> Option<AxElement> {
@@ -218,6 +331,244 @@ impl AxElement {
             Ok(())
         } else {
             Err(err)
+        }
+    }
+}
+
+pub struct BatchedNodeAttrs {
+    pub raw_role: String,
+    pub raw_subrole: Option<String>,
+    pub title: Option<String>,
+    pub label: Option<String>,
+    pub value: Option<String>,
+    pub focused: bool,
+    pub selected: bool,
+    pub enabled: bool,
+    pub bounds: Option<Rect>,
+}
+
+fn build_cf_string_array(names: &[&str]) -> CfOwned {
+    let owned: Vec<CfOwned> = names.iter().map(|s| cf_string(s)).collect();
+    let ptrs: Vec<CFTypeRef> = owned.iter().map(CfOwned::as_ptr).collect();
+    // SAFETY: `ptrs` holds `ptrs.len()` valid CFStringRef pointers; `kCFTypeArrayCallBacks`
+    // retains each entry inside the newly created CFArray.
+    let arr = unsafe {
+        ffi::CFArrayCreate(
+            ptr::null(),
+            ptrs.as_ptr(),
+            ptrs.len() as ffi::CFIndex,
+            &ffi::kCFTypeArrayCallBacks,
+        )
+    };
+    // SAFETY: `arr` is a newly created +1 CFArrayRef.
+    unsafe { CfOwned::from_owned(arr) }.expect("CFArrayCreate failed")
+}
+
+fn cached_snapshot_attr_keys(include_bounds: bool) -> &'static CfOwned {
+    static NO_BOUNDS: OnceLock<CfOwned> = OnceLock::new();
+    static WITH_BOUNDS: OnceLock<CfOwned> = OnceLock::new();
+    if include_bounds {
+        WITH_BOUNDS.get_or_init(|| {
+            build_cf_string_array(&[
+                "AXRole",
+                "AXSubrole",
+                "AXTitle",
+                "AXDescription",
+                "AXHelp",
+                "AXValue",
+                "AXFocused",
+                "AXSelected",
+                "AXEnabled",
+                "AXPosition",
+                "AXSize",
+            ])
+        })
+    } else {
+        NO_BOUNDS.get_or_init(|| {
+            build_cf_string_array(&[
+                "AXRole",
+                "AXSubrole",
+                "AXTitle",
+                "AXDescription",
+                "AXHelp",
+                "AXValue",
+                "AXFocused",
+                "AXSelected",
+                "AXEnabled",
+            ])
+        })
+    }
+}
+
+/// Unpack a borrowed `(AXPosition, AXSize)` pair into `Rect` when both are valid `AXValueRef`s.
+///
+/// # Safety
+/// `pos_val` and `size_val` must be null or valid CFTypeRefs.
+unsafe fn unpack_ax_bounds(pos_val: CFTypeRef, size_val: CFTypeRef) -> Option<Rect> {
+    if pos_val.is_null() || size_val.is_null() {
+        return None;
+    }
+    let mut pt = CGPoint::default();
+    let mut sz = CGSize::default();
+    // SAFETY: Verify both values are AXValueRef before unpacking CGPoint/CGSize.
+    unsafe {
+        let ax_val_ty = ffi::AXValueGetTypeID();
+        if ffi::CFGetTypeID(pos_val) != ax_val_ty || ffi::CFGetTypeID(size_val) != ax_val_ty {
+            return None;
+        }
+        if !ffi::AXValueGetValue(
+            pos_val,
+            K_AX_VALUE_CGPOINT_TYPE,
+            (&mut pt as *mut CGPoint).cast(),
+        ) || !ffi::AXValueGetValue(
+            size_val,
+            K_AX_VALUE_CGSIZE_TYPE,
+            (&mut sz as *mut CGSize).cast(),
+        ) {
+            return None;
+        }
+    }
+    Some(Rect {
+        x: pt.x,
+        y: pt.y,
+        width: sz.width,
+        height: sz.height,
+    })
+}
+
+/// Event-driven wait for an accessibility notification on `pid` (or the frontmost app),
+/// returning immediately when a UI change fires or once `timeout` / `stop` expires.
+pub fn wait_for_ui_event(pid: Option<u32>, timeout: Duration, stop: &AtomicBool) {
+    if timeout.is_zero() || stop.load(Ordering::Acquire) {
+        return;
+    }
+    if !crate::power::permissions().accessibility {
+        std::thread::sleep(timeout.min(Duration::from_millis(40)));
+        return;
+    }
+    let Some(target_pid) = pid
+        .and_then(|p| i32::try_from(p).ok())
+        .filter(|&p| p > 0)
+        .or_else(windows::frontmost_pid)
+    else {
+        std::thread::sleep(timeout.min(Duration::from_millis(40)));
+        return;
+    };
+
+    struct ObserverCtx {
+        run_loop: CFRunLoopRef,
+        triggered: AtomicBool,
+    }
+
+    unsafe extern "C" fn on_ax_event(
+        _observer: AXObserverRef,
+        _element: AXUIElementRef,
+        _notification: CFStringRef,
+        refcon: *mut c_void,
+    ) {
+        if refcon.is_null() {
+            return;
+        }
+        // SAFETY: `refcon` points to the stack-pinned `ObserverCtx` for the duration of
+        // `CFRunLoopRunInMode` on this exact thread; source is removed before `ctx` drops.
+        let ctx = unsafe { &*(refcon.cast::<ObserverCtx>()) };
+        ctx.triggered.store(true, Ordering::Release);
+        unsafe {
+            ffi::CFRunLoopStop(ctx.run_loop);
+        }
+    }
+
+    let mut raw_obs: AXObserverRef = ptr::null_mut();
+    // SAFETY: `on_ax_event` matches `AXObserverCallback`; `raw_obs` receives a +1 AXObserverRef.
+    let err = unsafe { ffi::AXObserverCreate(target_pid, on_ax_event, &mut raw_obs) };
+    let Some(observer) = (err == K_AX_ERROR_SUCCESS)
+        .then(|| unsafe { CfOwned::from_owned(raw_obs.cast_const()) })
+        .flatten()
+    else {
+        std::thread::sleep(timeout.min(Duration::from_millis(40)));
+        return;
+    };
+
+    // SAFETY: `CFRunLoopGetCurrent()` returns the current thread's non-null run loop.
+    let run_loop = unsafe { ffi::CFRunLoopGetCurrent() };
+    let mut ctx = ObserverCtx {
+        run_loop,
+        triggered: AtomicBool::new(false),
+    };
+    let refcon = (&mut ctx as *mut ObserverCtx).cast::<c_void>();
+
+    let app_el = AxElement::application(target_pid);
+    const NOTIFICATIONS: &[&str] = &[
+        "AXCreated",
+        "AXUIElementDestroyed",
+        "AXTitleChanged",
+        "AXValueChanged",
+        "AXFocusedWindowChanged",
+        "AXFocusedUIElementChanged",
+        "AXWindowCreated",
+        "AXLayoutChanged",
+        "AXApplicationActivated",
+        "AXApplicationDeactivated",
+    ];
+    let mut added: Vec<CfOwned> = Vec::with_capacity(NOTIFICATIONS.len());
+    for &name in NOTIFICATIONS {
+        let cf_name = cf_string(name);
+        // SAFETY: `observer`, `app_el`, `cf_name`, and `refcon` are valid for the loop below.
+        let rc = unsafe {
+            ffi::AXObserverAddNotification(
+                observer.as_mut_ptr(),
+                app_el.as_raw(),
+                cf_name.as_ptr(),
+                refcon,
+            )
+        };
+        if rc == K_AX_ERROR_SUCCESS {
+            added.push(cf_name);
+        }
+    }
+
+    if added.is_empty() {
+        std::thread::sleep(timeout.min(Duration::from_millis(40)));
+        return;
+    }
+
+    // SAFETY: `observer` is valid and `source` is borrowed from it until `observer` drops.
+    let source = unsafe { ffi::AXObserverGetRunLoopSource(observer.as_mut_ptr()) };
+    if !source.is_null() {
+        // SAFETY: Attach source to current thread's run loop, run bounded stop-checkable slices,
+        // and always detach before returning so `refcon` cannot dangle.
+        unsafe {
+            ffi::CFRunLoopAddSource(run_loop, source, ffi::kCFRunLoopDefaultMode);
+        }
+        let deadline = Instant::now() + timeout;
+        while !ctx.triggered.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let slice = deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(50));
+            // SAFETY: Runs current thread's run loop in default mode, returning immediately when
+            // `on_ax_event` fires or `slice` elapses.
+            unsafe {
+                ffi::CFRunLoopRunInMode(ffi::kCFRunLoopDefaultMode, slice.as_secs_f64(), 1);
+            }
+        }
+        // SAFETY: Detach source before removing notifications and dropping `ctx`.
+        unsafe {
+            ffi::CFRunLoopRemoveSource(run_loop, source, ffi::kCFRunLoopDefaultMode);
+        }
+    }
+
+    for cf_name in &added {
+        // SAFETY: Matches every notification successfully registered above.
+        unsafe {
+            ffi::AXObserverRemoveNotification(
+                observer.as_mut_ptr(),
+                app_el.as_raw(),
+                cf_name.as_ptr(),
+            );
         }
     }
 }
@@ -423,11 +774,12 @@ pub fn take_snapshot(
     let app_el = AxElement::application(pid);
 
     // Enable manual accessibility for Chromium/Electron apps (safe no-op for native AppKit apps).
-    // On the first activation for a PID, allow a brief 60 ms settle so the renderer populates AXWebArea.
+    // On the first activation for a PID, poll briefly until Chromium populates its renderer tree
+    // (exiting early as soon as content appears instead of returning an empty chrome shell).
     let manual_ok = app_el.set_bool_true("AXManualAccessibility").is_ok();
     let _ = app_el.set_bool_true("AXEnhancedUserInterface");
     if manual_ok && store.mark_manual_ax_enabled(pid) {
-        std::thread::sleep(Duration::from_millis(60));
+        wait_for_electron_ax_ready(&app_el, window_title.as_deref(), Duration::from_millis(260));
     }
 
     // Pick the best AX window: match by title if specified, else focused/main/first window.
@@ -478,6 +830,47 @@ fn pick_primary_window(wins: &[WindowInfo], pid: Option<u32>) -> Option<&WindowI
     wins.iter().find(|w| w.layer == 0).or_else(|| wins.first())
 }
 
+fn wait_for_electron_ax_ready(app_el: &AxElement, title: Option<&str>, max_wait: Duration) {
+    let deadline = Instant::now() + max_wait;
+    loop {
+        if let Some(win) = pick_ax_window(app_el, title)
+            && window_has_populated_content(&win)
+        {
+            return;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let step = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(25));
+        std::thread::sleep(step);
+    }
+}
+
+/// Returns true once a window's AX tree has populated beyond bare window-chrome buttons
+/// (e.g., an `AXWebArea` or populated container subtree inside an Electron/Chromium window).
+fn window_has_populated_content(win: &AxElement) -> bool {
+    let children = win.element_array_attr("AXChildren");
+    if children.len() > 6 {
+        return true;
+    }
+    for child in &children {
+        let role = child.string_attr("AXRole").unwrap_or_default();
+        if role == "AXWebArea" {
+            return true;
+        }
+        if matches!(role.as_str(), "AXGroup" | "AXSplitGroup" | "AXScrollArea") {
+            let grand = child.element_array_attr("AXChildren");
+            if !grand.is_empty() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn pick_ax_window(app_el: &AxElement, title: Option<&str>) -> Option<AxElement> {
     if let Some(t) = title
         && !t.is_empty()
@@ -526,6 +919,7 @@ fn build_snapshot_from_root(
     };
 
     let mut builder = SnapshotWalkBuilder::new(root_el, WalkBudget::new(max_depth, max_nodes));
+    let fetch_bounds = params.include_bounds;
 
     while let Some(pending) = builder.next_pending() {
         if Instant::now() >= deadline {
@@ -535,72 +929,69 @@ fn build_snapshot_from_root(
         let (el, meta) = pending.into_parts();
         let depth = meta.depth();
 
-        let raw_role = el.string_attr("AXRole").unwrap_or_default();
-        let raw_subrole = el.string_attr("AXSubrole");
-        let role = normalize_role(&raw_role);
-        let subrole = raw_subrole
+        // Single batched IPC call for all scalar attributes (skipping AXPosition/AXSize unless requested).
+        let attrs = el.read_node_attrs(fetch_bounds);
+        let role = normalize_role(&attrs.raw_role);
+        let subrole = attrs
+            .raw_subrole
             .as_deref()
             .map(normalize_subrole)
             .filter(|s| !s.is_empty());
 
-        let title = el.string_attr("AXTitle").filter(|s| !s.trim().is_empty());
-        let label = el
-            .string_attr("AXDescription")
-            .or_else(|| el.string_attr("AXHelp"))
-            .filter(|s| !s.trim().is_empty());
-
-        let is_secure =
-            raw_subrole.as_deref() == Some("AXSecureTextField") || raw_role == "AXSecureTextField";
+        let is_secure = attrs.raw_subrole.as_deref() == Some("AXSecureTextField")
+            || attrs.raw_role == "AXSecureTextField";
         let value = if is_secure && redact_passwords {
             Some("[REDACTED]".into())
         } else {
-            el.string_attr("AXValue").filter(|s| !s.is_empty())
+            attrs.value
         };
 
-        let focused = el.bool_attr("AXFocused").unwrap_or(false);
-        let selected = el.bool_attr("AXSelected").unwrap_or(false);
         let actions = map_actions(&el.action_names(), &role);
 
         let decorative = is_decorative_container(
             depth,
             &role,
-            title.as_deref(),
-            label.as_deref(),
+            attrs.title.as_deref(),
+            attrs.label.as_deref(),
             value.as_deref(),
-            focused,
-            selected,
+            attrs.focused,
+            attrs.selected,
             &actions,
         );
 
-        // Skip geometry/enabled IPC round-trips on anonymous decorative containers that will be flattened.
         let (bounds, enabled, live_ref) = if decorative {
             (None, true, None)
         } else {
-            let bounds = if depth == 0 {
-                root_bounds.or_else(|| el.bounds())
+            let bounds = if fetch_bounds {
+                if depth == 0 {
+                    root_bounds.or(attrs.bounds)
+                } else {
+                    attrs.bounds
+                }
+            } else if depth == 0 {
+                root_bounds
             } else {
-                el.bounds()
+                None
             };
-            let enabled = el.bool_attr("AXEnabled").unwrap_or(true);
             let live = LiveRef {
                 element: el.clone(),
                 app: app.clone(),
                 window_id,
                 actions: actions.clone(),
             };
-            (bounds, enabled, Some(live))
+            (bounds, attrs.enabled, Some(live))
         };
 
         let data = AxNodeData {
             role,
             subrole,
-            title,
-            label,
+            title: attrs.title,
+            label: attrs.label,
             value,
             bounds,
             enabled,
-            focused,
-            selected,
+            focused: attrs.focused,
+            selected: attrs.selected,
             actions,
         };
 
@@ -832,5 +1223,35 @@ pub fn read_text(
                 source: ref_id.unwrap_or("focused").into(),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batched_node_attrs_skips_bounds_when_not_requested_and_observer_respects_stop() {
+        let stop = AtomicBool::new(true);
+        let t0 = Instant::now();
+        wait_for_ui_event(Some(1), Duration::from_millis(200), &stop);
+        assert!(
+            t0.elapsed() < Duration::from_millis(50),
+            "wait_for_ui_event must return immediately when stop_flag is set"
+        );
+
+        if !crate::power::permissions().accessibility {
+            return;
+        }
+        let Some(finder) = windows::find_app("Finder").and_then(|a| a.pid) else {
+            return;
+        };
+        let app_el = AxElement::application(finder as i32);
+        let without_bounds = app_el.read_node_attrs(false);
+        assert_eq!(without_bounds.raw_role, "AXApplication");
+        assert!(without_bounds.bounds.is_none());
+
+        let with_bounds = app_el.read_node_attrs(true);
+        assert_eq!(with_bounds.raw_role, "AXApplication");
     }
 }

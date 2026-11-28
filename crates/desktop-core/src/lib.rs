@@ -12,10 +12,10 @@ pub mod mock;
 pub mod policy;
 pub mod tree;
 
-pub use annotate::draw_annotations_rgba;
+pub use annotate::{draw_annotations_bgra, draw_annotations_rgba};
 pub use audit::AuditLog;
 pub use backend::{
-    AnnotateBox, PlatformBackend, RawScreenshot, ResolvedRef, StepExecInfo, Timestamp,
+    AnnotateBox, PlatformBackend, RawScreenshot, ResolvedRef, StepExecInfo, Timestamp, VisualSample,
 };
 pub use clock::{Clock, SystemClock};
 pub use engine::{DesktopEngine, EXPLICIT_STOP_COOLDOWN_SECS};

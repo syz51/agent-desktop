@@ -21,10 +21,11 @@ mod windows;
 mod macos_backend {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
 
     use desktop_core::{
         AnnotateBox, EscKillSwitch, PlatformBackend, RawScreenshot, ResolvedRef, StepExecInfo,
-        Timestamp,
+        Timestamp, VisualSample,
     };
     use desktop_proto::{
         AppInfo, ClickMode, DisplayInfo, FocusMode, ImageFormat, KeyCombo, Modifiers, MouseButton,
@@ -42,7 +43,7 @@ mod macos_backend {
         stop_flag: Arc<AtomicBool>,
         refs: ax::AxRefStore,
         awake: power::DisplayAwakeGuard,
-        stream: stream::WarmDisplayStream,
+        stream: stream::WarmCaptureStream,
         ui: Option<UiHandle>,
     }
 
@@ -56,7 +57,7 @@ mod macos_backend {
                 stop_flag,
                 refs: ax::AxRefStore::new(),
                 awake: power::DisplayAwakeGuard::new(),
-                stream: stream::WarmDisplayStream::new(),
+                stream: stream::WarmCaptureStream::new(),
                 ui: Some(ui),
             }
         }
@@ -74,7 +75,7 @@ mod macos_backend {
                 stop_flag,
                 refs: ax::AxRefStore::new(),
                 awake: power::DisplayAwakeGuard::new(),
-                stream: stream::WarmDisplayStream::new(),
+                stream: stream::WarmCaptureStream::new(),
                 ui: None,
             }
         }
@@ -197,6 +198,21 @@ mod macos_backend {
             capture::capture(&self.stream, target, format, annotate, focus_mode)
         }
 
+        fn capture_visual_signature(
+            &self,
+            target: &ScreenshotTarget,
+        ) -> Result<VisualSample, RpcError> {
+            capture::capture_visual_signature(&self.stream, target)
+        }
+
+        fn wait_for_ui_event(&self, pid: Option<u32>, timeout: Duration) {
+            ax::wait_for_ui_event(pid, timeout, &self.stop_flag);
+        }
+
+        fn wait_for_visual_frame(&self, target: &ScreenshotTarget, timeout: Duration) {
+            capture::wait_for_visual_frame(&self.stream, target, timeout, &self.stop_flag);
+        }
+
         fn click_ref(
             &self,
             ref_id: &str,
@@ -229,8 +245,12 @@ mod macos_backend {
             input::click_point(&self.stop_flag, point, button, count, mods, focus_mode)
         }
 
-        fn hover_point(&self, point: Point) -> Result<StepExecInfo, RpcError> {
-            input::hover_point(&self.stop_flag, point)
+        fn hover_point(
+            &self,
+            point: Point,
+            focus_mode: FocusMode,
+        ) -> Result<StepExecInfo, RpcError> {
+            input::hover_point(&self.stop_flag, point, focus_mode)
         }
 
         fn drag(
@@ -251,6 +271,23 @@ mod macos_backend {
             focus_mode: FocusMode,
         ) -> Result<StepExecInfo, RpcError> {
             input::scroll(&self.stop_flag, point, direction, amount, focus_mode)
+        }
+
+        fn scroll_ref(
+            &self,
+            ref_id: &str,
+            direction: ScrollDirection,
+            amount: u32,
+            focus_mode: FocusMode,
+        ) -> Result<StepExecInfo, RpcError> {
+            input::scroll_ref(
+                &self.refs,
+                &self.stop_flag,
+                ref_id,
+                direction,
+                amount,
+                focus_mode,
+            )
         }
 
         fn set_text(

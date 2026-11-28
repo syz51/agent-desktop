@@ -1,17 +1,29 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 
 /// UTC timestamp type used by `PlatformBackend` and `Clock`.
 pub type Timestamp = DateTime<Utc>;
 
 use desktop_proto::{
-    AppInfo, ClickMode, DisplayInfo, ElementAction, FocusMode, ImageFormat, KeyCombo, Modifiers,
-    MouseButton, PermissionsStatus, Point, ReadTextMode, ReadTextResult, Rect, RpcError,
+    AppInfo, ClickMode, DisplayInfo, ElementAction, ErrorCode, FocusMode, ImageFormat, KeyCombo,
+    Modifiers, MouseButton, PermissionsStatus, Point, ReadTextMode, ReadTextResult, Rect, RpcError,
     ScreenState, ScreenshotTarget, ScrollDirection, Snapshot, SnapshotParams, TextMethod,
     WindowInfo,
 };
+
+/// Lightweight visual sample used by `wait(visual_change)` to avoid full JPEG encoding and hashing
+/// when a backend can produce an 8x8 luma signature directly from raw pixels or a warm stream.
+#[derive(Debug, Clone)]
+pub struct VisualSample {
+    /// Short SHA-256 hex digest of raw/encoded bytes (used only as fallback when `visual_sig` is absent).
+    pub sha: Option<String>,
+    /// 8x8 area-averaged luma thumbnail computed directly from screen pixels.
+    pub visual_sig: Option<[u8; 64]>,
+}
 
 #[derive(Debug, Clone)]
 pub struct AnnotateBox {
@@ -106,6 +118,42 @@ pub trait PlatformBackend: Send + Sync {
         focus_mode: FocusMode,
     ) -> Result<RawScreenshot, RpcError>;
 
+    /// Capture only the lightweight 8x8 visual signature (avoiding JPEG encoding when possible)
+    /// for `wait(visual_change)` polling.
+    fn capture_visual_signature(
+        &self,
+        target: &ScreenshotTarget,
+    ) -> Result<VisualSample, RpcError> {
+        let raw = self.capture(target, ImageFormat::Jpeg, &[], FocusMode::Background)?;
+        let sha = if raw.visual_sig.is_none() {
+            let digest = Sha256::digest(&raw.bytes);
+            let mut hex = String::with_capacity(16);
+            for b in &digest[..8] {
+                use std::fmt::Write as _;
+                let _ = write!(hex, "{b:02x}");
+            }
+            Some(hex)
+        } else {
+            None
+        };
+        Ok(VisualSample {
+            sha,
+            visual_sig: raw.visual_sig,
+        })
+    }
+
+    /// Block up to `timeout` waiting for an OS UI/accessibility event on `pid` (if known),
+    /// returning early as soon as a relevant notification fires.
+    fn wait_for_ui_event(&self, _pid: Option<u32>, timeout: Duration) {
+        std::thread::sleep(timeout.min(Duration::from_millis(40)));
+    }
+
+    /// Block up to `timeout` waiting for a new frame on `target` (e.g. from a warm `SCStream`),
+    /// falling back to a short sleep when no live stream is active.
+    fn wait_for_visual_frame(&self, _target: &ScreenshotTarget, timeout: Duration) {
+        std::thread::sleep(timeout.min(Duration::from_millis(40)));
+    }
+
     fn click_ref(
         &self,
         ref_id: &str,
@@ -125,7 +173,7 @@ pub trait PlatformBackend: Send + Sync {
         focus_mode: FocusMode,
     ) -> Result<StepExecInfo, RpcError>;
 
-    fn hover_point(&self, point: Point) -> Result<StepExecInfo, RpcError>;
+    fn hover_point(&self, point: Point, focus_mode: FocusMode) -> Result<StepExecInfo, RpcError>;
 
     fn drag(
         &self,
@@ -142,6 +190,26 @@ pub trait PlatformBackend: Send + Sync {
         amount: u32,
         focus_mode: FocusMode,
     ) -> Result<StepExecInfo, RpcError>;
+
+    /// Scroll a semantic `@eN` target, preferring zero-cursor background AX scrolling when
+    /// supported and falling back to pointer scrolling at the element's live center.
+    fn scroll_ref(
+        &self,
+        ref_id: &str,
+        direction: ScrollDirection,
+        amount: u32,
+        focus_mode: FocusMode,
+    ) -> Result<StepExecInfo, RpcError> {
+        let resolved = self.resolve_ref(ref_id)?;
+        let bounds = resolved.bounds.filter(|b| !b.is_empty()).ok_or_else(|| {
+            RpcError::with_next(
+                ErrorCode::StaleRef,
+                format!("{ref_id} has no visible bounding box"),
+                "Take a fresh snapshot or scroll an explicit coordinate.",
+            )
+        })?;
+        self.scroll(bounds.center(), direction, amount, focus_mode)
+    }
 
     fn set_text(
         &self,
