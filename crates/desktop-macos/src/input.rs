@@ -167,6 +167,8 @@ impl Drop for FocusRestoreGuard {
                 )
             } {
                 apply_event_flags(&ev, Modifiers::default());
+                // SAFETY: `ev` is a valid retained CGEventRef; tagging `SYNTHETIC_MARK` and
+                // posting to `K_CG_HID_EVENT_TAP` restores the cursor without tripping the kill-switch.
                 unsafe {
                     ffi::CGEventSetIntegerValueField(
                         ev.as_mut_ptr(),
@@ -747,6 +749,13 @@ fn paste_with_clipboard_restore(stop: &AtomicBool, text: &str) -> Result<(), Rpc
     // SAFETY: `NSPasteboardTypeString` is valid and `ns_text` is a retained NSString.
     let ok = unsafe { pb.setString_forType(&ns_text, NSPasteboardTypeString) };
     if !ok {
+        if let Some(prev) = saved {
+            let ns_prev = NSString::from_str(&prev);
+            // SAFETY: `NSPasteboardTypeString` is a static AppKit constant and `ns_prev` is retained.
+            unsafe {
+                let _ = pb.setString_forType(&ns_prev, NSPasteboardTypeString);
+            }
+        }
         return type_unicode_chunks(stop, text);
     }
     let after_write_count = pb.changeCount();
@@ -775,6 +784,7 @@ fn paste_with_clipboard_restore(stop: &AtomicBool, text: &str) -> Result<(), Rpc
         let _ = pb.clearContents();
         if let Some(prev) = saved {
             let ns_prev = NSString::from_str(&prev);
+            // SAFETY: `NSPasteboardTypeString` is a static AppKit constant and `ns_prev` is retained.
             unsafe {
                 let _ = pb.setString_forType(&ns_prev, NSPasteboardTypeString);
             }
@@ -846,6 +856,7 @@ pub fn press_key_combo(
                 for down in [true, false] {
                     let ev = make_key(&src, code, down)?;
                     apply_event_flags(&ev, combo.modifiers);
+                    // SAFETY: `ev` is a valid retained CGEventRef; tag `SYNTHETIC_MARK` and post to `pid`.
                     unsafe {
                         ffi::CGEventSetIntegerValueField(
                             ev.as_mut_ptr(),

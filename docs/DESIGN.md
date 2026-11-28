@@ -14,7 +14,7 @@ Legacy single-process pixel-click MCP servers proved local macOS clicking works,
 | **Slow actions (~100–500 ms each)** | Spawns a fresh Swift `helper` process per call (twice per click: `scene` + `click`), cold-inits `SCShareableContent`, writes JPEG to disk, reads back in Bun | Persistent per-machine daemon over Unix domain socket; in-process AX/CG/SCKit, zero disk I/O for frames (**<15 ms** input, **<50–90 ms** capture/snapshot) |
 | **High token cost & fragile clicking** | Pixel-only: every turn sends a 1568 px JPEG (~1,000–1,600 vision tokens) and asks the model to guess `(x, y)` | **Hybrid Accessibility-tree-first + Vision fallback**: compact semantic `@eN` refs (~300–800 text tokens), exact targeting, optional Set-of-Marks annotated screenshots (`annotate: true`), window-scoped & region-cropped capture |
 | **Chatty 1-action-per-LLM-turn loops** | No batching or event waits; filling a form + submitting + checking result takes 4–6 LLM turns | **Atomic batched `act` pipelines** (`focus -> set_text -> key -> wait_until -> snapshot`) executed inside the daemon in **1 LLM turn** |
-| **Slow long text entry (~2 s for 3k chars)** | 16 UTF-16 char `CGEvent` chunks with 10 ms sleeps | Fastest tiered entry: `AXSetValue` (<5 ms) → save/restore clipboard paste (~35 ms for arbitrarily large text) → raw `CGEvent` for tiny ASCII or opt-in typing |
+| **Slow long text entry (~2 s for 3k chars)** | 16 UTF-16 char `CGEvent` chunks with 10 ms sleeps | Fastest tiered entry: `AXSetValue` (<5 ms) → save/restore clipboard paste (~150 ms settle for async Chromium/Electron paste reads, arbitrarily large text) → raw `CGEvent` for tiny ASCII or opt-in typing |
 | **Disruptive cursor hijacking** | Always moves the physical cursor via `CGEvent` | Semantic `AXPress` / `AXSetValue` executes without moving the pointer (and often without raising the window) when supported |
 | **Single local Mac only** | Stdio-only Bun process per session, macOS-only, PID lockfile | Fleet-aware: local UDS + **Tailscale-only peer RPC** (`host: "mac-a" | "mac-b" | "linux-box"`), plus `PlatformBackend` for Linux (Wayland/X11/headless) |
 | **Unwanted built-in app blocks** | Hardcoded `SENSITIVE_APPS` / `DIALOG_APPS` refusals and modal dialogs get in the owner's way | **Owner-responsible default (`open`)**: no hardcoded app blocks or forced dialogs; optional opt-in rules in `policy.toml` + instant physical Esc/Stop override |
@@ -157,7 +157,7 @@ sequenceDiagram
 | `hover` / `mouse_move` | `ref` or `{x, y}` | Moves pointer directly to live element center or pixel point. |
 | `drag` | `from`, `to` | Smooth interpolated drag with mid-step `AtomicBool` Stop check. |
 | `scroll` | `ref` or `{x, y}`, `direction`, `amount` | Line or pixel-smooth scrolling. |
-| `set_text` | `ref` (optional; defaults to focused), `text`, `replace`, `submit` | **1. `AXSetValue`** (<5 ms, instant, unfocused-capable) when supported and replacing/empty.<br>**2. Tiny ASCII (`<= 16` chars)**: raw `CGEvent` keystrokes (~10 ms, zero clipboard touch).<br>**3. Longer / multiline / Unicode text**: **save `NSPasteboard` → write UTF-8 → `Cmd/Ctrl+V` → restore pasteboard** (~35 ms even for 50 KB!).<br>Explicit `method: "type"` override available for apps that intercept paste. |
+| `set_text` | `ref` (optional; defaults to focused), `text`, `replace`, `submit` | **1. `AXSetValue`** (<5 ms, instant, unfocused-capable) when supported and replacing/empty.<br>**2. Tiny ASCII (`<= 16` chars)**: raw `CGEvent` keystrokes (~10 ms, zero clipboard touch).<br>**3. Longer / multiline / Unicode text**: **save `NSPasteboard` → write UTF-8 → `Cmd/Ctrl+V` → restore pasteboard** (~150 ms settle for async Chromium/Electron reads, arbitrarily large text!).<br>Explicit `method: "type"` override available for apps that intercept paste. |
 | `key` | `combo`, `repeat` | Portable combos (`mod+c` maps to `cmd+c` on macOS, `ctrl+c` on Linux; explicit `cmd`/`ctrl` also supported). |
 | `open_app` / `focus_window` | `app` or `window_id` | Launches/activates app or raises specific window. |
 | `menu` | `app`, `path: ["File", "Export", "PDF..."]` | Direct AX menu-bar traversal + `AXPress` (~10 ms, no cascading menu animation). |
@@ -299,7 +299,7 @@ Behind the same `PlatformBackend` trait:
 | `snapshot` (AX tree, 250 nodes) | N/A | **30–80 ms** | **45–100 ms** |
 | `screenshot` (window WebP/JPEG) | ~250–500 ms (full display + disk) | **40–80 ms** | **70–130 ms** |
 | Single `click` | ~100–180 ms (2 process spawns) | **< 15 ms** | **< 30 ms** |
-| `set_text` (3,000 chars) | ~2,000 ms (chunked CGEvent) | **< 5 ms** (AX) / **~35 ms** (paste) | **< 55 ms** |
+| `set_text` (3,000 chars) | ~2,000 ms (chunked CGEvent) | **< 5 ms** (AX) / **~150 ms** (paste) | **< 175 ms** |
 | 5-step form fill + submit + verify | 5 LLM turns + ~2.5 s tool time | **1 LLM turn** + ~120 ms tool time | **1 LLM turn** + ~180 ms |
 
 ---

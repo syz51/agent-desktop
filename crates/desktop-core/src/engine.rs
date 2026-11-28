@@ -385,16 +385,11 @@ impl DesktopEngine {
                 let resolved_app = self.ensure_app_allowed_by_query(&params.app, &policy)?;
                 let detail = self.backend.menu(&params.app, &params.path)?;
                 self.invalidate_frame_caches();
-                let update = if is_quit_or_close_menu(&params.path) {
-                    PostTargetUpdate::Clear
-                } else {
-                    let target_app = resolved_app
-                        .as_ref()
-                        .map(|info| app_target_key(info, &params.app))
-                        .unwrap_or_else(|| params.app.clone());
-                    PostTargetUpdate::Set(ActPostTarget::App(target_app))
-                };
-                self.apply_sticky_screenshot_target(update);
+                self.apply_sticky_screenshot_target(menu_post_target_update(
+                    resolved_app.as_ref(),
+                    &params.app,
+                    &params.path,
+                ));
                 Ok(RpcResult::Menu { detail })
             }
             RpcMethod::Wait(params) => {
@@ -1216,11 +1211,15 @@ impl DesktopEngine {
         match target {
             Some(ActPostTarget::Window(wid)) => {
                 if check_window_visible {
-                    let visible = self.backend.windows(None).ok().is_some_and(|wins| {
+                    // Reject windows known to be minimized/offscreen, while preserving floating
+                    // panels (`layer != 0`) that `windows(None)` may omit on macOS (closed windows
+                    // still fall back cleanly to display capture when `capture_screenshot` fails).
+                    let known_hidden = self.backend.windows(None).ok().is_some_and(|wins| {
                         wins.iter()
-                            .any(|w| w.id == *wid && w.on_screen && !w.minimized)
+                            .find(|w| w.id == *wid)
+                            .is_some_and(|w| !w.on_screen || w.minimized)
                     });
-                    visible.then_some(ActPostTarget::Window(*wid))
+                    (!known_hidden).then_some(ActPostTarget::Window(*wid))
                 } else {
                     Some(ActPostTarget::Window(*wid))
                 }
@@ -1683,15 +1682,7 @@ impl DesktopEngine {
                 let resolved_app = self.ensure_app_allowed_by_query(&app, policy)?;
                 let detail = self.backend.menu(&app, &path)?;
                 let mut run = StepRun::mutating(detail, true);
-                if is_quit_or_close_menu(&path) {
-                    run.post_target = PostTargetUpdate::Clear;
-                } else {
-                    let target_app = resolved_app
-                        .as_ref()
-                        .map(|info| app_target_key(info, &app))
-                        .unwrap_or_else(|| app.clone());
-                    run.post_target = PostTargetUpdate::Set(ActPostTarget::App(target_app));
-                }
+                run.post_target = menu_post_target_update(resolved_app.as_ref(), &app, &path);
                 Ok(run)
             }
             ActionStep::ReadText {
@@ -1970,6 +1961,21 @@ fn post_target_from_resolved(resolved: &crate::backend::ResolvedRef) -> Option<A
     }
     let key = app_target_key(&resolved.app, "");
     (!key.trim().is_empty()).then_some(ActPostTarget::App(key))
+}
+
+fn menu_post_target_update(
+    resolved_app: Option<&AppInfo>,
+    app_query: &str,
+    path: &[String],
+) -> PostTargetUpdate {
+    if is_quit_or_close_menu(path) {
+        PostTargetUpdate::Clear
+    } else {
+        let target_app = resolved_app
+            .map(|info| app_target_key(info, app_query))
+            .unwrap_or_else(|| app_query.to_string());
+        PostTargetUpdate::Set(ActPostTarget::App(target_app))
+    }
 }
 
 fn is_quit_or_close_menu(path: &[String]) -> bool {

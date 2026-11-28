@@ -872,15 +872,19 @@ pub fn take_snapshot(
     let app_el = AxElement::application(pid);
 
     // Enable manual accessibility for Chromium/Electron apps (safe no-op for native AppKit apps).
-    // Native AppKit apps also accept `AXEnhancedUserInterface` and never expose `AXWebArea`, so
-    // only poll for web-engine readiness when `AXManualAccessibility` succeeds OR `enhanced_ok`
-    // matches a Chromium/Electron/CEF bundle.
+    // Check per-PID readiness state first so native AppKit apps and already-ready web engines do
+    // not re-scan `<App>.app/Contents/Frameworks` on every snapshot/find/wait call.
     let manual_ok = app_el.set_bool_true("AXManualAccessibility").is_ok();
     let enhanced_ok = app_el.set_bool_true("AXEnhancedUserInterface").is_ok();
-    if (manual_ok || (enhanced_ok && is_web_engine_app(&app))) && store.should_wait_for_web_ax(pid)
-    {
-        let ready = wait_for_web_ax_ready(&app_el, window_title.as_deref(), WEB_AX_READY_MAX_WAIT);
-        store.record_web_ax_wait_outcome(pid, ready);
+    if store.should_wait_for_web_ax(pid) {
+        if manual_ok || (enhanced_ok && is_web_engine_app(&app)) {
+            let ready =
+                wait_for_web_ax_ready(&app_el, window_title.as_deref(), WEB_AX_READY_MAX_WAIT);
+            store.record_web_ax_wait_outcome(pid, ready);
+        } else {
+            // Native non-web AppKit process: mark settled once so future snapshots skip disk checks.
+            store.record_web_ax_wait_outcome(pid, true);
+        }
     }
 
     // Pick the best AX window: match by title if specified, else focused/main/first window.
@@ -989,7 +993,7 @@ fn wait_for_web_ax_ready(app_el: &AxElement, title: Option<&str>, max_wait: Dura
     let deadline = Instant::now() + max_wait;
     loop {
         if let Some(win) = pick_ax_window(app_el, title)
-            && window_has_populated_web_area(&win)
+            && window_has_populated_web_area(&win, deadline)
         {
             return true;
         }
@@ -1006,27 +1010,35 @@ fn wait_for_web_ax_ready(app_el: &AxElement, title: Option<&str>, max_wait: Dura
 
 /// Returns `true` once a Chromium/Electron window contains a populated `AXWebArea` subtree.
 ///
-/// Uses a bounded BFS restricted to structural containers so browser chrome (toolbars, tab bars,
-/// window buttons) never triggers a false-positive ready result before the renderer attaches.
-fn window_has_populated_web_area(win: &AxElement) -> bool {
+/// Uses a bounded BFS restricted to structural containers (excluding `AXTabGroup` and toolbars)
+/// and checks `deadline` mid-walk so large tab strips or slow cold-starting renderers never starve
+/// discovery or overrun `WEB_AX_READY_MAX_WAIT`.
+fn window_has_populated_web_area(win: &AxElement, deadline: Instant) -> bool {
     window_has_populated_web_area_with(
         win.clone(),
         |el| el.string_attr("AXRole").unwrap_or_default(),
         |el| el.element_array_attr("AXChildren"),
+        || Instant::now() >= deadline,
     )
 }
 
-fn window_has_populated_web_area_with<N, F, G>(root: N, mut role_of: F, mut children_of: G) -> bool
+fn window_has_populated_web_area_with<N, F, G, D>(
+    root: N,
+    mut role_of: F,
+    mut children_of: G,
+    mut is_past_deadline: D,
+) -> bool
 where
     F: FnMut(&N) -> String,
     G: FnMut(&N) -> Vec<N>,
+    D: FnMut() -> bool,
 {
     let mut queue = VecDeque::new();
     queue.push_back((root, 0usize));
     let mut visited = 0usize;
 
     while let Some((node, depth)) = queue.pop_front() {
-        if visited >= WEB_AX_PROBE_MAX_NODES {
+        if visited >= WEB_AX_PROBE_MAX_NODES || is_past_deadline() {
             break;
         }
         visited += 1;
@@ -1039,10 +1051,12 @@ where
             continue;
         }
 
+        // Descend only through content containers; skip `AXTabGroup` and `AXToolbar` so dozens of
+        // browser tabs or bookmark buttons cannot exhaust `WEB_AX_PROBE_MAX_NODES`.
         let descend = depth == 0
             || matches!(
                 role.as_str(),
-                "AXGroup" | "AXSplitGroup" | "AXScrollArea" | "AXTabGroup" | "AXUnknown"
+                "AXGroup" | "AXSplitGroup" | "AXScrollArea" | "AXUnknown"
             );
         if descend && depth < WEB_AX_PROBE_MAX_DEPTH {
             for child in children_of(&node) {
@@ -1638,6 +1652,7 @@ mod tests {
                 chrome_only.clone(),
                 |n| n.role.to_string(),
                 |n| n.children.clone(),
+                || false,
             ),
             "chrome-only browser window with >6 children must not short-circuit as ready"
         );
@@ -1656,13 +1671,27 @@ mod tests {
                 empty_webarea,
                 |n| n.role.to_string(),
                 |n| n.children.clone(),
+                || false,
             ),
             "empty placeholder AXWebArea must not short-circuit as ready"
         );
 
-        // Nested populated AXWebArea inside AXGroup -> AXScrollArea -> AXWebArea is ready.
-        let mut populated = chrome_only;
-        populated.children.push(FakeNode {
+        // Large tab strip (120 tabs under AXTabGroup) before the content container must not starve
+        // discovery of a populated AXWebArea.
+        let mut many_tabs = chrome_only;
+        many_tabs.children.insert(
+            0,
+            FakeNode {
+                role: "AXTabGroup",
+                children: (0..120)
+                    .map(|_| FakeNode {
+                        role: "AXRadioButton",
+                        children: vec![],
+                    })
+                    .collect(),
+            },
+        );
+        many_tabs.children.push(FakeNode {
             role: "AXGroup",
             children: vec![FakeNode {
                 role: "AXScrollArea",
@@ -1676,9 +1705,18 @@ mod tests {
             }],
         });
         assert!(window_has_populated_web_area_with(
-            populated,
+            many_tabs.clone(),
             |n| n.role.to_string(),
             |n| n.children.clone(),
+            || false,
+        ));
+
+        // Exceeded deadline stops the BFS cleanly.
+        assert!(!window_has_populated_web_area_with(
+            many_tabs,
+            |n| n.role.to_string(),
+            |n| n.children.clone(),
+            || true,
         ));
     }
 
