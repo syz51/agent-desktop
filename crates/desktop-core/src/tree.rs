@@ -51,8 +51,9 @@ impl WalkBudget {
     }
 }
 
-/// Returns true for anonymous structural wrappers (e.g. Chromium/Electron `<div>` `AXGroup`s)
-/// that carry no semantic label/value/state and should be flattened while keeping descendants.
+/// Returns true for anonymous structural wrappers (e.g. Chromium/Electron `<div>` `AXGroup`s
+/// and table/outline `AXCell` wrappers) that carry no semantic label/value/state and should be
+/// flattened while keeping descendants.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn is_decorative_container(
@@ -77,11 +78,19 @@ pub fn is_decorative_container(
     depth > 0
         && matches!(
             role,
-            "group" | "generic" | "scrollarea" | "splitgroup" | "panel" | "filler" | "unknown"
+            "group"
+                | "generic"
+                | "scrollarea"
+                | "splitgroup"
+                | "panel"
+                | "filler"
+                | "unknown"
+                | "cell"
+                | "table_cell"
         )
-        && title.is_none()
-        && label.is_none()
-        && value.is_none()
+        && title.is_none_or(|s| s.trim().is_empty())
+        && label.is_none_or(|s| s.trim().is_empty())
+        && value.is_none_or(str::is_empty)
         && !focused
         && !selected
         && (actions.is_empty() || only_generic_container_actions)
@@ -2409,5 +2418,283 @@ mod tests {
         let mut nodes = Vec::new();
         collect_titles(&snap.root, &mut nodes);
         assert_eq!(out.refs.len(), nodes.len());
+    }
+
+    #[test]
+    fn flattens_anonymous_table_cells_while_preserving_descendants_and_semantic_cells() {
+        let mut next_id = 1usize;
+        let mut alloc = || {
+            let id = next_id;
+            next_id += 1;
+            id
+        };
+
+        // 32 Finder-style rows x 4 anonymous cell wrappers (128 cells) would exceed a 250-node
+        // budget if cells were emitted, but flattening empty anonymous cells keeps all rows and
+        // interactive/text descendants without truncation.
+        let mut rows = Vec::new();
+        for i in 0..32 {
+            let y = 80.0 + (i as f64) * 22.0;
+            let name_field = FakeAxNode {
+                id: alloc(),
+                data: AxNodeData {
+                    role: "textfield".into(),
+                    subrole: None,
+                    title: None,
+                    label: None,
+                    value: Some(format!("file-{i}.rs")),
+                    bounds: Some(rect(40.0, y, 180.0, 18.0)),
+                    enabled: true,
+                    focused: false,
+                    selected: false,
+                    actions: vec![ElementAction::SetValue, ElementAction::ShowMenu],
+                },
+                children: vec![],
+            };
+            let date_text = FakeAxNode {
+                id: alloc(),
+                data: AxNodeData {
+                    role: "text".into(),
+                    subrole: None,
+                    title: None,
+                    label: None,
+                    value: Some("Today".into()),
+                    bounds: Some(rect(230.0, y, 90.0, 18.0)),
+                    enabled: true,
+                    focused: false,
+                    selected: false,
+                    actions: vec![ElementAction::ShowMenu],
+                },
+                children: vec![],
+            };
+            let size_text = FakeAxNode {
+                id: alloc(),
+                data: AxNodeData {
+                    role: "text".into(),
+                    subrole: None,
+                    title: None,
+                    label: None,
+                    value: Some(format!("{i} KB")),
+                    bounds: Some(rect(330.0, y, 60.0, 18.0)),
+                    enabled: true,
+                    focused: false,
+                    selected: false,
+                    actions: vec![],
+                },
+                children: vec![],
+            };
+            let name_cell = FakeAxNode {
+                id: alloc(),
+                data: make_ax(
+                    "cell",
+                    None,
+                    Some(rect(20.0, y, 200.0, 20.0)),
+                    vec![ElementAction::ShowMenu, ElementAction::Press],
+                ),
+                children: vec![name_field],
+            };
+            let date_cell = FakeAxNode {
+                id: alloc(),
+                data: make_ax(
+                    "cell",
+                    None,
+                    Some(rect(225.0, y, 100.0, 20.0)),
+                    vec![ElementAction::ShowMenu],
+                ),
+                children: vec![date_text],
+            };
+            let size_cell = FakeAxNode {
+                id: alloc(),
+                data: make_ax(
+                    if i % 2 == 0 { "cell" } else { "table_cell" },
+                    None,
+                    Some(rect(325.0, y, 70.0, 20.0)),
+                    vec![],
+                ),
+                children: vec![size_text],
+            };
+            let empty_cell = FakeAxNode {
+                id: alloc(),
+                data: AxNodeData {
+                    role: "cell".into(),
+                    subrole: None,
+                    title: Some("   ".into()),
+                    label: Some(String::new()),
+                    value: Some(String::new()),
+                    bounds: Some(rect(400.0, y, 40.0, 20.0)),
+                    enabled: true,
+                    focused: false,
+                    selected: false,
+                    actions: vec![ElementAction::ShowMenu],
+                },
+                children: vec![],
+            };
+            rows.push(FakeAxNode {
+                id: alloc(),
+                data: make_ax(
+                    "row",
+                    None,
+                    Some(rect(16.0, y, 430.0, 20.0)),
+                    vec![ElementAction::Press],
+                ),
+                children: vec![name_cell, date_cell, size_cell, empty_cell],
+            });
+        }
+
+        // Semantic cells that carry label/value/state/explicit input action MUST be kept.
+        let semantic_row = FakeAxNode {
+            id: alloc(),
+            data: make_ax("row", Some("Special"), None, vec![]),
+            children: vec![
+                FakeAxNode {
+                    id: alloc(),
+                    data: make_ax("cell", Some("Titled Cell"), None, vec![]),
+                    children: vec![],
+                },
+                FakeAxNode {
+                    id: alloc(),
+                    data: AxNodeData {
+                        role: "cell".into(),
+                        subrole: None,
+                        title: None,
+                        label: Some("Labeled Cell".into()),
+                        value: None,
+                        bounds: None,
+                        enabled: true,
+                        focused: false,
+                        selected: false,
+                        actions: vec![],
+                    },
+                    children: vec![],
+                },
+                FakeAxNode {
+                    id: alloc(),
+                    data: AxNodeData {
+                        role: "cell".into(),
+                        subrole: None,
+                        title: None,
+                        label: None,
+                        value: Some("Valued Cell".into()),
+                        bounds: None,
+                        enabled: true,
+                        focused: false,
+                        selected: false,
+                        actions: vec![],
+                    },
+                    children: vec![],
+                },
+                FakeAxNode {
+                    id: alloc(),
+                    data: AxNodeData {
+                        role: "cell".into(),
+                        subrole: None,
+                        title: None,
+                        label: None,
+                        value: None,
+                        bounds: None,
+                        enabled: true,
+                        focused: true,
+                        selected: false,
+                        actions: vec![],
+                    },
+                    children: vec![],
+                },
+                FakeAxNode {
+                    id: alloc(),
+                    data: AxNodeData {
+                        role: "cell".into(),
+                        subrole: None,
+                        title: None,
+                        label: None,
+                        value: None,
+                        bounds: None,
+                        enabled: true,
+                        focused: false,
+                        selected: true,
+                        actions: vec![],
+                    },
+                    children: vec![],
+                },
+                FakeAxNode {
+                    id: alloc(),
+                    data: make_ax("cell", None, None, vec![ElementAction::SetValue]),
+                    children: vec![],
+                },
+            ],
+        };
+        rows.push(semantic_row);
+
+        let root = FakeAxNode {
+            id: alloc(),
+            data: make_ax(
+                "window",
+                Some("Finder"),
+                Some(rect(0.0, 0.0, 900.0, 800.0)),
+                vec![ElementAction::Raise],
+            ),
+            children: vec![FakeAxNode {
+                id: alloc(),
+                data: make_ax("tree", Some("List View"), None, vec![]),
+                children: rows,
+            }],
+        };
+
+        // Depth-0 cell root must never be treated as decorative.
+        assert!(!is_decorative_container(
+            0,
+            "cell",
+            None,
+            None,
+            None,
+            false,
+            false,
+            &[],
+        ));
+
+        let out = walk_fake_tree(root, WalkBudget::new(12, 250));
+        assert!(
+            !out.truncated,
+            "flattening 128 anonymous cells should keep 32-row Finder table under 250-node budget (emitted={})",
+            out.emitted_nodes
+        );
+
+        let tree_node = &out.root.children[0];
+        assert_eq!(tree_node.role, "tree");
+        assert_eq!(tree_node.children.len(), 33);
+
+        // First 32 rows should have their textfield + 2 text descendants directly lifted (no cell wrappers).
+        for (i, row) in tree_node.children[..32].iter().enumerate() {
+            assert_eq!(row.role, "row");
+            assert_eq!(
+                row.children.len(),
+                3,
+                "row {i} should lift textfield + 2 text nodes and drop empty cell"
+            );
+            assert_eq!(row.children[0].role, "textfield");
+            assert_eq!(
+                row.children[0].value.as_deref(),
+                Some(format!("file-{i}.rs").as_str())
+            );
+            assert_eq!(row.children[1].role, "text");
+            assert_eq!(row.children[1].value.as_deref(), Some("Today"));
+            assert_eq!(row.children[2].role, "text");
+            assert_eq!(
+                row.children[2].value.as_deref(),
+                Some(format!("{i} KB").as_str())
+            );
+            assert!(out.refs.contains_key(&row.children[0].ref_id));
+        }
+
+        // Semantic cells in the final row must all survive intact.
+        let special = &tree_node.children[32];
+        assert_eq!(special.title.as_deref(), Some("Special"));
+        assert_eq!(special.children.len(), 6);
+        assert!(special.children.iter().all(|c| c.role == "cell"));
+        assert_eq!(special.children[0].title.as_deref(), Some("Titled Cell"));
+        assert_eq!(special.children[1].label.as_deref(), Some("Labeled Cell"));
+        assert_eq!(special.children[2].value.as_deref(), Some("Valued Cell"));
+        assert!(special.children[3].focused);
+        assert!(special.children[4].selected);
+        assert_eq!(special.children[5].actions, vec![ElementAction::SetValue]);
     }
 }

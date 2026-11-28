@@ -436,9 +436,20 @@ fn offline_mcp_token_budgets_stay_under_ceilings() {
         schema.instructions_bytes
     );
     assert!(
-        schema.tools_total_bytes < 7_500,
-        "tools/list={} B exceeded 7500 B",
+        schema.tools_total_bytes < 6_700,
+        "tools/list={} B exceeded 6700 B",
         schema.tools_total_bytes
+    );
+    let act_metric = schema
+        .tools
+        .iter()
+        .find(|t| t.name == "act")
+        .expect("act tool present in schema profile");
+    // Baseline act schema was 3,015 B; >= 25% reduction requires <= 2,261 B.
+    assert!(
+        act_metric.total_bytes <= 2_260,
+        "act schema={} B exceeded 2260 B (>= 25% reduction from 3015 B baseline)",
+        act_metric.total_bytes
     );
 
     // Verify snapshot anatomy handles escaped quotes accurately.
@@ -592,4 +603,188 @@ fn offline_mcp_token_budgets_stay_under_ceilings() {
     let huge = "x".repeat(MAX_READ_TEXT_CHARS + 500);
     let capped = truncate_read_text(huge, MAX_READ_TEXT_CHARS);
     assert!(capped.contains("[truncated 500 chars]"));
+}
+
+#[test]
+fn finder_table_snapshot_flattens_anonymous_cells_without_truncation() {
+    let mut next_id = 1usize;
+    let mut id = || {
+        let cur = next_id;
+        next_id += 1;
+        cur
+    };
+
+    // Simulate a 32-row Finder list view with 110+ anonymous AXCell wrappers.
+    let mut rows = Vec::new();
+    for i in 0..32 {
+        let y = 100.0 + (i as f64) * 20.0;
+        let name_cell = SynthNode {
+            id: id(),
+            data: ax(
+                "cell",
+                None,
+                None,
+                rect(20.0, y, 220.0, 20.0),
+                vec![ElementAction::ShowMenu],
+            ),
+            children: vec![SynthNode {
+                id: id(),
+                data: ax(
+                    "textfield",
+                    None,
+                    Some(&format!("Document-{i}.pdf")),
+                    rect(36.0, y + 2.0, 190.0, 16.0),
+                    vec![ElementAction::SetValue, ElementAction::ShowMenu],
+                ),
+                children: vec![],
+            }],
+        };
+        let date_cell = SynthNode {
+            id: id(),
+            data: ax(
+                "cell",
+                None,
+                None,
+                rect(240.0, y, 120.0, 20.0),
+                vec![ElementAction::ShowMenu],
+            ),
+            children: vec![SynthNode {
+                id: id(),
+                data: ax(
+                    "text",
+                    None,
+                    Some("Today at 10:00"),
+                    rect(244.0, y + 2.0, 110.0, 16.0),
+                    vec![ElementAction::ShowMenu],
+                ),
+                children: vec![],
+            }],
+        };
+        let size_cell = SynthNode {
+            id: id(),
+            data: ax(
+                "cell",
+                None,
+                None,
+                rect(360.0, y, 80.0, 20.0),
+                vec![ElementAction::ShowMenu],
+            ),
+            children: vec![SynthNode {
+                id: id(),
+                data: ax(
+                    "text",
+                    None,
+                    Some(&format!("{i} KB")),
+                    rect(364.0, y + 2.0, 70.0, 16.0),
+                    vec![],
+                ),
+                children: vec![],
+            }],
+        };
+        let empty_kind_cell = SynthNode {
+            id: id(),
+            data: ax("cell", None, None, rect(440.0, y, 80.0, 20.0), vec![]),
+            children: vec![],
+        };
+        rows.push(SynthNode {
+            id: id(),
+            data: ax(
+                "row",
+                None,
+                None,
+                rect(16.0, y, 504.0, 20.0),
+                vec![ElementAction::Press],
+            ),
+            children: vec![name_cell, date_cell, size_cell, empty_kind_cell],
+        });
+    }
+
+    let root = SynthNode {
+        id: id(),
+        data: ax(
+            "window",
+            Some("Finder"),
+            None,
+            rect(0.0, 0.0, 900.0, 800.0),
+            vec![ElementAction::Raise],
+        ),
+        children: vec![SynthNode {
+            id: id(),
+            data: ax(
+                "tree",
+                Some("List View"),
+                None,
+                rect(0.0, 60.0, 900.0, 740.0),
+                vec![],
+            ),
+            children: rows,
+        }],
+    };
+
+    let fallback = UiNode {
+        ref_id: "@e1".into(),
+        role: "window".into(),
+        subrole: None,
+        title: Some("Finder".into()),
+        label: None,
+        value: None,
+        bounds: Some(rect(0.0, 0.0, 900.0, 800.0)),
+        enabled: true,
+        focused: false,
+        selected: false,
+        actions: vec![],
+        children: vec![],
+    };
+
+    let mut builder = SnapshotWalkBuilder::new(root, WalkBudget::new(12, 250));
+    while let Some(pending) = builder.next_pending() {
+        let (node, meta) = pending.into_parts();
+        let depth = meta.depth();
+        let children = node.children;
+        match builder.record_node(meta, node.data, Some(node.id)) {
+            RecordOutcome::Expand(idx) => builder.enqueue_children(idx, depth + 1, children),
+            RecordOutcome::CheckChildrenForTruncation => {
+                if !children.is_empty() {
+                    builder.mark_truncated();
+                }
+            }
+            RecordOutcome::Done => {}
+        }
+    }
+    let out = builder.finish(fallback);
+    let snap = Snapshot {
+        snapshot_id: "s-finder".into(),
+        app: AppInfo {
+            name: "Finder".into(),
+            bundle_id: Some("com.apple.finder".into()),
+            pid: Some(42),
+            path: None,
+            running: true,
+        },
+        window_id: Some(77),
+        window_title: Some("Finder".into()),
+        window_bounds: Some(rect(0.0, 0.0, 900.0, 800.0)),
+        truncated: out.truncated,
+        total_nodes: out.total_visited,
+        emitted_nodes: out.emitted_nodes,
+        elapsed_ms: 8,
+        root: out.root,
+    };
+
+    let rendered = snap.render_compact();
+    let anatomy = analyze_snapshot_text(
+        &rendered,
+        snap.emitted_nodes,
+        snap.total_nodes,
+        snap.truncated,
+    );
+    assert!(
+        !snap.truncated,
+        "Finder table should not truncate at 250 nodes"
+    );
+    assert_eq!(anatomy.roles.get("cell").copied().unwrap_or(0), 0);
+    assert_eq!(anatomy.roles.get("row").copied().unwrap_or(0), 32);
+    assert_eq!(anatomy.roles.get("textfield").copied().unwrap_or(0), 32);
+    assert!(rendered.contains("Document-0.pdf"));
+    assert!(rendered.contains("Document-31.pdf"));
 }
