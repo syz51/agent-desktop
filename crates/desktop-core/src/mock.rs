@@ -2702,4 +2702,353 @@ mod tests {
             Some(&None)
         );
     }
+
+    #[test]
+    fn standalone_read_text_enforces_app_policy_and_session_scope() {
+        use desktop_proto::ReadTextParams;
+
+        let (engine, backend, _, _tmp) = make_engine();
+        let calc_app = AppInfo {
+            name: "Calculator".into(),
+            bundle_id: Some("com.apple.calculator".into()),
+            pid: Some(2020),
+            path: Some("/System/Applications/Calculator.app".into()),
+            running: true,
+        };
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .extra_windows
+            .push(WindowInfo {
+                id: 202,
+                title: "Calculator".into(),
+                app: calc_app.clone(),
+                bounds: Rect {
+                    x: 400.0,
+                    y: 200.0,
+                    width: 300.0,
+                    height: 400.0,
+                },
+                layer: 0,
+                alpha: 1.0,
+                focused: false,
+                minimized: false,
+                on_screen: true,
+                display_index: Some(0),
+            });
+
+        // 1. deny_apps blocks Calculator via ref_id, window_id, and focused_app in Value & Selection
+        //    modes while allowing Notes and allowing Clipboard mode.
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::PolicySet(PolicyConfig {
+                    mode: PolicyMode::Open,
+                    deny_apps: vec!["com.apple.calculator".into()],
+                    ..PolicyConfig::default()
+                }),
+            )
+            .unwrap();
+
+        // ref_id pointing to denied Calculator (even though focused app is allowed Notes).
+        backend.state.lock().unwrap().resolved_ref_app = Some(calc_app.clone());
+        for mode in [ReadTextMode::Value, ReadTextMode::Selection] {
+            let err = engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("agent-1"),
+                    RpcMethod::ReadText(ReadTextParams {
+                        ref_id: Some("@e2".into()),
+                        window_id: None,
+                        mode,
+                    }),
+                )
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::PolicyDenied);
+        }
+        assert!(
+            engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("agent-1"),
+                    RpcMethod::ReadText(ReadTextParams {
+                        ref_id: Some("@e2".into()),
+                        window_id: None,
+                        mode: ReadTextMode::Clipboard,
+                    }),
+                )
+                .is_ok()
+        );
+
+        // window_id pointing to denied Calculator (while focused app is allowed Notes).
+        for mode in [ReadTextMode::Value, ReadTextMode::Selection] {
+            let err = engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("agent-1"),
+                    RpcMethod::ReadText(ReadTextParams {
+                        ref_id: None,
+                        window_id: Some(202),
+                        mode,
+                    }),
+                )
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::PolicyDenied);
+        }
+        assert!(
+            engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("agent-1"),
+                    RpcMethod::ReadText(ReadTextParams {
+                        ref_id: None,
+                        window_id: Some(202),
+                        mode: ReadTextMode::Clipboard,
+                    }),
+                )
+                .is_ok()
+        );
+
+        // Allowed focused app (Notes) succeeds in Value and Selection modes.
+        for mode in [ReadTextMode::Value, ReadTextMode::Selection] {
+            assert!(
+                engine
+                    .handle(
+                        Some(1),
+                        None,
+                        Some("agent-1"),
+                        RpcMethod::ReadText(ReadTextParams {
+                            ref_id: None,
+                            window_id: None,
+                            mode,
+                        }),
+                    )
+                    .is_ok()
+            );
+        }
+
+        // Focused app set to denied Calculator blocks focused_app and unknown-window fallback,
+        // while still allowing Clipboard mode.
+        backend.state.lock().unwrap().focused = Some(calc_app.clone());
+        for mode in [ReadTextMode::Value, ReadTextMode::Selection] {
+            let err = engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("agent-1"),
+                    RpcMethod::ReadText(ReadTextParams {
+                        ref_id: None,
+                        window_id: None,
+                        mode,
+                    }),
+                )
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::PolicyDenied);
+        }
+        let fallback_err = engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::ReadText(ReadTextParams {
+                    ref_id: None,
+                    window_id: Some(999),
+                    mode: ReadTextMode::Value,
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(fallback_err.code, ErrorCode::PolicyDenied);
+        assert!(
+            engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("agent-1"),
+                    RpcMethod::ReadText(ReadTextParams {
+                        ref_id: None,
+                        window_id: None,
+                        mode: ReadTextMode::Clipboard,
+                    }),
+                )
+                .is_ok()
+        );
+
+        // 2. confirm_apps enforces confirmation dialog on standalone read_text.
+        {
+            let mut st = backend.state.lock().unwrap();
+            st.focused = Some(sample_app());
+            st.resolved_ref_app = None;
+            st.confirm_result = false;
+        }
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::PolicySet(PolicyConfig {
+                    mode: PolicyMode::Open,
+                    confirm_apps: vec!["com.apple.Notes".into()],
+                    ..PolicyConfig::default()
+                }),
+            )
+            .unwrap();
+        for params in [
+            ReadTextParams {
+                ref_id: Some("@e2".into()),
+                window_id: None,
+                mode: ReadTextMode::Value,
+            },
+            ReadTextParams {
+                ref_id: None,
+                window_id: Some(101),
+                mode: ReadTextMode::Selection,
+            },
+            ReadTextParams {
+                ref_id: None,
+                window_id: None,
+                mode: ReadTextMode::Value,
+            },
+        ] {
+            let err = engine
+                .handle(Some(1), None, Some("agent-1"), RpcMethod::ReadText(params))
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::PolicyDenied);
+        }
+        assert!(
+            engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("agent-1"),
+                    RpcMethod::ReadText(ReadTextParams {
+                        ref_id: None,
+                        window_id: None,
+                        mode: ReadTextMode::Clipboard,
+                    }),
+                )
+                .is_ok()
+        );
+        backend.state.lock().unwrap().confirm_result = true;
+        assert!(
+            engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("agent-1"),
+                    RpcMethod::ReadText(ReadTextParams {
+                        ref_id: None,
+                        window_id: None,
+                        mode: ReadTextMode::Value,
+                    }),
+                )
+                .is_ok()
+        );
+
+        // 3. session_start(apps: ["Notes"]) rejects out-of-scope Calculator across ref_id,
+        //    window_id, and focused_app in Value & Selection modes while allowing Notes & Clipboard.
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::PolicySet(PolicyConfig::default()),
+            )
+            .unwrap();
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::SessionStart(SessionStartParams {
+                    reason: Some("scoped".into()),
+                    apps: Some(vec!["Notes".into()]),
+                    wait_for_lease_ms: None,
+                }),
+            )
+            .unwrap();
+
+        backend.state.lock().unwrap().resolved_ref_app = Some(calc_app.clone());
+        for mode in [ReadTextMode::Value, ReadTextMode::Selection] {
+            let ref_err = engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("agent-1"),
+                    RpcMethod::ReadText(ReadTextParams {
+                        ref_id: Some("@e2".into()),
+                        window_id: None,
+                        mode,
+                    }),
+                )
+                .unwrap_err();
+            assert_eq!(ref_err.code, ErrorCode::PolicyDenied);
+
+            let win_err = engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("agent-1"),
+                    RpcMethod::ReadText(ReadTextParams {
+                        ref_id: None,
+                        window_id: Some(202),
+                        mode,
+                    }),
+                )
+                .unwrap_err();
+            assert_eq!(win_err.code, ErrorCode::PolicyDenied);
+
+            assert!(
+                engine
+                    .handle(
+                        Some(1),
+                        None,
+                        Some("agent-1"),
+                        RpcMethod::ReadText(ReadTextParams {
+                            ref_id: None,
+                            window_id: Some(101),
+                            mode,
+                        }),
+                    )
+                    .is_ok()
+            );
+        }
+
+        backend.state.lock().unwrap().focused = Some(calc_app);
+        for mode in [ReadTextMode::Value, ReadTextMode::Selection] {
+            let focused_err = engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("agent-1"),
+                    RpcMethod::ReadText(ReadTextParams {
+                        ref_id: None,
+                        window_id: None,
+                        mode,
+                    }),
+                )
+                .unwrap_err();
+            assert_eq!(focused_err.code, ErrorCode::PolicyDenied);
+        }
+        assert!(
+            engine
+                .handle(
+                    Some(1),
+                    None,
+                    Some("agent-1"),
+                    RpcMethod::ReadText(ReadTextParams {
+                        ref_id: None,
+                        window_id: None,
+                        mode: ReadTextMode::Clipboard,
+                    }),
+                )
+                .is_ok()
+        );
+    }
 }

@@ -276,6 +276,12 @@ impl DesktopEngine {
                     &policy,
                     SessionAccess::Observe,
                 )?;
+                self.ensure_read_text_allowed(
+                    params.ref_id.as_deref(),
+                    params.window_id,
+                    params.mode,
+                    &policy,
+                )?;
                 let mut res = self.backend.read_text(
                     params.ref_id.as_deref(),
                     params.window_id,
@@ -828,6 +834,33 @@ impl DesktopEngine {
             return Ok(Some(app));
         }
         Ok(None)
+    }
+
+    fn ensure_read_text_allowed(
+        &self,
+        ref_id: Option<&str>,
+        window_id: Option<u32>,
+        mode: ReadTextMode,
+        policy: &PolicyConfig,
+    ) -> Result<(), RpcError> {
+        if mode == ReadTextMode::Clipboard {
+            return Ok(());
+        }
+        if let Some(r) = ref_id {
+            let resolved = self.backend.resolve_ref(r)?;
+            self.ensure_app_allowed(&resolved.app, policy)?;
+        } else if let Some(wid) = window_id
+            && let Some(win) = self
+                .backend
+                .windows(None)?
+                .into_iter()
+                .find(|w| w.id == wid)
+        {
+            self.ensure_app_allowed(&win.app, policy)?;
+        } else if let Some(app) = self.backend.focused_app()? {
+            self.ensure_app_allowed(&app, policy)?;
+        }
+        Ok(())
     }
 
     fn capture_snapshot(
@@ -1455,22 +1488,7 @@ impl DesktopEngine {
                 ref_id,
                 window_id,
             } => {
-                if mode != ReadTextMode::Clipboard {
-                    if let Some(r) = &ref_id {
-                        let resolved = self.backend.resolve_ref(r)?;
-                        self.ensure_app_allowed(&resolved.app, policy)?;
-                    } else if let Some(wid) = window_id
-                        && let Some(win) = self
-                            .backend
-                            .windows(None)?
-                            .into_iter()
-                            .find(|w| w.id == wid)
-                    {
-                        self.ensure_app_allowed(&win.app, policy)?;
-                    } else if let Some(app) = self.backend.focused_app()? {
-                        self.ensure_app_allowed(&app, policy)?;
-                    }
-                }
+                self.ensure_read_text_allowed(ref_id.as_deref(), window_id, mode, policy)?;
                 let mut res = self.backend.read_text(
                     ref_id.as_deref(),
                     window_id,
