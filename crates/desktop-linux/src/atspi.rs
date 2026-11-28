@@ -2,11 +2,11 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use desktop_core::ResolvedRef;
 use desktop_core::tree::{
     AxNodeData, DEFAULT_PRIMARY_FANOUT, RecordOutcome, SnapshotWalkBuilder, WalkBudget,
     is_decorative_container,
 };
+use desktop_core::{ResolvedRef, SnapshotRefLru};
 use desktop_proto::{
     AppInfo, AppMatchRank, ElementAction, ErrorCode, ReadTextMode, ReadTextResult, Rect, RpcError,
     Snapshot, SnapshotParams, UiNode, WindowInfo, best_matching_window, sanitize_text,
@@ -47,10 +47,11 @@ pub struct AtSpiRefEntry {
     pub is_password: bool,
 }
 
-/// Thread-safe store mapping `@eN` element IDs to AT-SPI2 object addresses or X11 fallback refs.
+/// Thread-safe LRU store mapping `@eN` element IDs from the most recent snapshots to AT-SPI2
+/// object addresses or X11 fallback refs.
 #[derive(Default)]
 pub struct LinuxRefStore {
-    inner: Mutex<HashMap<String, AtSpiRefEntry>>,
+    inner: Mutex<SnapshotRefLru<AtSpiRefEntry>>,
 }
 
 impl LinuxRefStore {
@@ -59,14 +60,30 @@ impl LinuxRefStore {
         Self::default()
     }
 
-    pub fn replace(&self, entries: HashMap<String, AtSpiRefEntry>) {
-        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        *map = entries;
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(SnapshotRefLru::with_capacity(capacity)),
+        }
+    }
+
+    pub fn alloc_ref_start(&self, count: usize) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .alloc_ref_start(count)
+    }
+
+    pub fn insert(&self, snapshot_id: impl Into<String>, entries: HashMap<String, AtSpiRefEntry>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(snapshot_id, entries);
     }
 
     pub fn get(&self, ref_id: &str) -> Result<AtSpiRefEntry, RpcError> {
-        let map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        map.get(ref_id).cloned().ok_or_else(|| {
+        let mut lru = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        lru.get(ref_id).cloned().ok_or_else(|| {
             RpcError::with_next(
                 ErrorCode::StaleRef,
                 format!("unknown or stale element ref {ref_id:?}"),
@@ -448,7 +465,8 @@ pub fn take_atspi_snapshot(
             }
         }
 
-        let mut output = builder.finish(fallback_root);
+        let mut output =
+            builder.finish_with_seq(fallback_root, |count| store.alloc_ref_start(count));
         for (ref_id, entry) in &mut output.refs {
             entry.ref_id.clone_from(ref_id);
         }
@@ -470,7 +488,7 @@ pub fn take_atspi_snapshot(
 
     match result {
         Some((snapshot, entries)) => {
-            store.replace(entries);
+            store.insert(snapshot.snapshot_id.clone(), entries);
             Ok(AtSpiSnapshotResult::Snapshot(Box::new(snapshot)))
         }
         None => Ok(AtSpiSnapshotResult::Unavailable),
@@ -484,6 +502,7 @@ pub fn fallback_window_snapshot(
     params: &SnapshotParams,
 ) -> Snapshot {
     let mut entries = HashMap::new();
+    let ref_id = format!("@e{}", store.alloc_ref_start(1));
     let chosen = params
         .window_id
         .and_then(|wid| windows.iter().find(|w| w.id == wid))
@@ -498,9 +517,9 @@ pub fn fallback_window_snapshot(
 
     let (app, window_id, window_title, window_bounds, root) = if let Some(w) = chosen {
         entries.insert(
-            "@e1".to_string(),
+            ref_id.clone(),
             AtSpiRefEntry {
-                ref_id: "@e1".into(),
+                ref_id: ref_id.clone(),
                 bus_name: String::new(),
                 object_path: String::new(),
                 app: w.app.clone(),
@@ -511,7 +530,7 @@ pub fn fallback_window_snapshot(
             },
         );
         let root = UiNode {
-            ref_id: "@e1".into(),
+            ref_id,
             role: "window".into(),
             subrole: None,
             title: (!w.title.is_empty()).then(|| sanitize_text(&w.title, 120)),
@@ -540,9 +559,9 @@ pub fn fallback_window_snapshot(
             running: true,
         };
         entries.insert(
-            "@e1".to_string(),
+            ref_id.clone(),
             AtSpiRefEntry {
-                ref_id: "@e1".into(),
+                ref_id: ref_id.clone(),
                 bus_name: String::new(),
                 object_path: String::new(),
                 app: app.clone(),
@@ -553,7 +572,7 @@ pub fn fallback_window_snapshot(
             },
         );
         let root = UiNode {
-            ref_id: "@e1".into(),
+            ref_id,
             role: "application".into(),
             subrole: None,
             title: Some("desktop (AT-SPI2 unavailable; use screenshot + coordinates)".into()),
@@ -569,9 +588,10 @@ pub fn fallback_window_snapshot(
         (app, None, None, None, root)
     };
 
-    store.replace(entries);
+    let snapshot_id = format!("snap_{}", Uuid::new_v4().simple());
+    store.insert(snapshot_id.clone(), entries);
     Snapshot {
-        snapshot_id: format!("snap_{}", Uuid::new_v4().simple()),
+        snapshot_id,
         app,
         window_id,
         window_title,
@@ -1053,5 +1073,85 @@ mod tests {
         assert_eq!(snap.window_id, Some(42));
         let resolved = store.resolve("@e1").unwrap();
         assert_eq!(resolved.app.name, "xterm");
+    }
+
+    fn make_window(id: u32, name: &str, pid: u32) -> WindowInfo {
+        WindowInfo {
+            id,
+            app: AppInfo {
+                name: name.into(),
+                bundle_id: Some(name.into()),
+                pid: Some(pid),
+                path: None,
+                running: true,
+            },
+            title: format!("{name} window"),
+            bounds: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            },
+            layer: 0,
+            alpha: 1.0,
+            display_index: Some(0),
+            focused: true,
+            minimized: false,
+            on_screen: true,
+        }
+    }
+
+    #[test]
+    fn linux_ref_store_retains_multi_snapshot_lru_across_apps() {
+        let store = LinuxRefStore::new();
+        let win_a = make_window(1, "Notes", 1001);
+        let win_b = make_window(2, "Calculator", 1002);
+        let win_c = make_window(3, "Firefox", 1003);
+        let win_d = make_window(4, "Terminal", 1004);
+
+        let snap_a = fallback_window_snapshot(&store, &[win_a], &SnapshotParams::default());
+        let snap_b = fallback_window_snapshot(&store, &[win_b], &SnapshotParams::default());
+        assert_eq!(snap_a.root.ref_id, "@e1");
+        assert_eq!(snap_b.root.ref_id, "@e2");
+
+        // Taking a snapshot of App B does not invalidate App A's ref.
+        assert_eq!(
+            store.resolve(&snap_a.root.ref_id).unwrap().app.name,
+            "Notes"
+        );
+        assert_eq!(
+            store.resolve(&snap_b.root.ref_id).unwrap().app.name,
+            "Calculator"
+        );
+
+        let snap_c = fallback_window_snapshot(&store, &[win_c], &SnapshotParams::default());
+        assert_eq!(snap_c.root.ref_id, "@e3");
+
+        // Touch App A so App B becomes least-recently-used.
+        assert_eq!(
+            store.resolve(&snap_a.root.ref_id).unwrap().app.name,
+            "Notes"
+        );
+
+        // Snapshot 4 evicts App B (LRU) while App A, C, and D stay valid.
+        let snap_d = fallback_window_snapshot(&store, &[win_d], &SnapshotParams::default());
+        assert_eq!(snap_d.root.ref_id, "@e4");
+
+        assert_eq!(
+            store.resolve(&snap_b.root.ref_id).unwrap_err().code,
+            ErrorCode::StaleRef
+        );
+        assert_eq!(
+            store.resolve(&snap_a.root.ref_id).unwrap().app.name,
+            "Notes"
+        );
+        assert_eq!(
+            store.resolve(&snap_c.root.ref_id).unwrap().app.name,
+            "Firefox"
+        );
+        assert_eq!(
+            store.resolve(&snap_d.root.ref_id).unwrap().app.name,
+            "Terminal"
+        );
     }
 }

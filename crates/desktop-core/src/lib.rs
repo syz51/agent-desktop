@@ -10,6 +10,7 @@ pub mod kill_switch;
 #[cfg(any(test, feature = "testing"))]
 pub mod mock;
 pub mod policy;
+pub mod ref_store;
 pub mod tree;
 
 pub use annotate::{draw_annotations_bgra, draw_annotations_rgba};
@@ -24,3 +25,4 @@ pub use frame_ring::{
 };
 pub use kill_switch::{DOUBLE_ESC_WINDOW, EscKillSwitch};
 pub use policy::PolicyStore;
+pub use ref_store::{DEFAULT_REF_SNAPSHOT_CAPACITY, SnapshotRefLru};

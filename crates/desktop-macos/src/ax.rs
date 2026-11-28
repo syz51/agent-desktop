@@ -5,10 +5,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use desktop_core::ResolvedRef;
 use desktop_core::tree::{
     AxNodeData, RecordOutcome, SnapshotWalkBuilder, WalkBudget, is_decorative_container,
 };
+use desktop_core::{ResolvedRef, SnapshotRefLru};
 use desktop_proto::{
     AppInfo, ElementAction, ErrorCode, FocusMode, ReadTextMode, ReadTextResult, Rect, RpcError,
     Snapshot, SnapshotParams, UiNode, WindowInfo,
@@ -614,10 +614,11 @@ pub struct LiveRef {
     pub actions: Vec<ElementAction>,
 }
 
-/// Live store mapping `@eN` refs from the latest snapshot to retained `AXUIElement` handles.
+/// Live LRU store mapping `@eN` refs from the most recent snapshots to retained `AXUIElement`
+/// handles, so inspecting another app does not immediately invalidate earlier `@eN` refs.
 pub struct AxRefStore {
     seq: AtomicU64,
-    refs: Mutex<HashMap<String, LiveRef>>,
+    refs: Mutex<SnapshotRefLru<LiveRef>>,
     /// PIDs for which we have already enabled `AXManualAccessibility` (Chromium/Electron).
     enabled_manual_ax: Mutex<HashSet<i32>>,
 }
@@ -627,16 +628,24 @@ impl AxRefStore {
     pub fn new() -> Self {
         Self {
             seq: AtomicU64::new(0),
-            refs: Mutex::new(HashMap::new()),
+            refs: Mutex::new(SnapshotRefLru::new()),
             enabled_manual_ax: Mutex::new(HashSet::new()),
         }
     }
 
+    /// Record `pid` as having `AXManualAccessibility` enabled, evicting any previously tracked
+    /// PIDs whose processes have exited. Returns `true` if `pid` was newly inserted.
     pub fn mark_manual_ax_enabled(&self, pid: i32) -> bool {
-        self.enabled_manual_ax
+        self.mark_manual_ax_enabled_with(pid, ffi::is_pid_alive)
+    }
+
+    fn mark_manual_ax_enabled_with(&self, pid: i32, is_alive: impl Fn(i32) -> bool) -> bool {
+        let mut guard = self
+            .enabled_manual_ax
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(pid)
+            .unwrap_or_else(|e| e.into_inner());
+        guard.retain(|&p| p == pid || is_alive(p));
+        guard.insert(pid)
     }
 
     pub fn next_snapshot_id(&self) -> String {
@@ -644,12 +653,22 @@ impl AxRefStore {
         format!("s{n}")
     }
 
-    pub fn replace_all(&self, map: HashMap<String, LiveRef>) {
-        *self.refs.lock().unwrap_or_else(|e| e.into_inner()) = map;
+    pub fn alloc_ref_start(&self, count: usize) -> usize {
+        self.refs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .alloc_ref_start(count)
+    }
+
+    pub fn insert_snapshot(&self, snapshot_id: impl Into<String>, map: HashMap<String, LiveRef>) {
+        self.refs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(snapshot_id, map);
     }
 
     pub fn get(&self, ref_id: &str) -> Result<LiveRef, RpcError> {
-        let guard = self.refs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.refs.lock().unwrap_or_else(|e| e.into_inner());
         guard.get(ref_id).cloned().ok_or_else(|| {
             RpcError::with_next(
                 ErrorCode::StaleRef,
@@ -1042,11 +1061,12 @@ fn build_snapshot_from_root(
         }
     }
 
-    let output = builder.finish(fallback_root);
-    store.replace_all(output.refs);
+    let output = builder.finish_with_seq(fallback_root, |count| store.alloc_ref_start(count));
+    let snapshot_id = store.next_snapshot_id();
+    store.insert_snapshot(snapshot_id.clone(), output.refs);
 
     Ok(Snapshot {
-        snapshot_id: store.next_snapshot_id(),
+        snapshot_id,
         app,
         window_id,
         window_title,
@@ -1286,5 +1306,128 @@ mod tests {
 
         let with_bounds = app_el.read_node_attrs(true);
         assert_eq!(with_bounds.raw_role, "AXApplication");
+    }
+
+    fn make_live_ref(app_name: &str, window_id: u32) -> LiveRef {
+        LiveRef {
+            element: AxElement::application(std::process::id() as i32),
+            app: AppInfo {
+                name: app_name.into(),
+                bundle_id: Some(format!("com.example.{}", app_name.to_ascii_lowercase())),
+                pid: Some(std::process::id()),
+                path: None,
+                running: true,
+            },
+            window_id: Some(window_id),
+            actions: vec![ElementAction::Press],
+        }
+    }
+
+    #[test]
+    fn ax_ref_store_retains_multi_snapshot_lru_and_evicts_least_recently_used() {
+        let store = AxRefStore::new();
+
+        // Snapshot 1: App A gets @e1..@e2.
+        let s1_start = store.alloc_ref_start(2);
+        assert_eq!(s1_start, 1);
+        let s1_id = store.next_snapshot_id();
+        store.insert_snapshot(
+            s1_id,
+            HashMap::from([
+                ("@e1".into(), make_live_ref("Notes", 10)),
+                ("@e2".into(), make_live_ref("Notes", 10)),
+            ]),
+        );
+
+        // Snapshot 2: App B gets @e3..@e4 without invalidating App A's refs.
+        let s2_start = store.alloc_ref_start(2);
+        assert_eq!(s2_start, 3);
+        let s2_id = store.next_snapshot_id();
+        store.insert_snapshot(
+            s2_id,
+            HashMap::from([
+                ("@e3".into(), make_live_ref("Calculator", 20)),
+                ("@e4".into(), make_live_ref("Calculator", 20)),
+            ]),
+        );
+
+        assert_eq!(store.get("@e2").unwrap().app.name, "Notes");
+        assert_eq!(store.get("@e4").unwrap().app.name, "Calculator");
+
+        // Snapshot 3: App C gets @e5.
+        let s3_start = store.alloc_ref_start(1);
+        assert_eq!(s3_start, 5);
+        let s3_id = store.next_snapshot_id();
+        store.insert_snapshot(
+            s3_id,
+            HashMap::from([("@e5".into(), make_live_ref("Safari", 30))]),
+        );
+
+        // Touch App A (@e1) so App B (s2) becomes the least-recently-used snapshot.
+        assert_eq!(store.get("@e1").unwrap().app.name, "Notes");
+
+        // Snapshot 4: App D gets @e6, evicting App B (s2) while preserving App A, C, and D.
+        let s4_start = store.alloc_ref_start(1);
+        assert_eq!(s4_start, 6);
+        let s4_id = store.next_snapshot_id();
+        store.insert_snapshot(
+            s4_id,
+            HashMap::from([("@e6".into(), make_live_ref("Terminal", 40))]),
+        );
+
+        assert_eq!(store.get("@e3").err().unwrap().code, ErrorCode::StaleRef);
+        assert_eq!(store.get("@e4").err().unwrap().code, ErrorCode::StaleRef);
+        assert_eq!(store.get("@e2").unwrap().app.name, "Notes");
+        assert_eq!(store.get("@e5").unwrap().app.name, "Safari");
+        assert_eq!(store.get("@e6").unwrap().app.name, "Terminal");
+    }
+
+    #[test]
+    fn enabled_manual_ax_evicts_exited_pids() {
+        let store = AxRefStore::new();
+
+        // Deterministic check with injectable liveness predicate.
+        let alive = HashSet::from([100, 200]);
+        assert!(store.mark_manual_ax_enabled_with(100, |p| alive.contains(&p)));
+        assert!(!store.mark_manual_ax_enabled_with(100, |p| alive.contains(&p)));
+        assert!(store.mark_manual_ax_enabled_with(200, |p| alive.contains(&p)));
+
+        // Simulate PID 100 exiting before PID 300 is marked enabled.
+        let alive_after_exit = HashSet::from([200, 300]);
+        assert!(store.mark_manual_ax_enabled_with(300, |p| alive_after_exit.contains(&p)));
+        {
+            let tracked = store.enabled_manual_ax.lock().unwrap();
+            assert!(!tracked.contains(&100), "exited PID 100 must be evicted");
+            assert!(tracked.contains(&200));
+            assert!(tracked.contains(&300));
+        }
+
+        // If PID 100 is later recycled for a new process, marking it returns `true` again.
+        let recycled = HashSet::from([100, 200, 300]);
+        assert!(store.mark_manual_ax_enabled_with(100, |p| recycled.contains(&p)));
+
+        // Real OS liveness check via `ffi::is_pid_alive` using an exited child process.
+        let real_store = AxRefStore::new();
+        let current_pid = std::process::id() as i32;
+        assert!(ffi::is_pid_alive(current_pid));
+        assert!(!ffi::is_pid_alive(0));
+        assert!(!ffi::is_pid_alive(-1));
+
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn /usr/bin/true");
+        let exited_pid = child.id() as i32;
+        let _ = child.wait();
+        assert!(!ffi::is_pid_alive(exited_pid));
+
+        real_store
+            .enabled_manual_ax
+            .lock()
+            .unwrap()
+            .insert(exited_pid);
+        assert!(real_store.mark_manual_ax_enabled(current_pid));
+        let tracked = real_store.enabled_manual_ax.lock().unwrap();
+        assert!(!tracked.contains(&exited_pid));
+        assert!(tracked.contains(&current_pid));
     }
 }

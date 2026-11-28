@@ -501,9 +501,21 @@ impl<H, R> SnapshotWalkBuilder<H, R> {
     /// Finalize the snapshot: enforce `max_nodes` prioritizing interactive controls, splice
     /// decorative/dropped wrappers, preserve original sibling order, and assign `@e1..@eN` refs.
     #[must_use]
-    pub fn finish(mut self, fallback_root: UiNode) -> WalkOutput<R> {
+    pub fn finish(self, fallback_root: UiNode) -> WalkOutput<R> {
+        self.finish_with_seq(fallback_root, |_| 1)
+    }
+
+    /// Finalize the snapshot using `alloc_start(emitted_count)` to choose the starting `@eN`
+    /// sequence number so multi-snapshot LRU stores can assign non-overlapping `@eN` ranges.
+    #[must_use]
+    pub fn finish_with_seq<F>(mut self, mut fallback_root: UiNode, alloc_start: F) -> WalkOutput<R>
+    where
+        F: FnOnce(usize) -> usize,
+    {
         let n = self.arena.len();
         if n == 0 || self.budget.max_nodes == 0 {
+            let start = alloc_start(1);
+            fallback_root.ref_id = format!("@e{start}");
             return WalkOutput {
                 root: fallback_root,
                 refs: HashMap::new(),
@@ -563,11 +575,15 @@ impl<H, R> SnapshotWalkBuilder<H, R> {
 
         let truncated = self.truncated || omitted_non_decorative;
 
+        let start_seq = alloc_start(kept_count);
         let mut refs = HashMap::with_capacity(kept_count);
-        let mut seq = 1usize;
+        let mut seq = start_seq;
         let built = build_subtree(0, &mut self.arena, &children_of, &kept, &mut refs, &mut seq);
-        let root = built.into_iter().next().unwrap_or(fallback_root);
-        let emitted_nodes = (seq - 1).max(1);
+        let root = built.into_iter().next().unwrap_or_else(|| {
+            fallback_root.ref_id = format!("@e{start_seq}");
+            fallback_root
+        });
+        let emitted_nodes = seq.saturating_sub(start_seq).max(1);
 
         WalkOutput {
             root,
@@ -2696,5 +2712,63 @@ mod tests {
         assert!(special.children[3].focused);
         assert!(special.children[4].selected);
         assert_eq!(special.children[5].actions, vec![ElementAction::SetValue]);
+    }
+
+    #[test]
+    fn finish_with_seq_assigns_non_overlapping_ranges_and_exact_emitted_count() {
+        let root = FakeAxNode {
+            id: 1,
+            data: make_ax("window", Some("App B"), None, vec![]),
+            children: vec![
+                FakeAxNode {
+                    id: 2,
+                    data: make_ax("button", Some("OK"), None, vec![ElementAction::Press]),
+                    children: vec![],
+                },
+                FakeAxNode {
+                    id: 3,
+                    data: make_ax("button", Some("Cancel"), None, vec![ElementAction::Press]),
+                    children: vec![],
+                },
+            ],
+        };
+        let mut builder = SnapshotWalkBuilder::new(root, WalkBudget::new(8, 20));
+        while let Some(pending) = builder.next_pending() {
+            let (node, meta) = pending.into_parts();
+            let depth = meta.depth();
+            let FakeAxNode { id, data, children } = node;
+            if let RecordOutcome::Expand(idx) = builder.record_node(meta, data, Some(id)) {
+                builder.enqueue_children(idx, depth + 1, children);
+            }
+        }
+        let mut requested_count = 0;
+        let out = builder.finish_with_seq(
+            UiNode {
+                ref_id: "@e1".into(),
+                role: "window".into(),
+                subrole: None,
+                title: None,
+                label: None,
+                value: None,
+                bounds: None,
+                enabled: true,
+                focused: false,
+                selected: false,
+                actions: vec![],
+                children: vec![],
+            },
+            |count| {
+                requested_count = count;
+                10
+            },
+        );
+        assert_eq!(requested_count, 3);
+        assert_eq!(out.emitted_nodes, 3);
+        assert_eq!(out.root.ref_id, "@e10");
+        assert_eq!(out.root.children[0].ref_id, "@e11");
+        assert_eq!(out.root.children[1].ref_id, "@e12");
+        assert_eq!(out.refs.get("@e10"), Some(&1));
+        assert_eq!(out.refs.get("@e11"), Some(&2));
+        assert_eq!(out.refs.get("@e12"), Some(&3));
     }
 }
