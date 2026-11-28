@@ -2615,4 +2615,76 @@ mod tests {
             "expected wait_for_ui_event to receive Notes pid 1234, got {waits:?}"
         );
     }
+
+    #[test]
+    fn reap_expired_lease_tears_down_expired_and_stopped_leases_without_rpcs() {
+        let (engine, backend, clock, _tmp) = make_engine();
+
+        // Start a session with default TTL (10 minutes).
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("remote-agent"),
+                RpcMethod::SessionStart(SessionStartParams::default()),
+            )
+            .unwrap();
+        assert!(backend.state.lock().unwrap().display_awake);
+        assert!(
+            !engine.reap_expired_lease(),
+            "active lease must not be reaped before TTL"
+        );
+        assert!(backend.state.lock().unwrap().display_awake);
+
+        // Advance past TTL: reaper tears down display_awake & overlay even with zero incoming RPCs.
+        clock.advance(Duration::minutes(11));
+        assert!(engine.reap_expired_lease(), "expired lease must be reaped");
+        assert!(!backend.state.lock().unwrap().display_awake);
+        assert_eq!(
+            backend.state.lock().unwrap().overlay_history.last(),
+            Some(&None)
+        );
+        assert!(
+            !engine.reap_expired_lease(),
+            "second reap should be a no-op"
+        );
+
+        // Now acquire an armed control lease and trip the physical kill-switch while idle.
+        engine
+            .handle(
+                Some(2),
+                None,
+                Some("remote-agent-2"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::Click {
+                        target: Target::Ref {
+                            ref_id: "@e3".into(),
+                        },
+                        button: MouseButton::Left,
+                        count: 1,
+                        modifiers: vec![],
+                        mode: ClickMode::Auto,
+                    }],
+                    after: PostAction::None,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Auto,
+                    release_after: false,
+                }),
+            )
+            .unwrap();
+        assert!(backend.state.lock().unwrap().control_active);
+
+        backend.stop.store(true, Ordering::Release);
+        assert!(
+            engine.reap_expired_lease(),
+            "reaper must tear down armed control lease when stop_flag is latched"
+        );
+        assert!(!backend.stop.load(Ordering::Acquire));
+        assert!(!backend.state.lock().unwrap().control_active);
+        assert!(!backend.state.lock().unwrap().display_awake);
+        assert_eq!(
+            backend.state.lock().unwrap().overlay_history.last(),
+            Some(&None)
+        );
+    }
 }

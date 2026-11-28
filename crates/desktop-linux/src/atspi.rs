@@ -11,6 +11,7 @@ use desktop_proto::{
     AppInfo, AppMatchRank, ElementAction, ErrorCode, ReadTextMode, ReadTextResult, Rect, RpcError,
     Snapshot, SnapshotParams, UiNode, WindowInfo, best_matching_window, sanitize_text,
 };
+use futures_util::future::join_all;
 use uuid::Uuid;
 use zbus::connection::Builder as ConnBuilder;
 use zbus::proxy::{Builder as ProxyBuilder, CacheProperties};
@@ -21,6 +22,10 @@ const DEFAULT_MAX_NODES: usize = 250;
 const WALK_BUDGET: Duration = Duration::from_millis(250);
 const ATSPI_REGISTRY_DEST: &str = "org.a11y.atspi.Registry";
 const ATSPI_ROOT_PATH: &str = "/org/a11y/atspi/accessible/root";
+
+/// Cached AT-SPI2 bus address resolved from `org.a11y.Bus.GetAddress` so hot calls avoid a
+/// redundant session D-Bus connection + GetAddress round-trip on every snapshot/action.
+static CACHED_ATSPI_ADDR: Mutex<Option<String>> = Mutex::new(None);
 
 /// Outcome of an AT-SPI2 snapshot attempt so callers only fall back when the bus is unavailable.
 pub enum AtSpiSnapshotResult {
@@ -132,6 +137,18 @@ async fn connect_atspi_bus() -> Result<Connection, RpcError> {
             .map_err(|e| RpcError::new(ErrorCode::BackendError, format!("AT-SPI connect: {e}")));
     }
 
+    let cached = CACHED_ATSPI_ADDR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(addr) = cached {
+        if let Ok(conn) = ConnBuilder::address(addr.as_str()).build().await {
+            return Ok(conn);
+        }
+        // Clear stale address if the accessibility bus restarted and re-resolve once below.
+        *CACHED_ATSPI_ADDR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     let session = Connection::session().await.map_err(|e| {
         RpcError::new(
             ErrorCode::BackendError,
@@ -145,16 +162,19 @@ async fn connect_atspi_bus() -> Result<Connection, RpcError> {
             format!("org.a11y.Bus.GetAddress failed: {e}"),
         )
     })?;
-    if addr.trim().is_empty() {
+    let trimmed = addr.trim();
+    if trimmed.is_empty() {
         return Err(RpcError::new(
             ErrorCode::BackendError,
             "org.a11y.Bus returned empty accessibility bus address",
         ));
     }
-    ConnBuilder::address(addr.trim())
+    let conn = ConnBuilder::address(trimmed)
         .build()
         .await
-        .map_err(|e| RpcError::new(ErrorCode::BackendError, format!("AT-SPI connect: {e}")))
+        .map_err(|e| RpcError::new(ErrorCode::BackendError, format!("AT-SPI connect: {e}")))?;
+    *CACHED_ATSPI_ADDR.lock().unwrap_or_else(|e| e.into_inner()) = Some(trimmed.to_string());
+    Ok(conn)
 }
 
 /// Take an AT-SPI2 accessibility snapshot.
@@ -288,25 +308,25 @@ pub fn take_atspi_snapshot(
                 continue;
             };
 
-            let raw_role: String = acc_proxy.call("GetRoleName", &()).await.unwrap_or_default();
+            // Fetch all 4 independent node properties concurrently in a single D-Bus RTT.
+            let (raw_role_res, name_res, desc_res, ifaces_res) = tokio::join!(
+                acc_proxy.call::<_, _, String>("GetRoleName", &()),
+                acc_proxy.get_property::<String>("Name"),
+                acc_proxy.get_property::<String>("Description"),
+                acc_proxy.call::<_, _, Vec<String>>("GetInterfaces", &()),
+            );
+            let raw_role = raw_role_res.unwrap_or_default();
             let (role, is_password) = normalize_atspi_role(&raw_role);
-            let name = acc_proxy
-                .get_property::<String>("Name")
-                .await
+            let name = name_res
                 .ok()
                 .map(|s| sanitize_text(&s, 120))
                 .filter(|s| !s.is_empty());
-            let desc = acc_proxy
-                .get_property::<String>("Description")
-                .await
+            let desc = desc_res
                 .ok()
                 .map(|s| sanitize_text(&s, 120))
                 .filter(|s| !s.is_empty());
 
-            let interfaces: Vec<String> = acc_proxy
-                .call("GetInterfaces", &())
-                .await
-                .unwrap_or_default();
+            let interfaces = ifaces_res.unwrap_or_default();
             let has_action = interfaces.iter().any(|i| i == "org.a11y.atspi.Action");
             let has_editable = interfaces
                 .iter()
@@ -322,19 +342,45 @@ pub fn take_atspi_snapshot(
                 actions.push(ElementAction::SetValue);
             }
 
-            let value = if is_password && redact_passwords {
-                Some("<redacted>".to_string())
-            } else if has_text
-                && matches!(role.as_str(), "textfield" | "textarea" | "textfield:secure")
-            {
-                get_text_preview(&conn, &bus, &path)
-                    .await
-                    .map(|s| sanitize_text(&s, 120))
-                    .filter(|s| !s.is_empty())
-            } else {
-                None
-            };
+            let want_text_preview = !(is_password && redact_passwords)
+                && has_text
+                && matches!(role.as_str(), "textfield" | "textarea" | "textfield:secure");
+            let likely_decorative = !want_text_preview
+                && is_decorative_container(
+                    depth,
+                    &role,
+                    name.as_deref(),
+                    desc.as_deref(),
+                    None,
+                    false,
+                    false,
+                    &actions,
+                );
+            let want_extents = !likely_decorative && has_component;
 
+            // Fetch text preview and component geometry concurrently when both are needed.
+            let (raw_value, bounds) = tokio::join!(
+                async {
+                    if is_password && redact_passwords {
+                        Some("<redacted>".to_string())
+                    } else if want_text_preview {
+                        get_text_preview(&conn, &bus, &path)
+                            .await
+                            .map(|s| sanitize_text(&s, 120))
+                            .filter(|s| !s.is_empty())
+                    } else {
+                        None
+                    }
+                },
+                async {
+                    if want_extents {
+                        get_extents(&conn, &bus, &path).await
+                    } else {
+                        None
+                    }
+                },
+            );
+            let value = raw_value;
             let decorative = is_decorative_container(
                 depth,
                 &role,
@@ -345,13 +391,7 @@ pub fn take_atspi_snapshot(
                 false,
                 &actions,
             );
-
-            // Skip D-Bus Component.GetExtents round-trips on anonymous decorative containers.
-            let bounds = if !decorative && has_component {
-                get_extents(&conn, &bus, &path).await
-            } else {
-                None
-            };
+            let bounds = if decorative { None } else { bounds };
 
             let entry = (!decorative).then(|| AtSpiRefEntry {
                 ref_id: String::new(),
@@ -764,12 +804,19 @@ async fn find_atspi_target(
         ));
     }
 
+    // Fetch all registered AT-SPI2 app names concurrently instead of awaiting sequentially.
+    let named_apps: Vec<Option<(String, String, String)>> =
+        join_all(apps.iter().map(|(bus, path)| async move {
+            let p = uncached_proxy(conn, bus, path, "org.a11y.atspi.Accessible")
+                .await
+                .ok()?;
+            let name: String = p.get_property("Name").await.unwrap_or_default();
+            Some((bus.clone(), path.clone(), name))
+        }))
+        .await;
+
     let mut chosen: Option<(AppMatchRank, String, String, String)> = None;
-    for (bus, path) in &apps {
-        let Ok(p) = uncached_proxy(conn, bus, path, "org.a11y.atspi.Accessible").await else {
-            continue;
-        };
-        let name: String = p.get_property("Name").await.unwrap_or_default();
+    for (bus, path, name) in named_apps.into_iter().flatten() {
         if let Some(explicit) = app_filter {
             let probe = AppInfo {
                 name: name.clone(),
@@ -789,7 +836,7 @@ async fn find_atspi_target(
                     .as_ref()
                     .is_none_or(|(best_rank, _, _, _)| rank > *best_rank);
                 if better {
-                    chosen = Some((rank, bus.clone(), path.clone(), name));
+                    chosen = Some((rank, bus, path, name));
                     if rank == AppMatchRank::Exact {
                         break;
                     }
@@ -808,14 +855,14 @@ async fn find_atspi_target(
                     .as_ref()
                     .is_none_or(|(best_rank, _, _, _)| rank > *best_rank);
                 if better {
-                    chosen = Some((rank, bus.clone(), path.clone(), name));
+                    chosen = Some((rank, bus, path, name));
                     if rank == AppMatchRank::Exact {
                         break;
                     }
                 }
             }
         } else if !name.is_empty() {
-            chosen = Some((AppMatchRank::Exact, bus.clone(), path.clone(), name));
+            chosen = Some((AppMatchRank::Exact, bus, path, name));
             break;
         }
     }
@@ -881,18 +928,17 @@ async fn get_children_range(proxy: &Proxy<'_>, start: usize, end: usize) -> Vec<
     if start >= end {
         return Vec::new();
     }
-    let mut out = Vec::with_capacity(end - start);
-    for idx in start..end {
-        if let Ok((cbus, cpath)) = proxy
+    // Issue all `GetChildAtIndex` calls in this batch concurrently, preserving sibling order.
+    let results = join_all((start..end).map(|idx| async move {
+        proxy
             .call::<_, _, (String, OwnedObjectPath)>("GetChildAtIndex", &(idx as i32,))
             .await
-            && !cbus.is_empty()
-            && cpath.as_str() != "/org/a11y/atspi/null"
-        {
-            out.push((cbus, cpath.to_string()));
-        }
-    }
-    out
+            .ok()
+            .filter(|(cbus, cpath)| !cbus.is_empty() && cpath.as_str() != "/org/a11y/atspi/null")
+            .map(|(cbus, cpath)| (cbus, cpath.to_string()))
+    }))
+    .await;
+    results.into_iter().flatten().collect()
 }
 
 async fn get_extents(conn: &Connection, bus: &str, path: &str) -> Option<Rect> {

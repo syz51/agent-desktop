@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::ptr;
 use std::sync::OnceLock;
@@ -351,6 +352,20 @@ pub fn windows(app_filter: Option<&str>) -> Result<Vec<WindowInfo>, RpcError> {
         return Ok(Vec::new());
     }
     let displays = displays()?;
+    windows_with_displays(app_filter, &displays)
+}
+
+/// Enumerate on-screen windows reusing an already-fetched `displays` slice and caching per-PID
+/// `NSRunningApplication` lookups across all windows belonging to the same process.
+pub fn windows_with_displays(
+    app_filter: Option<&str>,
+    displays: &[DisplayInfo],
+) -> Result<Vec<WindowInfo>, RpcError> {
+    if let Some(filter) = app_filter
+        && filter.trim().is_empty()
+    {
+        return Ok(Vec::new());
+    }
     let front_pid = frontmost_pid();
 
     // SAFETY: CoreGraphics returns an owned CFArray of CFDictionary entries.
@@ -364,6 +379,7 @@ pub fn windows(app_filter: Option<&str>) -> Result<Vec<WindowInfo>, RpcError> {
         return Ok(Vec::new());
     };
 
+    let mut pid_apps: HashMap<i32, Option<AppInfo>> = HashMap::new();
     let mut out = Vec::new();
     // SAFETY: `list` is a valid CFArrayRef.
     let count = unsafe { ffi::CFArrayGetCount(list.as_ptr()) };
@@ -377,7 +393,11 @@ pub fn windows(app_filter: Option<&str>) -> Result<Vec<WindowInfo>, RpcError> {
         if pid <= 0 {
             continue;
         }
-        let Some(app) = running_app_for_pid(pid) else {
+        let Some(app) = pid_apps
+            .entry(pid)
+            .or_insert_with(|| running_app_for_pid(pid))
+            .clone()
+        else {
             continue;
         };
         if let Some(filter) = app_filter

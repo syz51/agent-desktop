@@ -122,6 +122,27 @@ impl DesktopEngine {
         }
     }
 
+    /// Proactively reap an expired or user-stopped lease when no RPCs are arriving (e.g. an
+    /// abandoned remote HTTP session), releasing display-awake, overlay, and warm `SCStream`
+    /// resources promptly. Returns `true` if a lease was torn down.
+    pub fn reap_expired_lease(&self) -> bool {
+        let now = self.clock.now();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let had_lease = st.lease.is_some();
+        self.expire_lease_if_needed(&mut st);
+        if st.lease.as_ref().is_some_and(|l| l.control_armed)
+            && self.backend.stop_flag().load(Ordering::Acquire)
+        {
+            let lease = st.lease.take().expect("checked above");
+            let stop_time = self.backend.take_stop_triggered_at().unwrap_or(now);
+            st.stopped_at = Some(stop_time);
+            st.stopped_session_id = Some(lease.info.session_id.clone());
+            self.backend.stop_flag().store(false, Ordering::Release);
+            self.teardown_lease(&lease, "stopped_by_user");
+        }
+        had_lease && st.lease.is_none()
+    }
+
     /// Trigger an immediate external stop (e.g. `desktop stop` CLI or SIGINT).
     pub fn trigger_stop(&self, caller: Option<&str>) -> bool {
         let now = self.clock.now();

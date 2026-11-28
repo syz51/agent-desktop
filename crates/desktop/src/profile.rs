@@ -353,8 +353,35 @@ pub async fn run_live_profile(
     let mut stages = Vec::new();
     let mut snapshot_anatomy = None;
 
-    // Stage 1: Discovery
-    let hosts = client.list_hosts().await;
+    // Stage 1: Discovery (run independent read-only RPCs concurrently)
+    let hosts_fut = client.list_hosts();
+    let status_fut = client.call(host, RpcMethod::Status);
+    let wins_all_fut = client.call(
+        host,
+        RpcMethod::ListWindows(ListWindowsParams {
+            app: None,
+            include_displays: true,
+        }),
+    );
+    let wins_app_fut = async {
+        match &app {
+            Some(app_filter) => Some(
+                client
+                    .call(
+                        host,
+                        RpcMethod::ListWindows(ListWindowsParams {
+                            app: Some(app_filter.clone()),
+                            include_displays: false,
+                        }),
+                    )
+                    .await,
+            ),
+            None => None,
+        }
+    };
+    let (hosts, status_res, wins_all_res, wins_app_res) =
+        tokio::join!(hosts_fut, status_fut, wins_all_fut, wins_app_fut);
+
     let hosts_txt = mcp::render_hosts(&hosts);
     stages.push(metric_from_text(
         "discovery",
@@ -363,7 +390,7 @@ pub async fn run_live_profile(
         format!("{} host(s)", hosts.len()),
     ));
 
-    let status_res = client.call(host, RpcMethod::Status).await?;
+    let status_res = status_res?;
     let status_txt = blocks_text(&mcp::render_result(status_res));
     stages.push(metric_from_text(
         "discovery",
@@ -372,15 +399,7 @@ pub async fn run_live_profile(
         "1 host",
     ));
 
-    let wins_all = client
-        .call(
-            host,
-            RpcMethod::ListWindows(ListWindowsParams {
-                app: None,
-                include_displays: true,
-            }),
-        )
-        .await?;
+    let wins_all = wins_all_res?;
     let win_count = match &wins_all {
         RpcResult::Windows { windows, .. } => windows.len(),
         _ => 0,
@@ -393,16 +412,8 @@ pub async fn run_live_profile(
         format!("{win_count} windows"),
     ));
 
-    if let Some(app_filter) = &app {
-        let wins_app = client
-            .call(
-                host,
-                RpcMethod::ListWindows(ListWindowsParams {
-                    app: Some(app_filter.clone()),
-                    include_displays: false,
-                }),
-            )
-            .await?;
+    if let (Some(app_filter), Some(res)) = (&app, wins_app_res) {
+        let wins_app = res?;
         let app_win_count = match &wins_app {
             RpcResult::Windows { windows, .. } => windows.len(),
             _ => 0,
