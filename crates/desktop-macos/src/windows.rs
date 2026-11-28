@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::ptr;
+use std::sync::OnceLock;
 
 use desktop_proto::{
     AppInfo, AppMatchRank, DisplayInfo, ErrorCode, FocusMode, Point, Rect, RpcError, WindowInfo,
@@ -17,21 +18,27 @@ use crate::ffi::{
     cf_to_f64, cf_to_i64, cf_to_string,
 };
 
+static LOCAL_HOST_NAME: OnceLock<String> = OnceLock::new();
+
 #[must_use]
 pub fn local_host_name() -> String {
-    std::process::Command::new("scutil")
-        .args(["--get", "LocalHostName"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                (!s.is_empty()).then_some(s)
-            } else {
-                None
-            }
+    LOCAL_HOST_NAME
+        .get_or_init(|| {
+            std::process::Command::new("scutil")
+                .args(["--get", "LocalHostName"])
+                .output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        (!s.is_empty()).then_some(s)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| "local-mac".into())
         })
-        .unwrap_or_else(|| "local-mac".into())
+        .clone()
 }
 
 pub fn displays() -> Result<Vec<DisplayInfo>, RpcError> {

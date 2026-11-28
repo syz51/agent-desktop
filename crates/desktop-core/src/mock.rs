@@ -9,7 +9,7 @@ use desktop_proto::{
 };
 
 use crate::backend::{
-    AnnotateBox, PlatformBackend, RawScreenshot, ResolvedRef, StepExecInfo, Timestamp,
+    AnnotateBox, PlatformBackend, RawScreenshot, ResolvedRef, StepExecInfo, Timestamp, VisualSample,
 };
 use crate::clock::{Clock, SystemClock};
 use crate::kill_switch::EscKillSwitch;
@@ -28,10 +28,15 @@ pub struct MockState {
     pub open_app_calls: Vec<(String, FocusMode)>,
     pub snapshot_calls: Vec<SnapshotParams>,
     pub capture_calls: Vec<(ScreenshotTarget, bool)>,
+    pub visual_sig_calls: usize,
+    pub ui_event_waits: Vec<Option<u32>>,
+    pub hover_calls: Vec<(Point, FocusMode)>,
+    pub scroll_ref_calls: Vec<(String, ScrollDirection, u32, FocusMode)>,
     pub extra_windows: Vec<WindowInfo>,
     pub resolved_ref_app: Option<AppInfo>,
     pub resolved_ref_window_id: Option<u32>,
     pub screenshot_bytes: Vec<u8>,
+    pub visual_sig: Option<[u8; 64]>,
     pub snapshot_seq: u64,
     pub focused: Option<AppInfo>,
     pub ref_requires_focus: bool,
@@ -422,6 +427,7 @@ impl PlatformBackend for MockBackend {
         st.capture_calls
             .push((target.clone(), !annotate.is_empty()));
         let bytes = st.screenshot_bytes.clone();
+        let visual_sig = st.visual_sig;
         drop(st);
         match target {
             ScreenshotTarget::Window { window_id }
@@ -451,8 +457,36 @@ impl PlatformBackend for MockBackend {
             },
             mime_type: format.mime_type().into(),
             bytes,
+            visual_sig,
+        })
+    }
+
+    fn capture_visual_signature(
+        &self,
+        _target: &ScreenshotTarget,
+    ) -> Result<VisualSample, RpcError> {
+        let mut st = self.state.lock().unwrap();
+        st.visual_sig_calls += 1;
+        if let Some(sig) = st.visual_sig {
+            return Ok(VisualSample {
+                sha: None,
+                visual_sig: Some(sig),
+            });
+        }
+        let sha = String::from_utf8_lossy(&st.screenshot_bytes).into_owned();
+        Ok(VisualSample {
+            sha: Some(sha),
             visual_sig: None,
         })
+    }
+
+    fn wait_for_ui_event(&self, pid: Option<u32>, timeout: std::time::Duration) {
+        self.state.lock().unwrap().ui_event_waits.push(pid);
+        std::thread::sleep(timeout.min(std::time::Duration::from_millis(5)));
+    }
+
+    fn wait_for_visual_frame(&self, _target: &ScreenshotTarget, timeout: std::time::Duration) {
+        std::thread::sleep(timeout.min(std::time::Duration::from_millis(5)));
     }
 
     fn click_ref(
@@ -498,11 +532,17 @@ impl PlatformBackend for MockBackend {
         })
     }
 
-    fn hover_point(&self, point: Point) -> Result<StepExecInfo, RpcError> {
-        self.state
-            .lock()
-            .unwrap()
-            .actions_log
+    fn hover_point(&self, point: Point, focus_mode: FocusMode) -> Result<StepExecInfo, RpcError> {
+        if focus_mode == FocusMode::Background {
+            return Err(RpcError::with_next(
+                ErrorCode::RequiresFocus,
+                "hover requires physical pointer movement",
+                "Use focus_mode=\"auto\" or \"foreground\".",
+            ));
+        }
+        let mut st = self.state.lock().unwrap();
+        st.hover_calls.push((point, focus_mode));
+        st.actions_log
             .push(format!("hover:{:.0},{:.0}", point.x, point.y));
         Ok(StepExecInfo {
             detail: "hovered".into(),
@@ -538,8 +578,15 @@ impl PlatformBackend for MockBackend {
         _point: Point,
         direction: ScrollDirection,
         amount: u32,
-        _focus_mode: FocusMode,
+        focus_mode: FocusMode,
     ) -> Result<StepExecInfo, RpcError> {
+        if focus_mode == FocusMode::Background {
+            return Err(RpcError::with_next(
+                ErrorCode::RequiresFocus,
+                "raw coordinate scroll requires pointer input",
+                "Target an @eN ref or use focus_mode=\"auto\".",
+            ));
+        }
         self.state
             .lock()
             .unwrap()
@@ -548,6 +595,24 @@ impl PlatformBackend for MockBackend {
         Ok(StepExecInfo {
             detail: format!("scrolled {direction:?}"),
             used_background: false,
+        })
+    }
+
+    fn scroll_ref(
+        &self,
+        ref_id: &str,
+        direction: ScrollDirection,
+        amount: u32,
+        focus_mode: FocusMode,
+    ) -> Result<StepExecInfo, RpcError> {
+        let mut st = self.state.lock().unwrap();
+        st.scroll_ref_calls
+            .push((ref_id.to_string(), direction, amount, focus_mode));
+        st.actions_log
+            .push(format!("scroll_ref:{ref_id}:{direction:?}:{amount}"));
+        Ok(StepExecInfo {
+            detail: format!("scrolled {ref_id} {direction:?} via AXScrollBar (background)"),
+            used_background: true,
         })
     }
 
@@ -2376,5 +2441,178 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(snap_denied.code, ErrorCode::PolicyDenied);
+    }
+
+    #[test]
+    fn annotated_screenshot_requests_bounds_while_default_snapshot_omits_them() {
+        let (engine, backend, _, _tmp) = make_engine();
+
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::Snapshot(SnapshotParams::default()),
+            )
+            .unwrap();
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::Screenshot(ScreenshotParams {
+                    annotate: true,
+                    ..ScreenshotParams::default()
+                }),
+            )
+            .unwrap();
+
+        let calls = backend.state.lock().unwrap().snapshot_calls.clone();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            !calls[0].include_bounds,
+            "default snapshot must not request geometry bounds"
+        );
+        assert!(
+            calls[1].include_bounds,
+            "annotated screenshot must request bounds for Set-of-Marks boxes"
+        );
+    }
+
+    #[test]
+    fn background_hover_is_rejected_and_ref_scroll_routes_through_scroll_ref() {
+        let (engine, backend, _, _tmp) = make_engine();
+
+        let hover_act = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::Hover {
+                        target: Target::Ref {
+                            ref_id: "@e3".into(),
+                        },
+                    }],
+                    after: PostAction::None,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Background,
+                    release_after: false,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            hover_act.error.as_ref().map(|e| e.code),
+            Some(ErrorCode::RequiresFocus),
+            "hover in background mode must fail fast instead of moving cursor"
+        );
+
+        let scroll_act = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::Scroll {
+                        target: Target::Ref {
+                            ref_id: "@e3".into(),
+                        },
+                        direction: ScrollDirection::Down,
+                        amount: 4,
+                    }],
+                    after: PostAction::None,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Background,
+                    release_after: false,
+                }),
+            )
+            .unwrap()
+        {
+            RpcResult::Act(r) => r,
+            _ => unreachable!(),
+        };
+        assert!(scroll_act.error.is_none());
+        assert!(scroll_act.steps[0].used_background);
+        assert_eq!(
+            backend.state.lock().unwrap().scroll_ref_calls,
+            vec![(
+                "@e3".into(),
+                ScrollDirection::Down,
+                4,
+                FocusMode::Background
+            )]
+        );
+    }
+
+    #[test]
+    fn wait_visual_change_uses_lightweight_signature_and_ui_wait_notifies_pid() {
+        let (engine, backend, _, _tmp) = make_engine();
+        backend.state.lock().unwrap().visual_sig = Some([50u8; 64]);
+
+        let backend_bg = Arc::clone(&backend);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            backend_bg.state.lock().unwrap().visual_sig = Some([120u8; 64]);
+        });
+
+        let wait_res = engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::Wait(WaitParams {
+                    condition: WaitCondition::VisualChange {
+                        target: ScreenshotTarget::Display { index: None },
+                    },
+                    timeout_ms: 500,
+                }),
+            )
+            .unwrap();
+        handle.join().unwrap();
+
+        match wait_res {
+            RpcResult::Wait { matched, .. } => assert!(matched),
+            _ => unreachable!(),
+        }
+        let st = backend.state.lock().unwrap();
+        assert!(
+            st.visual_sig_calls >= 2,
+            "visual wait should use lightweight capture_visual_signature"
+        );
+        assert!(
+            st.capture_calls.is_empty(),
+            "visual wait must not trigger full JPEG capture when capture_visual_signature is implemented"
+        );
+        drop(st);
+
+        // Verify UI wait passes target app PID to wait_for_ui_event.
+        let exists_res = engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent"),
+                RpcMethod::Wait(WaitParams {
+                    condition: WaitCondition::Exists {
+                        query: "NonExistentWidget".into(),
+                        role: None,
+                        app: Some("Notes".into()),
+                    },
+                    timeout_ms: 40,
+                }),
+            )
+            .unwrap();
+        match exists_res {
+            RpcResult::Wait { matched, .. } => assert!(!matched),
+            _ => unreachable!(),
+        }
+        let waits = backend.state.lock().unwrap().ui_event_waits.clone();
+        assert!(
+            waits.contains(&Some(1234)),
+            "expected wait_for_ui_event to receive Notes pid 1234, got {waits:?}"
+        );
     }
 }

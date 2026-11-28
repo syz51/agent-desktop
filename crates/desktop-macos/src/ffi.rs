@@ -19,19 +19,36 @@ pub type CFMutableDataRef = *mut c_void;
 pub type CFTypeID = usize;
 pub type CFIndex = isize;
 pub type AXUIElementRef = *mut c_void;
+pub type AXObserverRef = *mut c_void;
 pub type AXValueRef = *const c_void;
 pub type AXError = i32;
+pub type CFRunLoopRef = *mut c_void;
+pub type CFRunLoopSourceRef = *mut c_void;
+pub type AXObserverCallback = unsafe extern "C" fn(
+    observer: AXObserverRef,
+    element: AXUIElementRef,
+    notification: CFStringRef,
+    refcon: *mut c_void,
+);
 pub type CGDirectDisplayID = u32;
 pub type CGDisplayModeRef = *mut c_void;
 pub type CGEventSourceRef = *mut c_void;
 pub type CGEventRef = *mut c_void;
 pub type CGImageRef = *mut c_void;
 pub type CGImageDestinationRef = *mut c_void;
+pub type CGDataProviderRef = *const c_void;
+
+/// Opaque type for CoreFoundation static callback tables (avoiding `&c_void` 1-byte provenance UB).
+#[repr(C)]
+pub struct CFOpaqueStatic {
+    _private: [u8; 0],
+}
 pub type CGContextRef = *mut c_void;
 pub type CGColorSpaceRef = *mut c_void;
 pub type IOPMAssertionID = u32;
 
 pub const K_AX_ERROR_SUCCESS: AXError = 0;
+pub const K_AX_COPY_MULTIPLE_ATTRIBUTE_OPTION_NONE: u32 = 0;
 pub const K_AX_VALUE_CGPOINT_TYPE: u32 = 1;
 pub const K_AX_VALUE_CGSIZE_TYPE: u32 = 2;
 
@@ -69,6 +86,10 @@ pub const K_CG_EVENT_FLAG_MASK_SECONDARY_FN: u64 = 0x0080_0000;
 
 pub const K_CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
 pub const K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST: u32 = 1;
+pub const K_CG_IMAGE_ALPHA_PREMULTIPLIED_FIRST: u32 = 2;
+pub const K_CG_BITMAP_BYTE_ORDER_32_LITTLE: u32 = 2 << 12;
+pub const K_CG_BITMAP_INFO_BGRA: u32 =
+    K_CG_IMAGE_ALPHA_PREMULTIPLIED_FIRST | K_CG_BITMAP_BYTE_ORDER_32_LITTLE;
 
 pub const K_IOPM_ASSERTION_LEVEL_ON: u32 = 255;
 
@@ -119,6 +140,24 @@ unsafe extern "C" {
     pub fn CFArrayGetTypeID() -> CFTypeID;
     pub fn CFArrayGetCount(the_array: CFArrayRef) -> CFIndex;
     pub fn CFArrayGetValueAtIndex(the_array: CFArrayRef, idx: CFIndex) -> CFTypeRef;
+    pub fn CFArrayCreate(
+        allocator: CFTypeRef,
+        values: *const CFTypeRef,
+        num_values: CFIndex,
+        callbacks: *const c_void,
+    ) -> CFArrayRef;
+    pub static kCFTypeArrayCallBacks: CFOpaqueStatic;
+
+    pub static kCFRunLoopDefaultMode: CFStringRef;
+    pub fn CFRunLoopGetCurrent() -> CFRunLoopRef;
+    pub fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
+    pub fn CFRunLoopRemoveSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
+    pub fn CFRunLoopStop(rl: CFRunLoopRef);
+    pub fn CFRunLoopRunInMode(
+        mode: CFStringRef,
+        seconds: f64,
+        return_after_source_handled: u8,
+    ) -> i32;
 
     pub fn CFDictionaryGetValue(the_dict: CFDictionaryRef, key: CFTypeRef) -> CFTypeRef;
     pub fn CFDictionaryCreate(
@@ -129,8 +168,8 @@ unsafe extern "C" {
         key_callbacks: *const c_void,
         value_callbacks: *const c_void,
     ) -> CFDictionaryRef;
-    pub static kCFTypeDictionaryKeyCallBacks: c_void;
-    pub static kCFTypeDictionaryValueCallBacks: c_void;
+    pub static kCFTypeDictionaryKeyCallBacks: CFOpaqueStatic;
+    pub static kCFTypeDictionaryValueCallBacks: CFOpaqueStatic;
 
     pub fn CFBooleanGetTypeID() -> CFTypeID;
     pub fn CFBooleanGetValue(boolean: CFBooleanRef) -> u8;
@@ -206,6 +245,12 @@ unsafe extern "C" {
 
     pub fn CGImageGetWidth(image: CGImageRef) -> usize;
     pub fn CGImageGetHeight(image: CGImageRef) -> usize;
+    pub fn CGImageGetBitsPerComponent(image: CGImageRef) -> usize;
+    pub fn CGImageGetBitsPerPixel(image: CGImageRef) -> usize;
+    pub fn CGImageGetBytesPerRow(image: CGImageRef) -> usize;
+    pub fn CGImageGetBitmapInfo(image: CGImageRef) -> u32;
+    pub fn CGImageGetDataProvider(image: CGImageRef) -> CGDataProviderRef;
+    pub fn CGDataProviderCopyData(provider: CGDataProviderRef) -> CFDataRef;
     pub fn CGColorSpaceCreateDeviceRGB() -> CGColorSpaceRef;
     pub fn CGBitmapContextCreate(
         data: *mut c_void,
@@ -237,6 +282,12 @@ unsafe extern "C" {
         attribute: CFStringRef,
         value: *mut CFTypeRef,
     ) -> AXError;
+    pub fn AXUIElementCopyMultipleAttributeValues(
+        element: AXUIElementRef,
+        attributes: CFArrayRef,
+        options: u32,
+        values: *mut CFArrayRef,
+    ) -> AXError;
     pub fn AXUIElementSetAttributeValue(
         element: AXUIElementRef,
         attribute: CFStringRef,
@@ -248,6 +299,23 @@ unsafe extern "C" {
     pub fn AXUIElementGetTypeID() -> CFTypeID;
     pub fn AXValueGetTypeID() -> CFTypeID;
     pub fn AXValueGetValue(value: AXValueRef, the_type: u32, value_ptr: *mut c_void) -> bool;
+    pub fn AXObserverCreate(
+        application: i32,
+        callback: AXObserverCallback,
+        out_observer: *mut AXObserverRef,
+    ) -> AXError;
+    pub fn AXObserverAddNotification(
+        observer: AXObserverRef,
+        element: AXUIElementRef,
+        notification: CFStringRef,
+        refcon: *mut c_void,
+    ) -> AXError;
+    pub fn AXObserverRemoveNotification(
+        observer: AXObserverRef,
+        element: AXUIElementRef,
+        notification: CFStringRef,
+    ) -> AXError;
+    pub fn AXObserverGetRunLoopSource(observer: AXObserverRef) -> CFRunLoopSourceRef;
 }
 
 #[link(name = "ImageIO", kind = "framework")]

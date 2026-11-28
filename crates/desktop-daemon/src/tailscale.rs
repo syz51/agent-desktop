@@ -130,7 +130,7 @@ pub fn parse_ip_addr_tailscale_ipv4(output: &str) -> Option<IpAddr> {
 
 /// Caches `tailscale whois` peer verification so hot-path remote RPC adds 0 ms overhead.
 pub struct TailscaleWhoisCache {
-    self_user_id: Mutex<Option<Option<i64>>>,
+    self_user_id: Mutex<Option<i64>>,
     verified: Mutex<HashMap<IpAddr, Instant>>,
 }
 
@@ -146,6 +146,27 @@ impl TailscaleWhoisCache {
         Self {
             self_user_id: Mutex::new(None),
             verified: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Fast non-blocking check whether `peer_ip` is already verified in the TTL cache.
+    #[must_use]
+    pub fn is_verified_cached(&self, peer_ip: IpAddr) -> bool {
+        if peer_ip.is_loopback() {
+            return true;
+        }
+        if !is_tailscale_ip(peer_ip) {
+            return false;
+        }
+        let guard = self.verified.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(&peer_ip).is_some_and(|exp| Instant::now() < *exp)
+    }
+
+    /// Pre-populate `self_user_id` off the request hot path at daemon startup so the first cold
+    /// `verify_peer` call avoids spawning a second `tailscale status --json` subprocess.
+    pub fn prewarm_self_user_id(&self) {
+        if let Some(bin) = find_tailscale_bin() {
+            let _ = self.self_user_id(&bin);
         }
     }
 
@@ -214,10 +235,14 @@ impl TailscaleWhoisCache {
     }
 
     fn self_user_id(&self, bin: &Path) -> Option<i64> {
-        let mut guard = self.self_user_id.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(cached) = *guard {
-            return cached;
+        {
+            let guard = self.self_user_id.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = *guard {
+                return Some(cached);
+            }
         }
+        // Only cache a resolved user ID so a transient boot-time failure (e.g. Tailscale not yet
+        // ready when LaunchAgent starts) retries on later verification rather than disabling checks.
         let uid = Command::new(bin)
             .args(["status", "--json"])
             .output()
@@ -228,7 +253,9 @@ impl TailscaleWhoisCache {
                 v.pointer("/Self/UserID")
                     .and_then(serde_json::Value::as_i64)
             });
-        *guard = Some(uid);
+        if let Some(id) = uid {
+            *self.self_user_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+        }
         uid
     }
 }
@@ -261,5 +288,13 @@ utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280
             parse_ip_addr_tailscale_ipv4(linux_sample),
             Some(IpAddr::V4(Ipv4Addr::new(100, 64, 12, 34)))
         );
+    }
+
+    #[test]
+    fn whois_cache_fast_path_recognizes_loopback_and_rejects_uncached_peers() {
+        let cache = TailscaleWhoisCache::new();
+        assert!(cache.is_verified_cached(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!cache.is_verified_cached(IpAddr::V4(Ipv4Addr::new(100, 64, 1, 2))));
+        assert!(!cache.is_verified_cached(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))));
     }
 }

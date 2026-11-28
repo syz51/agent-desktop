@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -75,6 +75,8 @@ pub struct DesktopClient {
     http: reqwest::Client,
     /// Pooled HTTP clients keyed by `connect_timeout_ms` to preserve TCP keep-alive connections.
     http_pool: Mutex<HashMap<u64, reqwest::Client>>,
+    /// mtime-keyed cache of `fleet.toml` so repeated remote RPCs avoid disk reads and TOML parsing.
+    fleet_cache: Mutex<Option<(Option<SystemTime>, FleetConfig)>>,
     sessions: Mutex<HashMap<String, String>>,
     next_id: AtomicU64,
 }
@@ -105,9 +107,27 @@ impl DesktopClient {
             conn: Mutex::new(None),
             http,
             http_pool: Mutex::new(HashMap::new()),
+            fleet_cache: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         }
+    }
+
+    async fn load_fleet_cached(&self) -> Result<FleetConfig, RpcError> {
+        let mtime = std::fs::metadata(&self.fleet_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        {
+            let guard = self.fleet_cache.lock().await;
+            if let Some((cached_mtime, cfg)) = guard.as_ref()
+                && *cached_mtime == mtime
+            {
+                return Ok(cfg.clone());
+            }
+        }
+        let cfg = FleetConfig::load_from(&self.fleet_path)?;
+        *self.fleet_cache.lock().await = Some((mtime, cfg.clone()));
+        Ok(cfg)
     }
 
     async fn pooled_http(&self, connect_ms: u64) -> reqwest::Client {
@@ -149,7 +169,7 @@ impl DesktopClient {
 
     /// Query `"local"` and all peers configured in `fleet.toml` concurrently.
     pub async fn list_hosts(&self) -> Vec<HostEntryStatus> {
-        let fleet = FleetConfig::load_from(&self.fleet_path).unwrap_or_default();
+        let fleet = self.load_fleet_cached().await.unwrap_or_default();
 
         let local_fut = async {
             let start = Instant::now();
@@ -232,7 +252,7 @@ impl DesktopClient {
         if alias.is_empty() || alias == "local" {
             return Ok(());
         }
-        let fleet = FleetConfig::load_from(&self.fleet_path)?;
+        let fleet = self.load_fleet_cached().await?;
         let Some(peer) = fleet.hosts.get(alias) else {
             return Ok(());
         };
@@ -304,7 +324,7 @@ impl DesktopClient {
         method: RpcMethod,
         total_timeout: Option<Duration>,
     ) -> Result<RpcResult, RpcError> {
-        let fleet = FleetConfig::load_from(&self.fleet_path)?;
+        let fleet = self.load_fleet_cached().await?;
         let peer = fleet.hosts.get(alias).ok_or_else(|| {
             let known: Vec<&str> = fleet.hosts.keys().map(String::as_str).collect();
             RpcError::with_next(
