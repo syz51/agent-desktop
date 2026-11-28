@@ -155,7 +155,12 @@ impl DesktopClient {
             return Ok(inline.to_string());
         }
         let home = dirs::home_dir();
-        if let Some(raw_path) = peer.token_file.as_deref() {
+        if let Some(raw_path) = peer
+            .token_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             let expanded = desktop_proto::expand_tilde(raw_path, home.as_deref());
             let stamp = std::fs::metadata(&expanded)
                 .ok()
@@ -680,13 +685,18 @@ mod tests {
         let peer = PeerHostConfig {
             addr: "127.0.0.1:9999".into(),
             token: None,
-            token_file: Some(token_path.display().to_string()),
+            token_file: Some(format!(" {} ", token_path.display())),
             connect_timeout_ms: None,
         };
 
         assert_eq!(
             client.resolve_token_cached(&peer).await.unwrap(),
             "token-v1"
+        );
+        assert_eq!(
+            client.token_cache.lock().await.len(),
+            1,
+            "trimmed token_file path must populate token_cache"
         );
         assert_eq!(
             client.resolve_token_cached(&peer).await.unwrap(),

@@ -804,14 +804,21 @@ async fn find_atspi_target(
         ));
     }
 
-    // Fetch all registered AT-SPI2 app names concurrently instead of awaiting sequentially.
+    // Fetch all registered AT-SPI2 app names concurrently with a tight per-app timeout so a
+    // single hung or suspended desktop app cannot stall discovery for zbus's 25 s default timeout.
+    const APP_NAME_TIMEOUT: Duration = Duration::from_millis(150);
     let named_apps: Vec<Option<(String, String, String)>> =
         join_all(apps.iter().map(|(bus, path)| async move {
-            let p = uncached_proxy(conn, bus, path, "org.a11y.atspi.Accessible")
-                .await
-                .ok()?;
-            let name: String = p.get_property("Name").await.unwrap_or_default();
-            Some((bus.clone(), path.clone(), name))
+            tokio::time::timeout(APP_NAME_TIMEOUT, async {
+                let p = uncached_proxy(conn, bus, path, "org.a11y.atspi.Accessible")
+                    .await
+                    .ok()?;
+                let name: String = p.get_property("Name").await.unwrap_or_default();
+                Some((bus.clone(), path.clone(), name))
+            })
+            .await
+            .ok()
+            .flatten()
         }))
         .await;
 

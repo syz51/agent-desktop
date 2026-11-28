@@ -2650,6 +2650,8 @@ mod tests {
         );
 
         // Now acquire an armed control lease and trip the physical kill-switch while idle.
+        // Before TTL expires, reap_expired_lease must NOT clear stop_flag or remove the lease,
+        // so in-flight steps can abort and the stopped owner still receives StoppedByUser.
         engine
             .handle(
                 Some(2),
@@ -2676,9 +2678,22 @@ mod tests {
 
         backend.stop.store(true, Ordering::Release);
         assert!(
-            engine.reap_expired_lease(),
-            "reaper must tear down armed control lease when stop_flag is latched"
+            !engine.reap_expired_lease(),
+            "reaper must not prematurely clear stop_flag on a non-expired lease"
         );
+        assert!(backend.stop.load(Ordering::Acquire));
+
+        // Even past the 5s cooldown, the stopped owner's next RPC still receives StoppedByUser.
+        clock.advance(Duration::seconds(10));
+        let stopped_err = engine
+            .handle(
+                Some(2),
+                None,
+                Some("remote-agent-2"),
+                RpcMethod::Snapshot(SnapshotParams::default()),
+            )
+            .unwrap_err();
+        assert_eq!(stopped_err.code, ErrorCode::StoppedByUser);
         assert!(!backend.stop.load(Ordering::Acquire));
         assert!(!backend.state.lock().unwrap().control_active);
         assert!(!backend.state.lock().unwrap().display_awake);

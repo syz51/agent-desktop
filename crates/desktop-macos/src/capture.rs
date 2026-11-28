@@ -65,29 +65,31 @@ pub fn capture(
 
     let displays = windows::displays()?;
 
-    // Resolve stream target once (avoiding redundant `windows()` and `displays()` calls on miss).
-    let resolved_target = resolve_stream_target(target, &displays)?;
-    let resolved_window_id = match resolved_target {
-        Some((StreamKey::Window(wid), _)) => Some(wid),
-        _ => None,
-    };
-
     // Fast path: serve live warm SCStream BGRA frame directly in memory (~3-10 ms!) for Display
     // and non-foreground Window/App targets when live bounds still match (no RGBA swizzle).
-    if focus_mode != FocusMode::Foreground
-        && let Some((key, expected_bounds)) = resolved_target
-        && let Some(frame) = stream.latest_frame(key, expected_bounds)
-    {
-        return encode_bgra_frame(
-            &frame.bgra,
-            frame.width,
-            frame.height,
-            frame.display_bounds,
-            format,
-            annotate,
-            frame.visual_sig,
-        );
-    }
+    // Skip target enumeration for Foreground mode so we never do an unused desktop window scan.
+    let resolved_window_id = if focus_mode != FocusMode::Foreground {
+        let resolved_target = resolve_stream_target(target, &displays)?;
+        if let Some((key, expected_bounds)) = resolved_target
+            && let Some(frame) = stream.latest_frame(key, expected_bounds)
+        {
+            return encode_bgra_frame(
+                &frame.bgra,
+                frame.width,
+                frame.height,
+                frame.display_bounds,
+                format,
+                annotate,
+                frame.visual_sig,
+            );
+        }
+        match resolved_target {
+            Some((StreamKey::Window(wid), _)) => Some(wid),
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     let force_fresh_content = focus_mode == FocusMode::Foreground;
     let content = fetch_shareable_content(force_fresh_content)?;
@@ -231,22 +233,30 @@ fn resolve_stream_target(
             Ok(Some((StreamKey::Window(*window_id), live_bounds)))
         }
         ScreenshotTarget::App { app } => {
-            let wins = windows::windows_with_displays(Some(app), displays)?;
-            let first = wins
-                .iter()
-                .find(|w| w.layer == 0)
-                .or_else(|| wins.first())
-                .ok_or_else(|| {
-                    RpcError::with_next(
-                        ErrorCode::NotFound,
-                        format!("no visible window found for app {app:?}"),
-                        "Open the app or call list_windows to inspect available windows.",
-                    )
-                })?;
-            Ok(Some((StreamKey::Window(first.id), Some(first.bounds))))
+            let (id, bounds) = resolve_app_window(app, displays)?;
+            Ok(Some((StreamKey::Window(id), Some(bounds))))
         }
         ScreenshotTarget::Region { .. } => Ok(None),
     }
+}
+
+fn resolve_app_window(
+    app: &str,
+    displays: &[desktop_proto::DisplayInfo],
+) -> Result<(u32, Rect), RpcError> {
+    let wins = windows::windows_with_displays(Some(app), displays)?;
+    let first = wins
+        .iter()
+        .find(|w| w.layer == 0)
+        .or_else(|| wins.first())
+        .ok_or_else(|| {
+            RpcError::with_next(
+                ErrorCode::NotFound,
+                format!("no visible window found for app {app:?}"),
+                "Open the app or call list_windows to inspect available windows.",
+            )
+        })?;
+    Ok((first.id, first.bounds))
 }
 
 #[allow(clippy::type_complexity)]
@@ -336,20 +346,7 @@ fn build_capture_plan(
         ScreenshotTarget::App { app } => {
             let wid = match resolved_window_id {
                 Some(id) => id,
-                None => {
-                    let wins = windows::windows_with_displays(Some(app), displays)?;
-                    wins.iter()
-                        .find(|w| w.layer == 0)
-                        .or_else(|| wins.first())
-                        .ok_or_else(|| {
-                            RpcError::with_next(
-                                ErrorCode::NotFound,
-                                format!("no visible window found for app {app:?}"),
-                                "Open the app or call list_windows to inspect available windows.",
-                            )
-                        })?
-                        .id
-                }
+                None => resolve_app_window(app, displays)?.0,
             };
             let plan = capture_window_filter(content, displays, wid, focus_mode)?;
             stream.ensure_started_window(

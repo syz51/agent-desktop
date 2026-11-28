@@ -1,9 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use desktop_proto::{AppInfo, ErrorCode, PolicyConfig, PolicyMode, RpcError};
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PolicyFileStamp {
@@ -108,24 +111,27 @@ impl PolicyStore {
         let body = toml::to_string_pretty(config).map_err(|err| {
             RpcError::new(ErrorCode::Internal, format!("serialize policy: {err}"))
         })?;
-        let tmp = self.path.with_extension("toml.tmp");
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = self
+            .path
+            .with_extension(format!("toml.{}.{seq}.tmp", std::process::id()));
+        // Serialize in-process saves and invalidate the cache rather than caching a post-rename
+        // stat that could race with an external writer and poison the cache.
+        let mut cache_guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         fs::write(&tmp, body).map_err(|err| {
             RpcError::new(
                 ErrorCode::BackendError,
                 format!("write {}: {err}", tmp.display()),
             )
         })?;
-        fs::rename(&tmp, &self.path).map_err(|err| {
-            RpcError::new(
+        if let Err(err) = fs::rename(&tmp, &self.path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(RpcError::new(
                 ErrorCode::BackendError,
                 format!("commit {}: {err}", self.path.display()),
-            )
-        })?;
-        let stamp = self
-            .current_stamp()
-            .ok()
-            .filter(|s| *s != PolicyFileStamp::Uncacheable);
-        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = stamp.map(|s| (s, config.clone()));
+            ));
+        }
+        *cache_guard = None;
         Ok(())
     }
 }
