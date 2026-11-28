@@ -554,7 +554,16 @@ impl PlatformBackend for LinuxBackend {
         })
     }
 
-    fn hover_point(&self, point: Point, _focus_mode: FocusMode) -> Result<StepExecInfo, RpcError> {
+    fn hover_point(&self, point: Point, focus_mode: FocusMode) -> Result<StepExecInfo, RpcError> {
+        if focus_mode == FocusMode::Background
+            && !matches!(self.session, SessionKind::HeadlessXvfb { .. })
+        {
+            return Err(RpcError::with_next(
+                ErrorCode::RequiresFocus,
+                "hover requires physical pointer movement on an interactive Linux session",
+                "Use focus_mode=\"auto\" or \"foreground\", or run desktopd with --xvfb.",
+            ));
+        }
         if self.session.is_wayland() && self.session.x11_display().is_none() {
             return wayland::wayland_hover_point(point);
         }
@@ -566,8 +575,17 @@ impl PlatformBackend for LinuxBackend {
         from: Point,
         to: Point,
         mods: Modifiers,
-        _focus_mode: FocusMode,
+        focus_mode: FocusMode,
     ) -> Result<StepExecInfo, RpcError> {
+        if focus_mode == FocusMode::Background
+            && !matches!(self.session, SessionKind::HeadlessXvfb { .. })
+        {
+            return Err(RpcError::with_next(
+                ErrorCode::RequiresFocus,
+                "drag requires physical pointer input on an interactive Linux session",
+                "Use focus_mode=\"auto\" or \"foreground\", or run desktopd with --xvfb.",
+            ));
+        }
         self.with_x11_action(|conn, _| conn.drag(&self.stop_flag, from, to, mods))
     }
 
@@ -576,8 +594,17 @@ impl PlatformBackend for LinuxBackend {
         point: Point,
         direction: ScrollDirection,
         amount: u32,
-        _focus_mode: FocusMode,
+        focus_mode: FocusMode,
     ) -> Result<StepExecInfo, RpcError> {
+        if focus_mode == FocusMode::Background
+            && !matches!(self.session, SessionKind::HeadlessXvfb { .. })
+        {
+            return Err(RpcError::with_next(
+                ErrorCode::RequiresFocus,
+                "scroll requires physical pointer input on an interactive Linux session",
+                "Use focus_mode=\"auto\" or \"foreground\", or run desktopd with --xvfb.",
+            ));
+        }
         if self.session.is_wayland() && self.session.x11_display().is_none() {
             return wayland::wayland_scroll(point, direction, amount);
         }

@@ -36,6 +36,13 @@ pub type CGEventSourceRef = *mut c_void;
 pub type CGEventRef = *mut c_void;
 pub type CGImageRef = *mut c_void;
 pub type CGImageDestinationRef = *mut c_void;
+pub type CGDataProviderRef = *const c_void;
+
+/// Opaque type for CoreFoundation static callback tables (avoiding `&c_void` 1-byte provenance UB).
+#[repr(C)]
+pub struct CFOpaqueStatic {
+    _private: [u8; 0],
+}
 pub type CGContextRef = *mut c_void;
 pub type CGColorSpaceRef = *mut c_void;
 pub type IOPMAssertionID = u32;
@@ -139,7 +146,7 @@ unsafe extern "C" {
         num_values: CFIndex,
         callbacks: *const c_void,
     ) -> CFArrayRef;
-    pub static kCFTypeArrayCallBacks: c_void;
+    pub static kCFTypeArrayCallBacks: CFOpaqueStatic;
 
     pub static kCFRunLoopDefaultMode: CFStringRef;
     pub fn CFRunLoopGetCurrent() -> CFRunLoopRef;
@@ -161,8 +168,8 @@ unsafe extern "C" {
         key_callbacks: *const c_void,
         value_callbacks: *const c_void,
     ) -> CFDictionaryRef;
-    pub static kCFTypeDictionaryKeyCallBacks: c_void;
-    pub static kCFTypeDictionaryValueCallBacks: c_void;
+    pub static kCFTypeDictionaryKeyCallBacks: CFOpaqueStatic;
+    pub static kCFTypeDictionaryValueCallBacks: CFOpaqueStatic;
 
     pub fn CFBooleanGetTypeID() -> CFTypeID;
     pub fn CFBooleanGetValue(boolean: CFBooleanRef) -> u8;
@@ -238,6 +245,12 @@ unsafe extern "C" {
 
     pub fn CGImageGetWidth(image: CGImageRef) -> usize;
     pub fn CGImageGetHeight(image: CGImageRef) -> usize;
+    pub fn CGImageGetBitsPerComponent(image: CGImageRef) -> usize;
+    pub fn CGImageGetBitsPerPixel(image: CGImageRef) -> usize;
+    pub fn CGImageGetBytesPerRow(image: CGImageRef) -> usize;
+    pub fn CGImageGetBitmapInfo(image: CGImageRef) -> u32;
+    pub fn CGImageGetDataProvider(image: CGImageRef) -> CGDataProviderRef;
+    pub fn CGDataProviderCopyData(provider: CGDataProviderRef) -> CFDataRef;
     pub fn CGColorSpaceCreateDeviceRGB() -> CGColorSpaceRef;
     pub fn CGBitmapContextCreate(
         data: *mut c_void,

@@ -268,6 +268,13 @@ impl Default for WarmCaptureStream {
     }
 }
 
+fn rect_approx_eq(a: Rect, b: Rect) -> bool {
+    (a.x - b.x).abs() <= 0.5
+        && (a.y - b.y).abs() <= 0.5
+        && (a.width - b.width).abs() <= 0.5
+        && (a.height - b.height).abs() <= 0.5
+}
+
 impl WarmCaptureStream {
     #[must_use]
     pub fn new() -> Self {
@@ -294,7 +301,10 @@ impl WarmCaptureStream {
     }
 
     /// Return a fresh complete frame for `key` captured safely after the last mutation.
-    pub fn latest_frame(&self, key: StreamKey) -> Option<WarmFrame> {
+    ///
+    /// When `expected_bounds` is provided (e.g. live window bounds), rejects frames whose
+    /// geometry no longer matches (after a window move or resize).
+    pub fn latest_frame(&self, key: StreamKey, expected_bounds: Option<Rect>) -> Option<WarmFrame> {
         let cur_gen = self.mutation_gen.load(Ordering::SeqCst);
         let last_mut = self
             .last_mutation_at
@@ -304,6 +314,11 @@ impl WarmCaptureStream {
         let guard = self.active.lock().ok()?;
         let active = guard.as_ref()?;
         if active.key != key || active.slot.stopped.load(Ordering::SeqCst) {
+            return None;
+        }
+        if let Some(exp) = expected_bounds
+            && !rect_approx_eq(active.slot.display_bounds, exp)
+        {
             return None;
         }
         let frame = active.slot.latest.lock().ok()?.clone()?;
@@ -319,7 +334,11 @@ impl WarmCaptureStream {
     }
 
     /// Return only the 8x8 visual signature from the latest fresh frame without cloning pixels.
-    pub fn latest_visual_sig(&self, key: StreamKey) -> Option<[u8; 64]> {
+    pub fn latest_visual_sig(
+        &self,
+        key: StreamKey,
+        expected_bounds: Option<Rect>,
+    ) -> Option<[u8; 64]> {
         let cur_gen = self.mutation_gen.load(Ordering::SeqCst);
         let last_mut = self
             .last_mutation_at
@@ -329,6 +348,11 @@ impl WarmCaptureStream {
         let guard = self.active.lock().ok()?;
         let active = guard.as_ref()?;
         if active.key != key || active.slot.stopped.load(Ordering::SeqCst) {
+            return None;
+        }
+        if let Some(exp) = expected_bounds
+            && !rect_approx_eq(active.slot.display_bounds, exp)
+        {
             return None;
         }
         let latest = active.slot.latest.lock().ok()?;
@@ -438,6 +462,7 @@ impl WarmCaptureStream {
             && existing.key == key
             && existing.width == w
             && existing.height == h
+            && rect_approx_eq(existing.slot.display_bounds, display_bounds)
             && !existing.slot.stopped.load(Ordering::SeqCst)
         {
             return;

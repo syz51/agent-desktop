@@ -155,13 +155,11 @@ impl Drop for FocusRestoreGuard {
                 }
             }
         }
-        // Only restore focus if the frontmost application actually changed during the HID action
-        // (covers both explicit target_pid activation and implicit activation from click_point/drag/scroll).
+        // Always allow a brief settle window after async CGEventPost before checking/restoring
+        // focus so mouse-up/paste/Return finishes delivering to the target app and macOS finishes
+        // any implicit click-to-activate before we decide whether focus changed.
         if let Some(pid) = self.prev_pid {
-            // Brief settle so macOS finishes processing activation from the click before checking.
-            if windows::frontmost_pid() == Some(pid) {
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            std::thread::sleep(Duration::from_millis(20));
             if windows::frontmost_pid() != Some(pid) {
                 windows::activate_pid(pid);
             }
@@ -488,6 +486,7 @@ fn try_ax_scroll(el: &crate::ax::AxElement, direction: ScrollDirection, amount: 
     let delta = (f64::from(amount.clamp(1, 50)) * 0.05).clamp(0.02, 0.5);
 
     let mut cur = Some(el.clone());
+    let mut had_writable_at_boundary = false;
     for _ in 0..16 {
         let Some(node) = cur else { break };
         let role = node.string_attr("AXRole").unwrap_or_default();
@@ -500,13 +499,19 @@ fn try_ax_scroll(el: &crate::ax::AxElement, direction: ScrollDirection, amount: 
             && let Some(val) = sb.f64_attr("AXValue")
         {
             let next = (val + sign * delta).clamp(0.0, 1.0);
-            if (next - val).abs() > 1e-4 && sb.set_f64_attr("AXValue", next).is_ok() {
-                return true;
+            if (next - val).abs() > 1e-4 {
+                if sb.set_f64_attr("AXValue", next).is_ok() {
+                    return true;
+                }
+            } else if sb.set_f64_attr("AXValue", val).is_ok() {
+                // Already at the 0.0/1.0 boundary of this writable scroll area; keep checking
+                // outer containers in case a parent can still scroll, otherwise treat as handled.
+                had_writable_at_boundary = true;
             }
         }
         cur = node.element_attr("AXParent");
     }
-    false
+    had_writable_at_boundary
 }
 
 pub fn scroll(

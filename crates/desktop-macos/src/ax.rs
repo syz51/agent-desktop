@@ -350,14 +350,14 @@ pub struct BatchedNodeAttrs {
 fn build_cf_string_array(names: &[&str]) -> CfOwned {
     let owned: Vec<CfOwned> = names.iter().map(|s| cf_string(s)).collect();
     let ptrs: Vec<CFTypeRef> = owned.iter().map(CfOwned::as_ptr).collect();
-    // SAFETY: `ptrs` holds `ptrs.len()` valid CFStringRef pointers; `kCFTypeArrayCallBacks`
-    // retains each entry inside the newly created CFArray.
+    // SAFETY: `ptrs` holds `ptrs.len()` valid CFStringRef pointers; `&raw const` passes the
+    // opaque `kCFTypeArrayCallBacks` symbol address without creating a Rust reference.
     let arr = unsafe {
         ffi::CFArrayCreate(
             ptr::null(),
             ptrs.as_ptr(),
             ptrs.len() as ffi::CFIndex,
-            &ffi::kCFTypeArrayCallBacks,
+            (&raw const ffi::kCFTypeArrayCallBacks).cast(),
         )
     };
     // SAFETY: `arr` is a newly created +1 CFArrayRef.
@@ -491,11 +491,13 @@ pub fn wait_for_ui_event(pid: Option<u32>, timeout: Duration, stop: &AtomicBool)
 
     // SAFETY: `CFRunLoopGetCurrent()` returns the current thread's non-null run loop.
     let run_loop = unsafe { ffi::CFRunLoopGetCurrent() };
-    let mut ctx = ObserverCtx {
+    let ctx = ObserverCtx {
         run_loop,
         triggered: AtomicBool::new(false),
     };
-    let refcon = (&mut ctx as *mut ObserverCtx).cast::<c_void>();
+    // Shared raw pointer derived without `&mut` so concurrent reads of `ctx.triggered` and
+    // callback writes via interior mutability (`AtomicBool`) satisfy Stacked Borrows.
+    let refcon = (&raw const ctx).cast_mut().cast::<c_void>();
 
     let app_el = AxElement::application(target_pid);
     const NOTIFICATIONS: &[&str] = &[
@@ -510,10 +512,48 @@ pub fn wait_for_ui_event(pid: Option<u32>, timeout: Duration, stop: &AtomicBool)
         "AXApplicationActivated",
         "AXApplicationDeactivated",
     ];
-    let mut added: Vec<CfOwned> = Vec::with_capacity(NOTIFICATIONS.len());
+
+    /// RAII guard guaranteeing the run-loop source is detached and every notification is removed
+    /// before `ctx` or `observer` can drop (even if a panic unwinds).
+    struct ObserverCleanup<'a> {
+        observer: &'a CfOwned,
+        app_el: &'a AxElement,
+        run_loop: CFRunLoopRef,
+        source: Option<ffi::CFRunLoopSourceRef>,
+        added: Vec<CfOwned>,
+    }
+
+    impl Drop for ObserverCleanup<'_> {
+        fn drop(&mut self) {
+            if let Some(source) = self.source.take() {
+                // SAFETY: `source` was attached to `self.run_loop` in `kCFRunLoopDefaultMode`.
+                unsafe {
+                    ffi::CFRunLoopRemoveSource(self.run_loop, source, ffi::kCFRunLoopDefaultMode);
+                }
+            }
+            for cf_name in &self.added {
+                // SAFETY: Matches every notification successfully registered on `self.observer`.
+                unsafe {
+                    ffi::AXObserverRemoveNotification(
+                        self.observer.as_mut_ptr(),
+                        self.app_el.as_raw(),
+                        cf_name.as_ptr(),
+                    );
+                }
+            }
+        }
+    }
+
+    let mut cleanup = ObserverCleanup {
+        observer: &observer,
+        app_el: &app_el,
+        run_loop,
+        source: None,
+        added: Vec::with_capacity(NOTIFICATIONS.len()),
+    };
     for &name in NOTIFICATIONS {
         let cf_name = cf_string(name);
-        // SAFETY: `observer`, `app_el`, `cf_name`, and `refcon` are valid for the loop below.
+        // SAFETY: `observer`, `app_el`, `cf_name`, and `refcon` remain valid until `cleanup` drops.
         let rc = unsafe {
             ffi::AXObserverAddNotification(
                 observer.as_mut_ptr(),
@@ -523,52 +563,45 @@ pub fn wait_for_ui_event(pid: Option<u32>, timeout: Duration, stop: &AtomicBool)
             )
         };
         if rc == K_AX_ERROR_SUCCESS {
-            added.push(cf_name);
+            cleanup.added.push(cf_name);
         }
     }
 
-    if added.is_empty() {
+    if cleanup.added.is_empty() {
         std::thread::sleep(timeout.min(Duration::from_millis(40)));
         return;
     }
 
     // SAFETY: `observer` is valid and `source` is borrowed from it until `observer` drops.
     let source = unsafe { ffi::AXObserverGetRunLoopSource(observer.as_mut_ptr()) };
-    if !source.is_null() {
-        // SAFETY: Attach source to current thread's run loop, run bounded stop-checkable slices,
-        // and always detach before returning so `refcon` cannot dangle.
-        unsafe {
-            ffi::CFRunLoopAddSource(run_loop, source, ffi::kCFRunLoopDefaultMode);
-        }
-        let deadline = Instant::now() + timeout;
-        while !ctx.triggered.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            let slice = deadline
-                .saturating_duration_since(now)
-                .min(Duration::from_millis(50));
-            // SAFETY: Runs current thread's run loop in default mode, returning immediately when
-            // `on_ax_event` fires or `slice` elapses.
-            unsafe {
-                ffi::CFRunLoopRunInMode(ffi::kCFRunLoopDefaultMode, slice.as_secs_f64(), 1);
-            }
-        }
-        // SAFETY: Detach source before removing notifications and dropping `ctx`.
-        unsafe {
-            ffi::CFRunLoopRemoveSource(run_loop, source, ffi::kCFRunLoopDefaultMode);
-        }
+    if source.is_null() {
+        std::thread::sleep(timeout.min(Duration::from_millis(40)));
+        return;
     }
 
-    for cf_name in &added {
-        // SAFETY: Matches every notification successfully registered above.
+    // SAFETY: Attach source to current thread's run loop; `cleanup` detaches it on all exits.
+    unsafe {
+        ffi::CFRunLoopAddSource(run_loop, source, ffi::kCFRunLoopDefaultMode);
+    }
+    cleanup.source = Some(source);
+
+    let deadline = Instant::now().checked_add(timeout);
+    while !ctx.triggered.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
+        let slice = match deadline {
+            Some(dl) => {
+                let now = Instant::now();
+                if now >= dl {
+                    break;
+                }
+                dl.saturating_duration_since(now)
+                    .min(Duration::from_millis(50))
+            }
+            None => Duration::from_millis(50),
+        };
+        // SAFETY: Runs current thread's run loop in default mode, returning immediately when
+        // `on_ax_event` fires or `slice` elapses.
         unsafe {
-            ffi::AXObserverRemoveNotification(
-                observer.as_mut_ptr(),
-                app_el.as_raw(),
-                cf_name.as_ptr(),
-            );
+            ffi::CFRunLoopRunInMode(ffi::kCFRunLoopDefaultMode, slice.as_secs_f64(), 1);
         }
     }
 }

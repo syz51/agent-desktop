@@ -1337,6 +1337,15 @@ impl DesktopEngine {
                 Target::Ref { ref_id } => {
                     let resolved = self.backend.resolve_ref(&ref_id)?;
                     self.ensure_app_allowed(&resolved.app, policy)?;
+                    // When pointer-wheel fallback is permitted, also verify policy on whichever
+                    // window currently sits at the target point (prevents scrolling an occluding
+                    // denied app on backends without window activation or background AX scroll).
+                    if focus_mode != FocusMode::Background
+                        && let Some(bounds) = resolved.bounds.filter(|b| !b.is_empty())
+                        && let Some(top) = self.backend.app_at_point(bounds.center())?
+                    {
+                        self.ensure_app_allowed(&top, policy)?;
+                    }
                     let post_target = post_target_from_resolved(&resolved);
                     let info = self
                         .backend

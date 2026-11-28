@@ -33,8 +33,8 @@ pub fn request_permissions() -> PermissionsStatus {
             keys.as_ptr(),
             vals.as_ptr(),
             1,
-            &ffi::kCFTypeDictionaryKeyCallBacks,
-            &ffi::kCFTypeDictionaryValueCallBacks,
+            (&raw const ffi::kCFTypeDictionaryKeyCallBacks).cast(),
+            (&raw const ffi::kCFTypeDictionaryValueCallBacks).cast(),
         ));
         if let Some(opts) = opts {
             ffi::AXIsProcessTrustedWithOptions(opts.as_ptr())

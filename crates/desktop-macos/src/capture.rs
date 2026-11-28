@@ -66,10 +66,10 @@ pub fn capture(
     let displays = windows::displays()?;
 
     // Fast path: serve live warm SCStream BGRA frame directly in memory (~3-10 ms!) for Display
-    // and non-foreground Window/App targets without any RGBA swizzle.
+    // and non-foreground Window/App targets when live bounds still match (no RGBA swizzle).
     if focus_mode != FocusMode::Foreground
-        && let Some(key) = resolve_stream_key(target, &displays)?
-        && let Some(frame) = stream.latest_frame(key)
+        && let Some((key, expected_bounds)) = resolve_stream_target(target, &displays)?
+        && let Some(frame) = stream.latest_frame(key, expected_bounds)
     {
         return encode_bgra_frame(
             &frame.bgra,
@@ -111,7 +111,7 @@ pub fn capture(
 }
 
 /// Capture ONLY the 8x8 luma visual signature for `wait(visual_change)`, skipping ImageIO JPEG
-/// encoding and SHA-256 hashing completely.
+/// encoding and SHA-256 hashing whenever the target is >= 8x8 pixels.
 pub fn capture_visual_signature(
     stream: &WarmCaptureStream,
     target: &ScreenshotTarget,
@@ -125,8 +125,8 @@ pub fn capture_visual_signature(
     }
 
     let displays = windows::displays()?;
-    if let Some(key) = resolve_stream_key(target, &displays)?
-        && let Some(sig) = stream.latest_visual_sig(key)
+    if let Some((key, expected_bounds)) = resolve_stream_target(target, &displays)?
+        && let Some(sig) = stream.latest_visual_sig(key, expected_bounds)
     {
         return Ok(VisualSample {
             sha: None,
@@ -139,10 +139,24 @@ pub fn capture_visual_signature(
         build_capture_plan(stream, &content, &displays, target, FocusMode::Background)?;
     let cg_image = capture_image(&filter, &config)?;
     let visual_sig = compute_cg_image_signature(&cg_image);
-    Ok(VisualSample {
-        sha: None,
-        visual_sig,
-    })
+    // Fallback digest only for tiny (< 8x8 px) targets where an 8x8 thumbnail cannot be formed.
+    let sha = if visual_sig.is_none() {
+        encode_cg_image(&cg_image, ImageFormat::Png)
+            .ok()
+            .map(|bytes| short_fnv_digest(&bytes))
+    } else {
+        None
+    };
+    Ok(VisualSample { sha, visual_sig })
+}
+
+fn short_fnv_digest(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// Wait up to `timeout` for the warm `SCStream` backing `target` to push a fresh frame.
@@ -153,7 +167,7 @@ pub fn wait_for_visual_frame(
     stop: &AtomicBool,
 ) {
     if let Ok(displays) = windows::displays()
-        && let Ok(Some(key)) = resolve_stream_key(target, &displays)
+        && let Ok(Some((key, _))) = resolve_stream_target(target, &displays)
     {
         let _ = stream.wait_for_frame(key, timeout, stop);
         return;
@@ -161,10 +175,10 @@ pub fn wait_for_visual_frame(
     std::thread::sleep(timeout.min(Duration::from_millis(40)));
 }
 
-fn resolve_stream_key(
+fn resolve_stream_target(
     target: &ScreenshotTarget,
     displays: &[desktop_proto::DisplayInfo],
-) -> Result<Option<StreamKey>, RpcError> {
+) -> Result<Option<(StreamKey, Option<Rect>)>, RpcError> {
     match target {
         ScreenshotTarget::Display { index } => {
             let disp_info = match index {
@@ -180,9 +194,18 @@ fn resolve_stream_key(
                     .or_else(|| displays.first())
                     .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "no active displays"))?,
             };
-            Ok(Some(StreamKey::Display(disp_info.id)))
+            Ok(Some((
+                StreamKey::Display(disp_info.id),
+                Some(disp_info.bounds),
+            )))
         }
-        ScreenshotTarget::Window { window_id } => Ok(Some(StreamKey::Window(*window_id))),
+        ScreenshotTarget::Window { window_id } => {
+            let live_bounds = windows::windows(None)
+                .ok()
+                .and_then(|wins| wins.into_iter().find(|w| w.id == *window_id))
+                .map(|w| w.bounds);
+            Ok(Some((StreamKey::Window(*window_id), live_bounds)))
+        }
         ScreenshotTarget::App { app } => {
             let wins = windows::windows(Some(app))?;
             let first = wins
@@ -196,7 +219,7 @@ fn resolve_stream_key(
                         "Open the app or call list_windows to inspect available windows.",
                     )
                 })?;
-            Ok(Some(StreamKey::Window(first.id)))
+            Ok(Some((StreamKey::Window(first.id), Some(first.bounds))))
         }
         ScreenshotTarget::Region { .. } => Ok(None),
     }
@@ -704,8 +727,8 @@ fn encode_cg_image(image: &CfOwned, format: ImageFormat) -> Result<Vec<u8>, RpcE
                     keys.as_ptr(),
                     vals.as_ptr(),
                     1,
-                    &ffi::kCFTypeDictionaryKeyCallBacks,
-                    &ffi::kCFTypeDictionaryValueCallBacks,
+                    (&raw const ffi::kCFTypeDictionaryKeyCallBacks).cast(),
+                    (&raw const ffi::kCFTypeDictionaryValueCallBacks).cast(),
                 ))
             }
         } else {
@@ -737,29 +760,72 @@ fn encode_cg_image(image: &CfOwned, format: ImageFormat) -> Result<Vec<u8>, RpcE
     }
 }
 
-/// Compute the 8x8 area-averaged visual signature by downscaling `CGImage` directly into a tiny
-/// 32x32 RGBA bitmap (4 KB instead of allocating a full-resolution ~5 MB bitmap).
+/// Compute the 8x8 area-averaged visual signature directly from `CGImage`'s backing pixel data
+/// (avoiding full-frame `CGContextDrawImage` rasterization while preserving exact pixel-grid
+/// parity with `WarmCaptureStream`'s `visual_signature_from_pixels`).
 fn compute_cg_image_signature(image: &CfOwned) -> Option<[u8; 64]> {
-    // SAFETY: Queries pixel dimensions of the valid CGImage.
-    let w = unsafe { ffi::CGImageGetWidth(image.as_mut_ptr()) };
-    // SAFETY: Queries pixel dimensions of the valid CGImage.
-    let h = unsafe { ffi::CGImageGetHeight(image.as_mut_ptr()) };
+    // SAFETY: Queries dimensions and pixel layout of the valid CGImage.
+    let (w, h, bpc, bpp, bpr, info) = unsafe {
+        (
+            ffi::CGImageGetWidth(image.as_mut_ptr()),
+            ffi::CGImageGetHeight(image.as_mut_ptr()),
+            ffi::CGImageGetBitsPerComponent(image.as_mut_ptr()),
+            ffi::CGImageGetBitsPerPixel(image.as_mut_ptr()),
+            ffi::CGImageGetBytesPerRow(image.as_mut_ptr()),
+            ffi::CGImageGetBitmapInfo(image.as_mut_ptr()),
+        )
+    };
     if w < 8 || h < 8 {
         return None;
     }
-    let thumb_w = w.min(32);
-    let thumb_h = h.min(32);
-    // SAFETY: Creates an owned DeviceRGB color space.
+
+    // Fast direct-provider path for standard 32-bpp 8-bpc RGBA/BGRA images: identical math to
+    // `WarmCaptureStream` without creating a bitmap context or rasterizing the full image.
+    let alpha = info & 0x1F;
+    let byte_order = info & 0x7000;
+    let direct_is_bgra = if bpc == 8 && bpp == 32 && bpr >= w * 4 {
+        if byte_order == ffi::K_CG_BITMAP_BYTE_ORDER_32_LITTLE && matches!(alpha, 2 | 4 | 6) {
+            Some(true)
+        } else if (byte_order == 0 || byte_order == 0x4000) && matches!(alpha, 1 | 3 | 5) {
+            Some(false)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(is_bgra) = direct_is_bgra {
+        // SAFETY: `CGImageGetDataProvider` returns a borrowed provider valid while `image` lives;
+        // `CGDataProviderCopyData` returns an owned +1 CFDataRef.
+        let provider = unsafe { ffi::CGImageGetDataProvider(image.as_mut_ptr()) };
+        if !provider.is_null()
+            && let Some(data) =
+                (unsafe { CfOwned::from_owned(ffi::CGDataProviderCopyData(provider)) })
+        {
+            // SAFETY: Queries byte length and pointer of the owned CFData.
+            let len = unsafe { ffi::CFDataGetLength(data.as_ptr()).max(0) as usize };
+            let ptr = unsafe { ffi::CFDataGetBytePtr(data.as_ptr()) };
+            if !ptr.is_null() && len >= h * bpr {
+                // SAFETY: `ptr` is valid for `len` bytes owned by `data`.
+                let pixels = unsafe { std::slice::from_raw_parts(ptr, len) };
+                if let Some(sig) = visual_signature_from_pixels(pixels, w, h, bpr, is_bgra) {
+                    return Some(sig);
+                }
+            }
+        }
+    }
+
+    // Fallback for uncommon pixel formats (e.g. 16-bit HDR or grayscale).
     let cs = unsafe { CfOwned::from_owned(ffi::CGColorSpaceCreateDeviceRGB().cast_const()) }?;
-    // SAFETY: Creates a tiny owned RGBA8 bitmap context (<= 4 KB) for fast CoreGraphics downscale.
     let ctx = unsafe {
         CfOwned::from_owned(
             ffi::CGBitmapContextCreate(
                 ptr::null_mut(),
-                thumb_w,
-                thumb_h,
+                w,
+                h,
                 8,
-                thumb_w * 4,
+                w * 4,
                 cs.as_mut_ptr(),
                 K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
             )
@@ -769,24 +835,20 @@ fn compute_cg_image_signature(image: &CfOwned) -> Option<[u8; 64]> {
     let rect = CGRect {
         origin: ffi::CGPoint { x: 0.0, y: 0.0 },
         size: ffi::CGSize {
-            width: thumb_w as f64,
-            height: thumb_h as f64,
+            width: w as f64,
+            height: h as f64,
         },
     };
-    // SAFETY: `ctx` and `image` are valid retained CoreGraphics objects.
     unsafe {
         ffi::CGContextDrawImage(ctx.as_mut_ptr(), rect, image.as_mut_ptr());
     }
-    // SAFETY: Queries the readable RGBA buffer pointer owned by `ctx`.
     let data = unsafe { ffi::CGBitmapContextGetData(ctx.as_mut_ptr()) };
-    // SAFETY: Queries the row stride of the valid bitmap context.
-    let bpr = unsafe { ffi::CGBitmapContextGetBytesPerRow(ctx.as_mut_ptr()) };
-    if data.is_null() || bpr < thumb_w * 4 {
+    let ctx_bpr = unsafe { ffi::CGBitmapContextGetBytesPerRow(ctx.as_mut_ptr()) };
+    if data.is_null() || ctx_bpr < w * 4 {
         return None;
     }
-    // SAFETY: `data` points to `thumb_h * bpr` readable RGBA bytes owned by `ctx`.
-    let pixels = unsafe { std::slice::from_raw_parts(data, thumb_h * bpr) };
-    visual_signature_from_pixels(pixels, thumb_w, thumb_h, bpr, false)
+    let pixels = unsafe { std::slice::from_raw_parts(data, h * ctx_bpr) };
+    visual_signature_from_pixels(pixels, w, h, ctx_bpr, false)
 }
 
 /// Draw crisp Set-of-Marks bounding boxes and `@eN` tags directly onto an RGBA bitmap copy,
@@ -975,5 +1037,48 @@ mod tests {
         let sig_dark = compute_cg_image_signature(&dark).unwrap();
         let sig_bright = compute_cg_image_signature(&bright).unwrap();
         assert!(desktop_core::max_visual_delta(&sig_dark, &sig_bright) >= 150);
+
+        // Verify direct-provider CGImage signature matches raw pixel signature with 0 delta even
+        // on sharp 1-pixel high-contrast stripes (preventing SCStream vs one-shot false diffs).
+        let sw = 128usize;
+        let sh = 128usize;
+        let cs = unsafe { CfOwned::from_owned(ffi::CGColorSpaceCreateDeviceRGB().cast_const()) }
+            .unwrap();
+        let ctx = unsafe {
+            CfOwned::from_owned(
+                ffi::CGBitmapContextCreate(
+                    ptr::null_mut(),
+                    sw,
+                    sh,
+                    8,
+                    sw * 4,
+                    cs.as_mut_ptr(),
+                    K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
+                )
+                .cast_const(),
+            )
+        }
+        .unwrap();
+        let data = unsafe { ffi::CGBitmapContextGetData(ctx.as_mut_ptr()) };
+        let bpr = unsafe { ffi::CGBitmapContextGetBytesPerRow(ctx.as_mut_ptr()) };
+        let buf = unsafe { std::slice::from_raw_parts_mut(data, sh * bpr) };
+        for y in 0..sh {
+            for x in 0..sw {
+                let v = if (x + y) % 2 == 0 { 245u8 } else { 15u8 };
+                let off = y * bpr + x * 4;
+                buf[off..off + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let raw_sig = visual_signature_from_pixels(buf, sw, sh, bpr, false).unwrap();
+        let cg_striped = unsafe {
+            CfOwned::from_owned(ffi::CGBitmapContextCreateImage(ctx.as_mut_ptr()).cast_const())
+        }
+        .unwrap();
+        let cg_sig = compute_cg_image_signature(&cg_striped).unwrap();
+        assert_eq!(
+            desktop_core::max_visual_delta(&raw_sig, &cg_sig),
+            0,
+            "CGImage and raw pixel visual signatures must match identically"
+        );
     }
 }
