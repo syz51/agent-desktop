@@ -473,17 +473,6 @@ pub fn tools() -> Vec<Tool> {
         "type": "string",
         "enum": ["auto", "background", "foreground"]
     });
-    let target_point_or_ref = json!({
-        "type": "object",
-        "description": "{ref} or {x,y,display?} (screenshot px)",
-        "properties": {
-            "ref": { "type": "string" },
-            "x": { "type": "number" },
-            "y": { "type": "number" },
-            "display": { "type": "integer" }
-        },
-        "additionalProperties": false
-    });
     let screenshot_target_schema = json!({
         "type": "object",
         "required": ["kind"],
@@ -520,10 +509,11 @@ pub fn tools() -> Vec<Tool> {
         "type": "object",
         "required": ["op"],
         "description": concat!(
-            "click{ref|(x,y,display?),button?,count?,modifiers?,mode?:auto|semantic|pointer}|",
-            "hover{ref|(x,y,display?)}|",
-            "drag{from,to,modifiers?}|",
-            "scroll{ref|(x,y,display?),direction,amount?}|",
+            "T=ref|(x,y,display?)(px); ",
+            "click{T,button?,count?,modifiers?,mode?:auto|semantic|pointer}|",
+            "hover{T}|",
+            "drag{from:T,to:T,modifiers?}|",
+            "scroll{T,direction,amount?}|",
             "set_text{text,ref?,replace?:false,submit?,method?}|",
             "key{combo,repeat?}|",
             "open_app{app}|",
@@ -564,8 +554,8 @@ pub fn tools() -> Vec<Tool> {
                 "type": "string",
                 "enum": ["auto", "semantic", "pointer", "value", "selection", "clipboard"]
             },
-            "from": target_point_or_ref,
-            "to": target_point_or_ref,
+            "from": { "type": "object", "description": "{ref}|{x,y,display?}" },
+            "to": { "type": "object", "description": "{ref}|{x,y,display?}" },
             "direction": { "type": "string", "enum": ["up", "down", "left", "right"] },
             "amount": { "type": "integer" },
             "text": { "type": "string" },
@@ -577,7 +567,10 @@ pub fn tools() -> Vec<Tool> {
             "app": { "type": "string" },
             "window_id": { "type": "integer" },
             "path": { "type": "array", "items": { "type": "string" } },
-            "until": wait_condition_schema,
+            "until": {
+                "type": "object",
+                "description": "exists|gone|focused_app|window_title_contains|visual_change (see wait.condition)"
+            },
             "timeout_ms": { "type": "integer" },
             "ms": { "type": "integer" }
         },
@@ -680,7 +673,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         make_tool(
             "act",
-            "Run 1..25 ordered UI steps atomically with optional post-action capture and release_after.",
+            "Run 1..25 atomic UI steps; optional post-capture (after) and release_after.",
             json!({
                 "type": "object",
                 "required": ["steps"],
@@ -1024,37 +1017,54 @@ mod tests {
             json!(["kind"])
         );
 
+        for endpoint in ["from", "to"] {
+            let target_schema = &step_props[endpoint];
+            assert_eq!(target_schema["type"], "object");
+            let desc = target_schema["description"].as_str().unwrap();
+            assert!(
+                desc.contains("ref") && desc.contains("x,y,display"),
+                "{endpoint} description should document target shape: {desc}"
+            );
+        }
+
         let wait = all_tools.iter().find(|t| t.name == "wait").unwrap();
         let wait_schema = Value::Object((*wait.input_schema).clone());
-        for cond_schema in [
-            &wait_schema["properties"]["condition"],
-            &step_items["properties"]["until"],
+        let cond_schema = &wait_schema["properties"]["condition"];
+        let kinds: Vec<&str> = cond_schema["properties"]["kind"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let until_schema = &step_items["properties"]["until"];
+        assert_eq!(until_schema["type"], "object");
+        let until_desc = until_schema["description"].as_str().unwrap();
+        assert!(
+            until_desc.contains("wait.condition"),
+            "act.steps[].until should reference wait.condition: {until_desc}"
+        );
+        for expected_kind in [
+            "exists",
+            "gone",
+            "focused_app",
+            "window_title_contains",
+            "visual_change",
         ] {
-            let kinds: Vec<&str> = cond_schema["properties"]["kind"]["enum"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap())
-                .collect();
-            for expected_kind in [
-                "exists",
-                "gone",
-                "focused_app",
-                "window_title_contains",
-                "visual_change",
-            ] {
-                assert!(
-                    kinds.contains(&expected_kind),
-                    "missing WaitCondition kind {expected_kind}"
-                );
-            }
-            let cond_props = cond_schema["properties"].as_object().unwrap();
-            for field in ["kind", "query", "role", "ref", "app", "text", "target"] {
-                assert!(
-                    cond_props.contains_key(field),
-                    "missing WaitCondition field {field}"
-                );
-            }
+            assert!(
+                kinds.contains(&expected_kind),
+                "missing WaitCondition kind {expected_kind}"
+            );
+            assert!(
+                until_desc.contains(expected_kind),
+                "act.steps[].until description missing kind {expected_kind}: {until_desc}"
+            );
+        }
+        let cond_props = cond_schema["properties"].as_object().unwrap();
+        for field in ["kind", "query", "role", "ref", "app", "text", "target"] {
+            assert!(
+                cond_props.contains_key(field),
+                "missing WaitCondition field {field}"
+            );
         }
 
         assert!(INSTRUCTIONS.contains("open_app"));
@@ -1064,13 +1074,19 @@ mod tests {
         assert!(INSTRUCTIONS.contains("release_after"));
         assert!(INSTRUCTIONS.len() < 550);
 
+        let act_bytes = serde_json::to_string(act).unwrap().len();
+        assert!(
+            act_bytes <= 2_260,
+            "act tool compact JSON ({act_bytes} B) exceeded 2260 B ceiling (>= 25% below 3015 B baseline)"
+        );
+
         let total_tools_bytes: usize = all_tools
             .iter()
             .map(|t| serde_json::to_string(t).unwrap().len())
             .sum();
         assert!(
-            total_tools_bytes < 7_500,
-            "tools/list compact JSON ({total_tools_bytes} B) exceeded 7500 B ceiling"
+            total_tools_bytes < 6_700,
+            "tools/list compact JSON ({total_tools_bytes} B) exceeded 6700 B ceiling"
         );
 
         // Verify find preserves explicit `value=` on populated input fields matching their title.
