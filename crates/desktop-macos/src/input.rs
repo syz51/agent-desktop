@@ -63,14 +63,35 @@ fn check_stop(stop: &AtomicBool) -> Result<(), RpcError> {
     Ok(())
 }
 
+const PASTE_SETTLE_DELAY: Duration = Duration::from_millis(150);
+const STOP_POLL_SLICE: Duration = Duration::from_millis(20);
+
+fn sleep_abortable(stop: &AtomicBool, dur: Duration) -> Result<(), RpcError> {
+    let deadline = std::time::Instant::now() + dur;
+    loop {
+        check_stop(stop)?;
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        std::thread::sleep(deadline.saturating_duration_since(now).min(STOP_POLL_SLICE));
+    }
+}
+
+fn apply_event_flags(ev: &CfOwned, mods: Modifiers) {
+    let flags = modifier_flags(mods);
+    // SAFETY: `ev` is a valid retained CGEventRef; setting `flags` unconditionally (including `0`)
+    // clears any stale/latched HID modifier flags inherited from the event source.
+    unsafe {
+        ffi::CGEventSetFlags(ev.as_mut_ptr(), flags);
+    }
+}
+
 fn post_event(ev: CfOwned, mods: Modifiers, stop: &AtomicBool) -> Result<(), RpcError> {
     check_stop(stop)?;
-    let flags = modifier_flags(mods);
+    apply_event_flags(&ev, mods);
     // SAFETY: `ev` is a valid retained CGEventRef.
     unsafe {
-        if flags != 0 {
-            ffi::CGEventSetFlags(ev.as_mut_ptr(), flags);
-        }
         ffi::CGEventSetIntegerValueField(
             ev.as_mut_ptr(),
             K_CG_EVENT_SOURCE_USER_DATA,
@@ -145,6 +166,7 @@ impl Drop for FocusRestoreGuard {
                     .cast_const(),
                 )
             } {
+                apply_event_flags(&ev, Modifiers::default());
                 unsafe {
                     ffi::CGEventSetIntegerValueField(
                         ev.as_mut_ptr(),
@@ -740,7 +762,13 @@ fn paste_with_clipboard_restore(stop: &AtomicBool, text: &str) -> Result<(), Rpc
         },
         1,
     );
-    std::thread::sleep(Duration::from_millis(35));
+    // Chromium/Electron browsers read NSPasteboard asynchronously after Cmd+V; wait in short
+    // stop-aware slices so the target consumes the pasted text before we restore the clipboard.
+    let settle_res = if paste_res.is_ok() {
+        sleep_abortable(stop, PASTE_SETTLE_DELAY)
+    } else {
+        Ok(())
+    };
 
     // Only restore if nothing else modified the clipboard in the meantime.
     if pb.changeCount() == after_write_count {
@@ -752,7 +780,7 @@ fn paste_with_clipboard_restore(stop: &AtomicBool, text: &str) -> Result<(), Rpc
             }
         }
     }
-    paste_res
+    paste_res.and(settle_res)
 }
 
 fn type_unicode_chunks(stop: &AtomicBool, text: &str) -> Result<(), RpcError> {
@@ -817,11 +845,8 @@ pub fn press_key_combo(
                 check_stop(stop)?;
                 for down in [true, false] {
                     let ev = make_key(&src, code, down)?;
-                    let flags = modifier_flags(combo.modifiers);
+                    apply_event_flags(&ev, combo.modifiers);
                     unsafe {
-                        if flags != 0 {
-                            ffi::CGEventSetFlags(ev.as_mut_ptr(), flags);
-                        }
                         ffi::CGEventSetIntegerValueField(
                             ev.as_mut_ptr(),
                             K_CG_EVENT_SOURCE_USER_DATA,
@@ -908,5 +933,52 @@ mod tests {
             scroll_err.code,
             ErrorCode::RequiresFocus | ErrorCode::PermissionDenied
         ));
+    }
+
+    #[test]
+    fn apply_event_flags_clears_latched_modifiers_when_unmodified() {
+        let src = event_source().expect("CGEventSourceCreate");
+        let ev = make_key(&src, KeyCode::Return.macos_keycode(), true).expect("make_key");
+
+        // Simulate stale Command + Shift flags on the CGEvent.
+        apply_event_flags(
+            &ev,
+            Modifiers {
+                cmd: true,
+                shift: true,
+                ..Modifiers::default()
+            },
+        );
+        // SAFETY: `ev` is a valid retained CGEventRef.
+        let set_flags = unsafe { ffi::CGEventGetFlags(ev.as_mut_ptr()) };
+        assert_ne!(set_flags & K_CG_EVENT_FLAG_MASK_COMMAND, 0);
+        assert_ne!(set_flags & K_CG_EVENT_FLAG_MASK_SHIFT, 0);
+
+        // Applying default (unmodified) modifiers must explicitly clear modifier bits to 0.
+        apply_event_flags(&ev, Modifiers::default());
+        // SAFETY: `ev` is a valid retained CGEventRef.
+        let cleared_flags = unsafe { ffi::CGEventGetFlags(ev.as_mut_ptr()) };
+        assert_eq!(
+            cleared_flags
+                & (K_CG_EVENT_FLAG_MASK_COMMAND
+                    | K_CG_EVENT_FLAG_MASK_CONTROL
+                    | K_CG_EVENT_FLAG_MASK_ALTERNATE
+                    | K_CG_EVENT_FLAG_MASK_SHIFT
+                    | K_CG_EVENT_FLAG_MASK_SECONDARY_FN),
+            0,
+            "unmodified events must clear stale modifier bits"
+        );
+    }
+
+    #[test]
+    fn sleep_abortable_returns_stopped_immediately_when_stop_latched() {
+        let stop = AtomicBool::new(true);
+        let start = std::time::Instant::now();
+        let err = sleep_abortable(&stop, PASTE_SETTLE_DELAY).unwrap_err();
+        assert_eq!(err.code, ErrorCode::StoppedByUser);
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "abortable paste settle must exit immediately when stop is latched"
+        );
     }
 }

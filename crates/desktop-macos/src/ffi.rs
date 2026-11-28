@@ -238,6 +238,8 @@ unsafe extern "C" {
         wheel3: i32,
     ) -> CGEventRef;
     pub fn CGEventSetFlags(event: CGEventRef, flags: u64);
+    #[cfg(test)]
+    pub fn CGEventGetFlags(event: CGEventRef) -> u64;
     pub fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
     pub fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
     pub fn CGEventPost(tap: u32, event: CGEventRef);

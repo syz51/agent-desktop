@@ -3051,4 +3051,463 @@ mod tests {
                 .is_ok()
         );
     }
+
+    #[test]
+    fn sticky_screenshot_target_persists_across_coordinate_act_batches_and_resets_cleanly() {
+        let (engine, backend, _clock, _tmp) = make_engine();
+
+        // 1. Focus window 101 with after=screenshot -> captures window 101 and latches sticky target.
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::FocusWindow { window_id: 101 }],
+                    after: PostAction::Screenshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Foreground,
+                    release_after: false,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            backend.state.lock().unwrap().capture_calls.last().cloned(),
+            Some((ScreenshotTarget::Window { window_id: 101 }, false))
+        );
+
+        // 2. Follow-up coordinate click/scroll/key/set_text without focus_window stays on window 101.
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![
+                        ActionStep::Click {
+                            target: Target::Point {
+                                x: 100.0,
+                                y: 120.0,
+                                display: None,
+                            },
+                            button: MouseButton::Left,
+                            count: 1,
+                            modifiers: vec![],
+                            mode: ClickMode::Auto,
+                        },
+                        ActionStep::Scroll {
+                            target: Target::Point {
+                                x: 100.0,
+                                y: 120.0,
+                                display: None,
+                            },
+                            direction: ScrollDirection::Down,
+                            amount: 5,
+                        },
+                        ActionStep::Key {
+                            combo: "Return".into(),
+                            repeat: 1,
+                        },
+                        ActionStep::SetText {
+                            ref_id: None,
+                            text: "ok".into(),
+                            replace: false,
+                            submit: false,
+                            method: TextMethod::Auto,
+                        },
+                    ],
+                    after: PostAction::Screenshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Foreground,
+                    release_after: false,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            backend.state.lock().unwrap().capture_calls.last().cloned(),
+            Some((ScreenshotTarget::Window { window_id: 101 }, false))
+        );
+
+        // 3. after=annotated also honors sticky window 101.
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::Sleep { ms: 1 }],
+                    after: PostAction::Annotated,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Foreground,
+                    release_after: false,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            backend.state.lock().unwrap().capture_calls.last().cloned(),
+            Some((ScreenshotTarget::Window { window_id: 101 }, true))
+        );
+
+        // 4. after=snapshot is NOT overridden by sticky screenshot target (targets focused window).
+        backend.state.lock().unwrap().snapshot_calls.clear();
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::Key {
+                        combo: "Tab".into(),
+                        repeat: 1,
+                    }],
+                    after: PostAction::Snapshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Auto,
+                    release_after: false,
+                }),
+            )
+            .unwrap();
+        let last_snap = backend
+            .state
+            .lock()
+            .unwrap()
+            .snapshot_calls
+            .last()
+            .cloned()
+            .expect("post-action snapshot call");
+        assert_eq!(last_snap.app, None);
+        assert_eq!(last_snap.window_id, None);
+
+        // 5. Explicit display screenshot clears stickiness.
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Screenshot(ScreenshotParams {
+                    target: ScreenshotTarget::Display { index: None },
+                    ..ScreenshotParams::default()
+                }),
+            )
+            .unwrap();
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::Sleep { ms: 1 }],
+                    after: PostAction::Screenshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Foreground,
+                    release_after: false,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            backend.state.lock().unwrap().capture_calls.last().cloned(),
+            Some((ScreenshotTarget::Display { index: None }, false))
+        );
+
+        // 6. Explicit window screenshot sets stickiness; explicit display point click clears it.
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Screenshot(ScreenshotParams {
+                    target: ScreenshotTarget::Window { window_id: 101 },
+                    ..ScreenshotParams::default()
+                }),
+            )
+            .unwrap();
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::Click {
+                        target: Target::Point {
+                            x: 100.0,
+                            y: 120.0,
+                            display: Some(0),
+                        },
+                        button: MouseButton::Left,
+                        count: 1,
+                        modifiers: vec![],
+                        mode: ClickMode::Auto,
+                    }],
+                    after: PostAction::Screenshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Foreground,
+                    release_after: false,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            backend.state.lock().unwrap().capture_calls.last().cloned(),
+            Some((ScreenshotTarget::Display { index: None }, false))
+        );
+
+        // 7. Standalone Menu("Quit") clears stickiness; minimized sticky window falls back to display.
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::FocusWindow { window_id: 101 }],
+                    after: PostAction::None,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Foreground,
+                    release_after: false,
+                }),
+            )
+            .unwrap();
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Menu(desktop_proto::MenuParams {
+                    app: "Notes".into(),
+                    path: vec!["Notes".into(), "Quit".into()],
+                }),
+            )
+            .unwrap();
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::Sleep { ms: 1 }],
+                    after: PostAction::Screenshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Foreground,
+                    release_after: false,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            backend.state.lock().unwrap().capture_calls.last().cloned(),
+            Some((ScreenshotTarget::Display { index: None }, false))
+        );
+
+        // Re-latch an extra window (w303), then minimize it -> falls back cleanly to display.
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .extra_windows
+            .push(WindowInfo {
+                id: 303,
+                app: AppInfo {
+                    name: "Browser".into(),
+                    bundle_id: Some("com.example.browser".into()),
+                    pid: Some(777),
+                    path: None,
+                    running: true,
+                },
+                title: "Settings".into(),
+                bounds: Rect {
+                    x: 0.0,
+                    y: 33.0,
+                    width: 1200.0,
+                    height: 800.0,
+                },
+                display_index: Some(0),
+                focused: false,
+                minimized: false,
+                on_screen: true,
+                layer: 0,
+                alpha: 1.0,
+            });
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Screenshot(ScreenshotParams {
+                    target: ScreenshotTarget::Window { window_id: 303 },
+                    ..ScreenshotParams::default()
+                }),
+            )
+            .unwrap();
+        backend.state.lock().unwrap().extra_windows[0].minimized = true;
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::Sleep { ms: 1 }],
+                    after: PostAction::Screenshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Foreground,
+                    release_after: false,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            backend.state.lock().unwrap().capture_calls.last().cloned(),
+            Some((ScreenshotTarget::Display { index: None }, false))
+        );
+        backend.state.lock().unwrap().extra_windows.clear();
+
+        // 8. Lease teardown resets stickiness so a new session does not inherit prior window target.
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Screenshot(ScreenshotParams {
+                    target: ScreenshotTarget::Window { window_id: 101 },
+                    ..ScreenshotParams::default()
+                }),
+            )
+            .unwrap();
+        engine
+            .handle(Some(1), None, Some("agent-1"), RpcMethod::SessionEnd)
+            .unwrap();
+        engine
+            .handle(
+                Some(2),
+                None,
+                Some("agent-2"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::Sleep { ms: 1 }],
+                    after: PostAction::Screenshot,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Foreground,
+                    release_after: false,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            backend.state.lock().unwrap().capture_calls.last().cloned(),
+            Some((ScreenshotTarget::Display { index: None }, false))
+        );
+    }
+
+    #[test]
+    fn session_end_writes_single_audit_record_per_release() {
+        let (engine, backend, _clock, tmp) = make_engine();
+        let audit_path = tmp.path().join("events.jsonl");
+        let count_events = |sid: &str, event: &str| -> usize {
+            std::fs::read_to_string(&audit_path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|v| {
+                    v.get("session_id").and_then(|s| s.as_str()) == Some(sid)
+                        && v.get("event").and_then(|e| e.as_str()) == Some(event)
+                })
+                .count()
+        };
+
+        // 1. Direct SessionStart + SessionEnd -> exactly 1 session_end, 0 stopped_by_user.
+        let sid1 = match engine
+            .handle(
+                Some(1),
+                None,
+                Some("mcp"),
+                RpcMethod::SessionStart(SessionStartParams::default()),
+            )
+            .unwrap()
+        {
+            RpcResult::Session { lease, .. } => lease.session_id,
+            _ => unreachable!(),
+        };
+        engine
+            .handle(Some(1), Some(&sid1), Some("mcp"), RpcMethod::SessionEnd)
+            .unwrap();
+        assert_eq!(count_events(&sid1, "session_end"), 1);
+        assert_eq!(count_events(&sid1, "stopped_by_user"), 0);
+
+        // Unmatched SessionEnd writes 0 additional records.
+        engine
+            .handle(Some(1), Some(&sid1), Some("mcp"), RpcMethod::SessionEnd)
+            .unwrap();
+        assert_eq!(count_events(&sid1, "session_end"), 1);
+
+        // 2. SessionEnd after physical kill-switch -> exactly 1 stopped_by_user, 0 session_end.
+        let sid2 = match engine
+            .handle(
+                Some(2),
+                None,
+                Some("mcp"),
+                RpcMethod::SessionStart(SessionStartParams::default()),
+            )
+            .unwrap()
+        {
+            RpcResult::Session { lease, .. } => lease.session_id,
+            _ => unreachable!(),
+        };
+        backend.stop_flag().store(true, Ordering::Release);
+        engine
+            .handle(Some(2), Some(&sid2), Some("mcp"), RpcMethod::SessionEnd)
+            .unwrap();
+        assert_eq!(count_events(&sid2, "stopped_by_user"), 1);
+        assert_eq!(count_events(&sid2, "session_end"), 0);
+
+        // 3. Act with release_after: true -> exactly 1 session_end.
+        let sid3 = match engine
+            .handle(
+                Some(3),
+                None,
+                Some("mcp"),
+                RpcMethod::SessionStart(SessionStartParams::default()),
+            )
+            .unwrap()
+        {
+            RpcResult::Session { lease, .. } => lease.session_id,
+            _ => unreachable!(),
+        };
+        engine
+            .handle(
+                Some(3),
+                Some(&sid3),
+                Some("mcp"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::Sleep { ms: 1 }],
+                    after: PostAction::None,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Auto,
+                    release_after: true,
+                }),
+            )
+            .unwrap();
+        assert_eq!(count_events(&sid3, "session_end"), 1);
+
+        // 4. Act with trailing ActionStep::SessionEnd -> exactly 1 session_end.
+        let sid4 = match engine
+            .handle(
+                Some(4),
+                None,
+                Some("mcp"),
+                RpcMethod::SessionStart(SessionStartParams::default()),
+            )
+            .unwrap()
+        {
+            RpcResult::Session { lease, .. } => lease.session_id,
+            _ => unreachable!(),
+        };
+        engine
+            .handle(
+                Some(4),
+                Some(&sid4),
+                Some("mcp"),
+                RpcMethod::Act(ActParams {
+                    steps: vec![ActionStep::SessionEnd],
+                    after: PostAction::None,
+                    expect_snapshot: None,
+                    focus_mode: FocusMode::Auto,
+                    release_after: false,
+                }),
+            )
+            .unwrap();
+        assert_eq!(count_events(&sid4, "session_end"), 1);
+    }
 }
