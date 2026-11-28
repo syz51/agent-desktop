@@ -48,6 +48,10 @@ struct ActiveLease {
     /// Access level of this lease (`Observe` for standalone read-only observation; `Control`
     /// once `session_start`, `act`, or `menu` arms the physical kill-switch and Stop overlay).
     access: SessionAccess,
+    /// Sticky window/app target for `act(after: "screenshot" | "annotated")` when a batch has no
+    /// explicit window/app/ref step (e.g. consecutive coordinate click/scroll/key batches after a
+    /// window screenshot or `focus_window`). Scoped to this lease so teardown clears it cleanly.
+    sticky_screenshot_target: Option<ActPostTarget>,
 }
 
 impl ActiveLease {
@@ -90,6 +94,13 @@ enum SessionPhase {
 
 impl SessionPhase {
     fn active_lease(&self) -> Option<&ActiveLease> {
+        match self {
+            Self::Active { lease, .. } => Some(lease),
+            Self::Idle | Self::Cooldown { .. } => None,
+        }
+    }
+
+    fn active_lease_mut(&mut self) -> Option<&mut ActiveLease> {
         match self {
             Self::Active { lease, .. } => Some(lease),
             Self::Idle | Self::Cooldown { .. } => None,
@@ -186,9 +197,9 @@ impl DesktopEngine {
                 st.phase
                     .enter_cooldown(stop_time, lease.info.session_id.clone());
                 self.backend.stop_flag().store(false, Ordering::Release);
-                self.teardown_lease(&lease, "stopped_by_user");
+                self.teardown_lease(&lease, "stopped_by_user", None);
             } else {
-                self.teardown_lease(&lease, "client_disconnect");
+                self.teardown_lease(&lease, "client_disconnect", None);
             }
         }
     }
@@ -213,7 +224,7 @@ impl DesktopEngine {
         if let Some(lease) = st.phase.take_active() {
             let _ = self.backend.take_stop_triggered_at();
             st.phase.enter_cooldown(now, lease.info.session_id.clone());
-            self.teardown_lease(&lease, "stopped_by_user");
+            self.teardown_lease(&lease, "stopped_by_user", None);
             self.backend.stop_flag().store(false, Ordering::Release);
             drop(st);
             self.audit.record(AuditEvent {
@@ -371,9 +382,14 @@ impl DesktopEngine {
                     &policy,
                     SessionAccess::Control,
                 )?;
-                self.ensure_app_allowed_by_query(&params.app, &policy)?;
+                let resolved_app = self.ensure_app_allowed_by_query(&params.app, &policy)?;
                 let detail = self.backend.menu(&params.app, &params.path)?;
                 self.invalidate_frame_caches();
+                self.apply_sticky_screenshot_target(menu_post_target_update(
+                    resolved_app.as_ref(),
+                    &params.app,
+                    &params.path,
+                ));
                 Ok(RpcResult::Menu { detail })
             }
             RpcMethod::Wait(params) => {
@@ -509,7 +525,7 @@ impl DesktopEngine {
                 st.phase
                     .enter_cooldown(stop_time, stopped.info.session_id.clone());
                 self.backend.stop_flag().store(false, Ordering::Release);
-                self.teardown_lease(&stopped, "stopped_by_user");
+                self.teardown_lease(&stopped, "stopped_by_user", None);
                 continue;
             }
 
@@ -544,6 +560,7 @@ impl DesktopEngine {
                     client_id,
                     scoped_apps: params.apps.clone(),
                     access: SessionAccess::Control,
+                    sticky_screenshot_target: None,
                 };
                 // Explicit `session_start` always clears any prior explicit-stop cooldown while
                 // carrying over any superseded stopped session ID for in-flight aborts.
@@ -619,22 +636,10 @@ impl DesktopEngine {
                 st.phase
                     .enter_cooldown(stop_time, lease.info.session_id.clone());
                 self.backend.stop_flag().store(false, Ordering::Release);
-                self.teardown_lease(&lease, "stopped_by_user");
+                self.teardown_lease(&lease, "stopped_by_user", None);
             } else {
-                self.teardown_lease(&lease, "session_end");
+                self.teardown_lease(&lease, "session_end", caller);
             }
-            drop(st);
-            self.audit.record(AuditEvent {
-                time: self.clock.now(),
-                event: if was_stopped {
-                    "stopped_by_user"
-                } else {
-                    "session_end"
-                },
-                caller,
-                session_id: Some(&lease.info.session_id),
-                detail: None,
-            });
             Ok(RpcResult::Released {
                 message: "Session released; lease is free.".into(),
             })
@@ -671,7 +676,7 @@ impl DesktopEngine {
             st.phase
                 .enter_cooldown(stop_time, lease.info.session_id.clone());
             self.backend.stop_flag().store(false, Ordering::Release);
-            self.teardown_lease(&lease, "stopped_by_user");
+            self.teardown_lease(&lease, "stopped_by_user", None);
             // Always notify the stopped session itself; for an unrelated caller, only reject if
             // the explicit-stop cooldown measured from `stop_time` is still active.
             if was_owner || st.phase.is_cooldown_active(now) {
@@ -745,6 +750,7 @@ impl DesktopEngine {
                     client_id,
                     scoped_apps: None,
                     access,
+                    sticky_screenshot_target: None,
                 },
                 superseded_stopped_session_id: superseded,
             };
@@ -825,7 +831,7 @@ impl DesktopEngine {
                         st.phase
                             .enter_cooldown(stop_time, lease.info.session_id.clone());
                         self.backend.stop_flag().store(false, Ordering::Release);
-                        self.teardown_lease(&lease, "stopped_by_user");
+                        self.teardown_lease(&lease, "stopped_by_user", None);
                         return Err(stopped_by_user_error());
                     }
                     Ok(())
@@ -852,7 +858,7 @@ impl DesktopEngine {
             let stop_time = self.backend.take_stop_triggered_at().unwrap_or(now);
             st.phase.enter_cooldown(stop_time, active_sid.to_string());
             self.backend.stop_flag().store(false, Ordering::Release);
-            self.teardown_lease(&lease, "stopped_by_user");
+            self.teardown_lease(&lease, "stopped_by_user", None);
         }
     }
 
@@ -869,24 +875,45 @@ impl DesktopEngine {
                 st.phase
                     .enter_cooldown(stop_time, lease.info.session_id.clone());
                 self.backend.stop_flag().store(false, Ordering::Release);
-                self.teardown_lease(&lease, "stopped_by_user");
+                self.teardown_lease(&lease, "stopped_by_user", None);
             } else {
-                self.teardown_lease(&lease, "lease_expired");
+                self.teardown_lease(&lease, "lease_expired", None);
             }
         }
     }
 
-    fn teardown_lease(&self, lease: &ActiveLease, reason: &str) {
+    fn teardown_lease(&self, lease: &ActiveLease, reason: &str, caller_override: Option<&str>) {
         self.backend.set_control_active(false);
         self.backend.set_overlay(None);
         self.backend.set_display_awake(false);
         self.audit.record(AuditEvent {
             time: self.clock.now(),
             event: reason,
-            caller: Some(&lease.info.owner),
+            caller: caller_override.or(Some(&lease.info.owner)),
             session_id: Some(&lease.info.session_id),
             detail: None,
         });
+    }
+
+    fn apply_sticky_screenshot_target(&self, update: PostTargetUpdate) {
+        if update == PostTargetUpdate::Keep {
+            return;
+        }
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lease) = st.phase.active_lease_mut() {
+            match update {
+                PostTargetUpdate::Keep => {}
+                PostTargetUpdate::Set(target) => lease.sticky_screenshot_target = Some(target),
+                PostTargetUpdate::Clear => lease.sticky_screenshot_target = None,
+            }
+        }
+    }
+
+    fn sticky_screenshot_target(&self) -> Option<ActPostTarget> {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.phase
+            .active_lease()
+            .and_then(|l| l.sticky_screenshot_target.clone())
     }
 
     fn ensure_app_allowed(&self, app: &AppInfo, policy: &PolicyConfig) -> Result<(), RpcError> {
@@ -1092,6 +1119,12 @@ impl DesktopEngine {
             _ => 0,
         };
 
+        let sticky_update = match &params.target {
+            ScreenshotTarget::Window { window_id } => Some(ActPostTarget::Window(*window_id)),
+            ScreenshotTarget::App { app } => Some(ActPostTarget::App(app.clone())),
+            ScreenshotTarget::Display { .. } | ScreenshotTarget::Region { .. } => None,
+        };
+
         {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             st.shots_by_display.insert(
@@ -1104,6 +1137,9 @@ impl DesktopEngine {
             );
             st.last_display = Some(display_idx);
             st.last_shot_hash = Some(hash.clone());
+            if let Some(lease) = st.phase.active_lease_mut() {
+                lease.sticky_screenshot_target = sticky_update;
+            }
         }
 
         let annotated_refs = annotate_boxes.into_iter().map(|b| b.ref_id).collect();
@@ -1167,19 +1203,27 @@ impl DesktopEngine {
         }
     }
 
-    fn capture_post_action(
+    fn resolve_usable_post_target(
         &self,
-        after: PostAction,
-        focus_mode: FocusMode,
-        post_target: Option<&ActPostTarget>,
-        policy: &PolicyConfig,
-    ) -> (Option<Snapshot>, Option<ScreenshotResult>) {
-        if after == PostAction::None {
-            return (None, None);
-        }
-
-        let usable_target = match post_target {
-            Some(ActPostTarget::Window(wid)) => Some(ActPostTarget::Window(*wid)),
+        target: Option<&ActPostTarget>,
+        check_window_visible: bool,
+    ) -> Option<ActPostTarget> {
+        match target {
+            Some(ActPostTarget::Window(wid)) => {
+                if check_window_visible {
+                    // Reject windows known to be minimized/offscreen, while preserving floating
+                    // panels (`layer != 0`) that `windows(None)` may omit on macOS (closed windows
+                    // still fall back cleanly to display capture when `capture_screenshot` fails).
+                    let known_hidden = self.backend.windows(None).ok().is_some_and(|wins| {
+                        wins.iter()
+                            .find(|w| w.id == *wid)
+                            .is_some_and(|w| !w.on_screen || w.minimized)
+                    });
+                    (!known_hidden).then_some(ActPostTarget::Window(*wid))
+                } else {
+                    Some(ActPostTarget::Window(*wid))
+                }
+            }
             Some(ActPostTarget::App(app)) => {
                 // Only target the tracked app when it currently has at least one visible normal
                 // (`layer == 0`) window, avoiding empty/application-only snapshots or menu-bar/backdrop
@@ -1191,11 +1235,24 @@ impl DesktopEngine {
                 has_visible.then(|| ActPostTarget::App(app.clone()))
             }
             None => None,
-        };
+        }
+    }
+
+    fn capture_post_action(
+        &self,
+        after: PostAction,
+        focus_mode: FocusMode,
+        post_target: Option<&ActPostTarget>,
+        policy: &PolicyConfig,
+    ) -> (Option<Snapshot>, Option<ScreenshotResult>) {
+        if after == PostAction::None {
+            return (None, None);
+        }
 
         match after {
             PostAction::None => unreachable!("handled above"),
             PostAction::Snapshot => {
+                let usable_target = self.resolve_usable_post_target(post_target, false);
                 let targeted = match &usable_target {
                     Some(ActPostTarget::Window(wid)) => Some(self.capture_snapshot(
                         &SnapshotParams {
@@ -1232,6 +1289,18 @@ impl DesktopEngine {
             }
             PostAction::Screenshot | PostAction::Annotated => {
                 let annotate = after == PostAction::Annotated;
+                // When the current batch had no explicit window/app/ref step (e.g. coordinate
+                // click/scroll/key), stay locked to this session's sticky window/app target
+                // instead of snapping out to a full-display capture.
+                let (effective_target, from_sticky) = match post_target {
+                    Some(t) => (Some(t.clone()), false),
+                    None => (self.sticky_screenshot_target(), true),
+                };
+                let usable_target =
+                    self.resolve_usable_post_target(effective_target.as_ref(), from_sticky);
+                if from_sticky && effective_target.is_some() && usable_target.is_none() {
+                    self.apply_sticky_screenshot_target(PostTargetUpdate::Clear);
+                }
                 let targeted = match &usable_target {
                     Some(ActPostTarget::Window(wid)) => Some(self.capture_screenshot(
                         &ScreenshotParams {
@@ -1303,6 +1372,7 @@ impl DesktopEngine {
         let mut deferred_session_end = false;
         let mut released = false;
         let mut post_target: Option<ActPostTarget> = None;
+        let mut sticky_update = PostTargetUpdate::Keep;
 
         for (index, step) in params.steps.into_iter().enumerate() {
             if let Err(err) = self.check_session_not_stopped(active_sid) {
@@ -1325,8 +1395,14 @@ impl DesktopEngine {
                     }
                     match exec.post_target {
                         PostTargetUpdate::Keep => {}
-                        PostTargetUpdate::Set(target) => post_target = Some(target),
-                        PostTargetUpdate::Clear => post_target = None,
+                        PostTargetUpdate::Set(target) => {
+                            post_target = Some(target.clone());
+                            sticky_update = PostTargetUpdate::Set(target);
+                        }
+                        PostTargetUpdate::Clear => {
+                            post_target = None;
+                            sticky_update = PostTargetUpdate::Clear;
+                        }
                     }
                     outcomes.push(StepOutcome {
                         index,
@@ -1361,6 +1437,10 @@ impl DesktopEngine {
                     break;
                 }
             }
+        }
+
+        if !released && sticky_update != PostTargetUpdate::Keep {
+            self.apply_sticky_screenshot_target(sticky_update);
         }
 
         let completed = outcomes.iter().filter(|s| s.ok).count();
@@ -1429,7 +1509,7 @@ impl DesktopEngine {
                         Ok(StepRun::mutating(info.detail, info.used_background)
                             .with_optional_target(post_target))
                     }
-                    point_target @ Target::Point { .. } => {
+                    point_target @ Target::Point { display, .. } => {
                         let (p, _) = self.resolve_target_point(&point_target)?;
                         if let Some(app) = self.backend.app_at_point(p)? {
                             self.ensure_app_allowed(&app, policy)?;
@@ -1437,18 +1517,33 @@ impl DesktopEngine {
                         let info = self
                             .backend
                             .click_point(p, button, count, mods, focus_mode)?;
-                        Ok(StepRun::mutating(info.detail, info.used_background))
+                        let mut run = StepRun::mutating(info.detail, info.used_background);
+                        if display.is_some() {
+                            run.post_target = PostTargetUpdate::Clear;
+                        }
+                        Ok(run)
                     }
                 }
             }
             ActionStep::Hover { target } => {
+                let explicit_display = matches!(
+                    target,
+                    Target::Point {
+                        display: Some(_),
+                        ..
+                    }
+                );
                 let (p, post_target) = self.resolve_target_point(&target)?;
                 if let Some(app) = self.backend.app_at_point(p)? {
                     self.ensure_app_allowed(&app, policy)?;
                 }
                 let info = self.backend.hover_point(p, focus_mode)?;
-                Ok(StepRun::mutating(info.detail, info.used_background)
-                    .with_optional_target(post_target))
+                let mut run = StepRun::mutating(info.detail, info.used_background)
+                    .with_optional_target(post_target);
+                if explicit_display {
+                    run.post_target = PostTargetUpdate::Clear;
+                }
+                Ok(run)
             }
             ActionStep::Drag {
                 from,
@@ -1456,6 +1551,19 @@ impl DesktopEngine {
                 modifiers,
             } => {
                 let mods = parse_modifiers(&modifiers, is_macos)?;
+                let explicit_display = matches!(
+                    from,
+                    Target::Point {
+                        display: Some(_),
+                        ..
+                    }
+                ) || matches!(
+                    to,
+                    Target::Point {
+                        display: Some(_),
+                        ..
+                    }
+                );
                 let (p1, from_target) = self.resolve_target_point(&from)?;
                 let (p2, to_target) = self.resolve_target_point(&to)?;
                 if let Some(app) = self.backend.app_at_point(p1)? {
@@ -1465,8 +1573,12 @@ impl DesktopEngine {
                     self.ensure_app_allowed(&app, policy)?;
                 }
                 let info = self.backend.drag(p1, p2, mods, focus_mode)?;
-                Ok(StepRun::mutating(info.detail, info.used_background)
-                    .with_optional_target(to_target.or(from_target)))
+                let mut run = StepRun::mutating(info.detail, info.used_background)
+                    .with_optional_target(to_target.or(from_target));
+                if explicit_display && run.post_target == PostTargetUpdate::Keep {
+                    run.post_target = PostTargetUpdate::Clear;
+                }
+                Ok(run)
             }
             ActionStep::Scroll {
                 target,
@@ -1492,14 +1604,18 @@ impl DesktopEngine {
                     Ok(StepRun::mutating(info.detail, info.used_background)
                         .with_optional_target(post_target))
                 }
-                point_target @ Target::Point { .. } => {
+                point_target @ Target::Point { display, .. } => {
                     let (p, post_target) = self.resolve_target_point(&point_target)?;
                     if let Some(app) = self.backend.app_at_point(p)? {
                         self.ensure_app_allowed(&app, policy)?;
                     }
                     let info = self.backend.scroll(p, direction, amount, focus_mode)?;
-                    Ok(StepRun::mutating(info.detail, info.used_background)
-                        .with_optional_target(post_target))
+                    let mut run = StepRun::mutating(info.detail, info.used_background)
+                        .with_optional_target(post_target);
+                    if display.is_some() {
+                        run.post_target = PostTargetUpdate::Clear;
+                    }
+                    Ok(run)
                 }
             },
             ActionStep::SetText {
@@ -1566,15 +1682,7 @@ impl DesktopEngine {
                 let resolved_app = self.ensure_app_allowed_by_query(&app, policy)?;
                 let detail = self.backend.menu(&app, &path)?;
                 let mut run = StepRun::mutating(detail, true);
-                if is_quit_or_close_menu(&path) {
-                    run.post_target = PostTargetUpdate::Clear;
-                } else {
-                    let target_app = resolved_app
-                        .as_ref()
-                        .map(|info| app_target_key(info, &app))
-                        .unwrap_or_else(|| app.clone());
-                    run.post_target = PostTargetUpdate::Set(ActPostTarget::App(target_app));
-                }
+                run.post_target = menu_post_target_update(resolved_app.as_ref(), &app, &path);
                 Ok(run)
             }
             ActionStep::ReadText {
@@ -1853,6 +1961,21 @@ fn post_target_from_resolved(resolved: &crate::backend::ResolvedRef) -> Option<A
     }
     let key = app_target_key(&resolved.app, "");
     (!key.trim().is_empty()).then_some(ActPostTarget::App(key))
+}
+
+fn menu_post_target_update(
+    resolved_app: Option<&AppInfo>,
+    app_query: &str,
+    path: &[String],
+) -> PostTargetUpdate {
+    if is_quit_or_close_menu(path) {
+        PostTargetUpdate::Clear
+    } else {
+        let target_app = resolved_app
+            .map(|info| app_target_key(info, app_query))
+            .unwrap_or_else(|| app_query.to_string());
+        PostTargetUpdate::Set(ActPostTarget::App(target_app))
+    }
 }
 
 fn is_quit_or_close_menu(path: &[String]) -> bool {

@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
+use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -26,6 +27,10 @@ use crate::windows;
 const DEFAULT_MAX_DEPTH: usize = 24;
 const DEFAULT_MAX_NODES: usize = 250;
 const SNAPSHOT_BUDGET: Duration = Duration::from_millis(250);
+const WEB_AX_READY_MAX_WAIT: Duration = Duration::from_millis(600);
+const WEB_AX_PROBE_MAX_DEPTH: usize = 8;
+const WEB_AX_PROBE_MAX_NODES: usize = 96;
+const MAX_WEB_AX_WAIT_ATTEMPTS: u8 = 2;
 
 /// Thread-safe RAII wrapper over `AXUIElementRef`.
 #[derive(Clone)]
@@ -614,13 +619,22 @@ pub struct LiveRef {
     pub actions: Vec<ElementAction>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualAxState {
+    /// Renderer `AXWebArea` populated for this PID; skip future waits.
+    Ready,
+    /// Number of readiness waits that timed out without seeing a populated `AXWebArea`.
+    /// Capped at `MAX_WEB_AX_WAIT_ATTEMPTS` so non-web dialogs do not stall repeatedly.
+    TimedOut(u8),
+}
+
 /// Live LRU store mapping `@eN` refs from the most recent snapshots to retained `AXUIElement`
 /// handles, so inspecting another app does not immediately invalidate earlier `@eN` refs.
 pub struct AxRefStore {
     seq: AtomicU64,
     refs: Mutex<SnapshotRefLru<LiveRef>>,
-    /// PIDs for which we have already enabled `AXManualAccessibility` (Chromium/Electron).
-    enabled_manual_ax: Mutex<HashSet<i32>>,
+    /// Per-PID Chromium/Electron web-AX readiness state (evicted on process exit).
+    manual_ax_state: Mutex<HashMap<i32, ManualAxState>>,
 }
 
 impl AxRefStore {
@@ -629,23 +643,55 @@ impl AxRefStore {
         Self {
             seq: AtomicU64::new(0),
             refs: Mutex::new(SnapshotRefLru::new()),
-            enabled_manual_ax: Mutex::new(HashSet::new()),
+            manual_ax_state: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Record `pid` as having `AXManualAccessibility` enabled, evicting any previously tracked
-    /// PIDs whose processes have exited. Returns `true` if `pid` was newly inserted.
-    pub fn mark_manual_ax_enabled(&self, pid: i32) -> bool {
-        self.mark_manual_ax_enabled_with(pid, ffi::is_pid_alive)
+    /// Returns `true` if `pid` should poll for Chromium/Electron `AXWebArea` readiness, evicting
+    /// any previously tracked PIDs whose processes have exited.
+    pub fn should_wait_for_web_ax(&self, pid: i32) -> bool {
+        self.should_wait_for_web_ax_with(pid, ffi::is_pid_alive)
     }
 
-    fn mark_manual_ax_enabled_with(&self, pid: i32, is_alive: impl Fn(i32) -> bool) -> bool {
+    fn should_wait_for_web_ax_with(&self, pid: i32, is_alive: impl Fn(i32) -> bool) -> bool {
         let mut guard = self
-            .enabled_manual_ax
+            .manual_ax_state
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        guard.retain(|&p| p == pid || is_alive(p));
-        guard.insert(pid)
+        guard.retain(|&p, _| p == pid || is_alive(p));
+        match guard.get(&pid).copied() {
+            Some(ManualAxState::Ready) => false,
+            Some(ManualAxState::TimedOut(n)) => n < MAX_WEB_AX_WAIT_ATTEMPTS,
+            None => true,
+        }
+    }
+
+    /// Record whether `wait_for_web_ax_ready` observed a populated `AXWebArea` for `pid`.
+    pub fn record_web_ax_wait_outcome(&self, pid: i32, ready: bool) {
+        self.record_web_ax_wait_outcome_with(pid, ready, ffi::is_pid_alive);
+    }
+
+    fn record_web_ax_wait_outcome_with(
+        &self,
+        pid: i32,
+        ready: bool,
+        is_alive: impl Fn(i32) -> bool,
+    ) {
+        let mut guard = self
+            .manual_ax_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.retain(|&p, _| p == pid || is_alive(p));
+        if ready {
+            guard.insert(pid, ManualAxState::Ready);
+        } else {
+            let next = match guard.get(&pid).copied() {
+                Some(ManualAxState::Ready) => return,
+                Some(ManualAxState::TimedOut(n)) => n.saturating_add(1),
+                None => 1,
+            };
+            guard.insert(pid, ManualAxState::TimedOut(next));
+        }
     }
 
     pub fn next_snapshot_id(&self) -> String {
@@ -826,12 +872,19 @@ pub fn take_snapshot(
     let app_el = AxElement::application(pid);
 
     // Enable manual accessibility for Chromium/Electron apps (safe no-op for native AppKit apps).
-    // On the first activation for a PID, poll briefly until Chromium populates its renderer tree
-    // (exiting early as soon as content appears instead of returning an empty chrome shell).
+    // Check per-PID readiness state first so native AppKit apps and already-ready web engines do
+    // not re-scan `<App>.app/Contents/Frameworks` on every snapshot/find/wait call.
     let manual_ok = app_el.set_bool_true("AXManualAccessibility").is_ok();
-    let _ = app_el.set_bool_true("AXEnhancedUserInterface");
-    if manual_ok && store.mark_manual_ax_enabled(pid) {
-        wait_for_electron_ax_ready(&app_el, window_title.as_deref(), Duration::from_millis(260));
+    let enhanced_ok = app_el.set_bool_true("AXEnhancedUserInterface").is_ok();
+    if store.should_wait_for_web_ax(pid) {
+        if manual_ok || (enhanced_ok && is_web_engine_app(&app)) {
+            let ready =
+                wait_for_web_ax_ready(&app_el, window_title.as_deref(), WEB_AX_READY_MAX_WAIT);
+            store.record_web_ax_wait_outcome(pid, ready);
+        } else {
+            // Native non-web AppKit process: mark settled once so future snapshots skip disk checks.
+            store.record_web_ax_wait_outcome(pid, true);
+        }
     }
 
     // Pick the best AX window: match by title if specified, else focused/main/first window.
@@ -882,17 +935,71 @@ fn pick_primary_window(wins: &[WindowInfo], pid: Option<u32>) -> Option<&WindowI
     wins.iter().find(|w| w.layer == 0).or_else(|| wins.first())
 }
 
-fn wait_for_electron_ax_ready(app_el: &AxElement, title: Option<&str>, max_wait: Duration) {
+/// Detect Chromium/Electron/CEF app bundles so `AXEnhancedUserInterface` readiness polling only
+/// runs for web-engine apps (never adding latency to native AppKit apps like Finder/Notes/Terminal).
+fn is_web_engine_app(app: &AppInfo) -> bool {
+    if let Some(path) = app.path.as_deref().filter(|s| !s.is_empty())
+        && has_web_engine_frameworks(Path::new(path))
+    {
+        return true;
+    }
+    app.bundle_id
+        .as_deref()
+        .is_some_and(is_known_chromium_bundle_id)
+}
+
+fn has_web_engine_frameworks(bundle_path: &Path) -> bool {
+    let frameworks_dir = bundle_path.join("Contents/Frameworks");
+    let Ok(entries) = std::fs::read_dir(&frameworks_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str == "Electron Framework.framework"
+            || name_str == "Chromium Embedded Framework.framework"
+            || name_str.ends_with("Helper (Renderer).app")
+        {
+            return true;
+        }
+        if name_str.ends_with(".framework")
+            && entry
+                .path()
+                .join("Versions/Current/Helpers/chrome_crashpad_handler")
+                .exists()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_known_chromium_bundle_id(bundle_id: &str) -> bool {
+    let lower = bundle_id.to_ascii_lowercase();
+    lower.starts_with("com.google.chrome")
+        || lower.starts_with("org.chromium.")
+        || lower.starts_with("net.imput.helium")
+        || lower.starts_with("com.brave.browser")
+        || lower.starts_with("com.microsoft.edgemac")
+        || lower.starts_with("company.thebrowser.browser")
+        || lower.starts_with("com.vivaldi.vivaldi")
+        || lower.starts_with("com.operasoftware.opera")
+        || lower.starts_with("com.electron.")
+}
+
+fn wait_for_web_ax_ready(app_el: &AxElement, title: Option<&str>, max_wait: Duration) -> bool {
     let deadline = Instant::now() + max_wait;
     loop {
         if let Some(win) = pick_ax_window(app_el, title)
-            && window_has_populated_content(&win)
+            && window_has_populated_web_area(&win, deadline)
         {
-            return;
+            return true;
         }
         let now = Instant::now();
         if now >= deadline {
-            return;
+            return false;
         }
         let step = deadline
             .saturating_duration_since(now)
@@ -901,22 +1008,59 @@ fn wait_for_electron_ax_ready(app_el: &AxElement, title: Option<&str>, max_wait:
     }
 }
 
-/// Returns true once a window's AX tree has populated beyond bare window-chrome buttons
-/// (e.g., an `AXWebArea` or populated container subtree inside an Electron/Chromium window).
-fn window_has_populated_content(win: &AxElement) -> bool {
-    let children = win.element_array_attr("AXChildren");
-    if children.len() > 6 {
-        return true;
-    }
-    for child in &children {
-        let role = child.string_attr("AXRole").unwrap_or_default();
-        if role == "AXWebArea" {
-            return true;
+/// Returns `true` once a Chromium/Electron window contains a populated `AXWebArea` subtree.
+///
+/// Uses a bounded BFS restricted to structural containers (excluding `AXTabGroup` and toolbars)
+/// and checks `deadline` mid-walk so large tab strips or slow cold-starting renderers never starve
+/// discovery or overrun `WEB_AX_READY_MAX_WAIT`.
+fn window_has_populated_web_area(win: &AxElement, deadline: Instant) -> bool {
+    window_has_populated_web_area_with(
+        win.clone(),
+        |el| el.string_attr("AXRole").unwrap_or_default(),
+        |el| el.element_array_attr("AXChildren"),
+        || Instant::now() >= deadline,
+    )
+}
+
+fn window_has_populated_web_area_with<N, F, G, D>(
+    root: N,
+    mut role_of: F,
+    mut children_of: G,
+    mut is_past_deadline: D,
+) -> bool
+where
+    F: FnMut(&N) -> String,
+    G: FnMut(&N) -> Vec<N>,
+    D: FnMut() -> bool,
+{
+    let mut queue = VecDeque::new();
+    queue.push_back((root, 0usize));
+    let mut visited = 0usize;
+
+    while let Some((node, depth)) = queue.pop_front() {
+        if visited >= WEB_AX_PROBE_MAX_NODES || is_past_deadline() {
+            break;
         }
-        if matches!(role.as_str(), "AXGroup" | "AXSplitGroup" | "AXScrollArea") {
-            let grand = child.element_array_attr("AXChildren");
-            if !grand.is_empty() {
+        visited += 1;
+
+        let role = role_of(&node);
+        if role == "AXWebArea" {
+            if !children_of(&node).is_empty() {
                 return true;
+            }
+            continue;
+        }
+
+        // Descend only through content containers; skip `AXTabGroup` and `AXToolbar` so dozens of
+        // browser tabs or bookmark buttons cannot exhaust `WEB_AX_PROBE_MAX_NODES`.
+        let descend = depth == 0
+            || matches!(
+                role.as_str(),
+                "AXGroup" | "AXSplitGroup" | "AXScrollArea" | "AXUnknown"
+            );
+        if descend && depth < WEB_AX_PROBE_MAX_DEPTH {
+            for child in children_of(&node) {
+                queue.push_back((child, depth + 1));
             }
         }
     }
@@ -952,7 +1096,9 @@ fn build_snapshot_from_root(
 ) -> Result<Snapshot, RpcError> {
     let max_depth = params.max_depth.unwrap_or(DEFAULT_MAX_DEPTH);
     let max_nodes = params.max_nodes.unwrap_or(DEFAULT_MAX_NODES);
-    let deadline = start + SNAPSHOT_BUDGET;
+    // Start the tree-walk budget after any cold-start web-AX readiness wait so waiting for a
+    // Chromium/Electron renderer never starves the walk itself (`elapsed_ms` still uses `start`).
+    let deadline = Instant::now() + SNAPSHOT_BUDGET;
 
     let root_bounds = root_el.bounds();
     let fallback_root = UiNode {
@@ -1383,28 +1529,42 @@ mod tests {
     }
 
     #[test]
-    fn enabled_manual_ax_evicts_exited_pids() {
+    fn manual_ax_state_retries_once_on_timeout_latches_on_ready_and_evicts_exited_pids() {
+        use std::collections::HashSet;
+
         let store = AxRefStore::new();
 
         // Deterministic check with injectable liveness predicate.
         let alive = HashSet::from([100, 200]);
-        assert!(store.mark_manual_ax_enabled_with(100, |p| alive.contains(&p)));
-        assert!(!store.mark_manual_ax_enabled_with(100, |p| alive.contains(&p)));
-        assert!(store.mark_manual_ax_enabled_with(200, |p| alive.contains(&p)));
+        // PID 100 succeeds on first wait -> latched Ready immediately.
+        assert!(store.should_wait_for_web_ax_with(100, |p| alive.contains(&p)));
+        store.record_web_ax_wait_outcome_with(100, true, |p| alive.contains(&p));
+        assert!(!store.should_wait_for_web_ax_with(100, |p| alive.contains(&p)));
 
-        // Simulate PID 100 exiting before PID 300 is marked enabled.
+        // PID 200 times out once -> allowed one bounded retry, then settles after 2nd timeout.
+        assert!(store.should_wait_for_web_ax_with(200, |p| alive.contains(&p)));
+        store.record_web_ax_wait_outcome_with(200, false, |p| alive.contains(&p));
+        assert!(store.should_wait_for_web_ax_with(200, |p| alive.contains(&p)));
+        store.record_web_ax_wait_outcome_with(200, false, |p| alive.contains(&p));
+        assert!(!store.should_wait_for_web_ax_with(200, |p| alive.contains(&p)));
+
+        // Simulate PID 100 exiting before PID 300 is checked.
         let alive_after_exit = HashSet::from([200, 300]);
-        assert!(store.mark_manual_ax_enabled_with(300, |p| alive_after_exit.contains(&p)));
+        assert!(store.should_wait_for_web_ax_with(300, |p| alive_after_exit.contains(&p)));
+        store.record_web_ax_wait_outcome_with(300, true, |p| alive_after_exit.contains(&p));
         {
-            let tracked = store.enabled_manual_ax.lock().unwrap();
-            assert!(!tracked.contains(&100), "exited PID 100 must be evicted");
-            assert!(tracked.contains(&200));
-            assert!(tracked.contains(&300));
+            let tracked = store.manual_ax_state.lock().unwrap();
+            assert!(
+                !tracked.contains_key(&100),
+                "exited PID 100 must be evicted"
+            );
+            assert!(tracked.contains_key(&200));
+            assert!(tracked.contains_key(&300));
         }
 
-        // If PID 100 is later recycled for a new process, marking it returns `true` again.
+        // If PID 100 is later recycled for a new process, waiting is enabled again.
         let recycled = HashSet::from([100, 200, 300]);
-        assert!(store.mark_manual_ax_enabled_with(100, |p| recycled.contains(&p)));
+        assert!(store.should_wait_for_web_ax_with(100, |p| recycled.contains(&p)));
 
         // Real OS liveness check via `ffi::is_pid_alive` using an exited child process.
         let real_store = AxRefStore::new();
@@ -1421,13 +1581,188 @@ mod tests {
         assert!(!ffi::is_pid_alive(exited_pid));
 
         real_store
-            .enabled_manual_ax
+            .manual_ax_state
             .lock()
             .unwrap()
-            .insert(exited_pid);
-        assert!(real_store.mark_manual_ax_enabled(current_pid));
-        let tracked = real_store.enabled_manual_ax.lock().unwrap();
-        assert!(!tracked.contains(&exited_pid));
-        assert!(tracked.contains(&current_pid));
+            .insert(exited_pid, ManualAxState::Ready);
+        assert!(real_store.should_wait_for_web_ax(current_pid));
+        real_store.record_web_ax_wait_outcome(current_pid, true);
+        let tracked = real_store.manual_ax_state.lock().unwrap();
+        assert!(!tracked.contains_key(&exited_pid));
+        assert_eq!(tracked.get(&current_pid), Some(&ManualAxState::Ready));
+    }
+
+    #[test]
+    fn web_area_probe_ignores_chrome_shell_and_finds_nested_populated_webarea() {
+        #[derive(Clone)]
+        struct FakeNode {
+            role: &'static str,
+            children: Vec<FakeNode>,
+        }
+
+        // Chromium window with 8 chrome children + non-empty toolbar/group, but NO AXWebArea yet.
+        let chrome_only = FakeNode {
+            role: "AXWindow",
+            children: vec![
+                FakeNode {
+                    role: "AXToolbar",
+                    children: vec![FakeNode {
+                        role: "AXButton",
+                        children: vec![],
+                    }],
+                },
+                FakeNode {
+                    role: "AXToolbar",
+                    children: vec![],
+                },
+                FakeNode {
+                    role: "AXGroup",
+                    children: vec![FakeNode {
+                        role: "AXStaticText",
+                        children: vec![],
+                    }],
+                },
+                FakeNode {
+                    role: "AXTabGroup",
+                    children: vec![FakeNode {
+                        role: "AXRadioButton",
+                        children: vec![],
+                    }],
+                },
+                FakeNode {
+                    role: "AXButton",
+                    children: vec![],
+                },
+                FakeNode {
+                    role: "AXButton",
+                    children: vec![],
+                },
+                FakeNode {
+                    role: "AXButton",
+                    children: vec![],
+                },
+                FakeNode {
+                    role: "AXButton",
+                    children: vec![],
+                },
+            ],
+        };
+        assert!(
+            !window_has_populated_web_area_with(
+                chrome_only.clone(),
+                |n| n.role.to_string(),
+                |n| n.children.clone(),
+                || false,
+            ),
+            "chrome-only browser window with >6 children must not short-circuit as ready"
+        );
+
+        // Empty placeholder AXWebArea is also not ready yet.
+        let mut empty_webarea = chrome_only.clone();
+        empty_webarea.children.push(FakeNode {
+            role: "AXGroup",
+            children: vec![FakeNode {
+                role: "AXWebArea",
+                children: vec![],
+            }],
+        });
+        assert!(
+            !window_has_populated_web_area_with(
+                empty_webarea,
+                |n| n.role.to_string(),
+                |n| n.children.clone(),
+                || false,
+            ),
+            "empty placeholder AXWebArea must not short-circuit as ready"
+        );
+
+        // Large tab strip (120 tabs under AXTabGroup) before the content container must not starve
+        // discovery of a populated AXWebArea.
+        let mut many_tabs = chrome_only;
+        many_tabs.children.insert(
+            0,
+            FakeNode {
+                role: "AXTabGroup",
+                children: (0..120)
+                    .map(|_| FakeNode {
+                        role: "AXRadioButton",
+                        children: vec![],
+                    })
+                    .collect(),
+            },
+        );
+        many_tabs.children.push(FakeNode {
+            role: "AXGroup",
+            children: vec![FakeNode {
+                role: "AXScrollArea",
+                children: vec![FakeNode {
+                    role: "AXWebArea",
+                    children: vec![FakeNode {
+                        role: "AXHeading",
+                        children: vec![],
+                    }],
+                }],
+            }],
+        });
+        assert!(window_has_populated_web_area_with(
+            many_tabs.clone(),
+            |n| n.role.to_string(),
+            |n| n.children.clone(),
+            || false,
+        ));
+
+        // Exceeded deadline stops the BFS cleanly.
+        assert!(!window_has_populated_web_area_with(
+            many_tabs,
+            |n| n.role.to_string(),
+            |n| n.children.clone(),
+            || true,
+        ));
+    }
+
+    #[test]
+    fn is_web_engine_app_matches_chromium_and_electron_not_native_apps() {
+        let native_finder = AppInfo {
+            name: "Finder".into(),
+            bundle_id: Some("com.apple.finder".into()),
+            pid: Some(10),
+            path: Some("/System/Library/CoreServices/Finder.app".into()),
+            running: true,
+        };
+        assert!(!is_web_engine_app(&native_finder));
+
+        let native_notes = AppInfo {
+            name: "Notes".into(),
+            bundle_id: Some("com.apple.Notes".into()),
+            pid: Some(11),
+            path: None,
+            running: true,
+        };
+        assert!(!is_web_engine_app(&native_notes));
+
+        let helium_by_bundle = AppInfo {
+            name: "Helium".into(),
+            bundle_id: Some("net.imput.helium".into()),
+            pid: Some(12),
+            path: None,
+            running: true,
+        };
+        assert!(is_web_engine_app(&helium_by_bundle));
+
+        // Synthetic app bundle with Chromium crashpad marker under a branded framework name.
+        let tmp =
+            std::env::temp_dir().join(format!("agent-desktop-web-test-{}", std::process::id()));
+        let crashpad = tmp.join("Contents/Frameworks/Custom Browser Framework.framework/Versions/Current/Helpers/chrome_crashpad_handler");
+        std::fs::create_dir_all(crashpad.parent().unwrap()).unwrap();
+        std::fs::write(&crashpad, b"").unwrap();
+        let custom_chromium = AppInfo {
+            name: "CustomBrowser".into(),
+            bundle_id: Some("com.example.custombrowser".into()),
+            pid: Some(13),
+            path: Some(tmp.to_string_lossy().into_owned()),
+            running: true,
+        };
+        assert!(is_web_engine_app(&custom_chromium));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
