@@ -521,3 +521,22 @@ pub unsafe fn cf_dict_get(dict: CFDictionaryRef, key: &str) -> CFTypeRef {
     // SAFETY: `dict` is valid per caller and `k` is a live CFString.
     unsafe { CFDictionaryGetValue(dict, k.as_ptr()) }
 }
+
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+/// Returns `true` if a process with `pid` currently exists (including processes owned by another
+/// user where `kill(pid, 0)` returns `EPERM`).
+#[must_use]
+pub fn is_pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: POSIX `kill(pid, 0)` checks process existence without delivering any signal.
+    if unsafe { kill(pid, 0) } == 0 {
+        return true;
+    }
+    const EPERM: i32 = 1;
+    std::io::Error::last_os_error().raw_os_error() == Some(EPERM)
+}

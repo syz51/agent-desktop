@@ -45,9 +45,85 @@ struct ActiveLease {
     client_id: Option<u64>,
     /// Optional explicit app scope requested by the caller in `session_start(apps: [...])`.
     scoped_apps: Option<Vec<String>>,
-    /// Whether this lease is armed for physical kill-switch stops (true for `session_start`,
-    /// `act`, and `menu`; false for standalone read-only observation calls).
-    control_armed: bool,
+    /// Access level of this lease (`Observe` for standalone read-only observation; `Control`
+    /// once `session_start`, `act`, or `menu` arms the physical kill-switch and Stop overlay).
+    access: SessionAccess,
+}
+
+impl ActiveLease {
+    fn is_control_armed(&self) -> bool {
+        self.access == SessionAccess::Control
+    }
+
+    fn is_owned_by(&self, client_id: Option<u64>, session_id: Option<&str>) -> bool {
+        session_id.is_some_and(|sid| sid == self.info.session_id)
+            || (client_id.is_some() && self.client_id == client_id)
+    }
+}
+
+/// Typed lifecycle state machine for the engine's single-writer desktop session.
+///
+/// Encoding `Idle`, `Active`, and `Cooldown` as mutually exclusive variants makes invalid
+/// combinations (such as holding a lease alongside an active stop cooldown or carrying
+/// `control_armed` without an active lease) unrepresentable at compile time.
+#[derive(Debug, Clone, Default)]
+enum SessionPhase {
+    /// No active lease and no active explicit-stop cooldown.
+    #[default]
+    Idle,
+    /// A single-writer lease is currently held.
+    Active {
+        lease: ActiveLease,
+        /// If this session immediately superseded a user-stopped session (e.g. via explicit
+        /// `session_start`), remember that stopped session ID so any in-flight batch/wait for it
+        /// still aborts with `StoppedByUser`.
+        superseded_stopped_session_id: Option<String>,
+    },
+    /// No active lease; an explicit user stop occurred and `PolicyMode::Open` refuses to
+    /// silently auto-reacquire until `stopped_at + EXPLICIT_STOP_COOLDOWN_SECS` (or until an
+    /// explicit `session_start` clears the cooldown immediately).
+    Cooldown {
+        stopped_at: DateTime<chrono::Utc>,
+        stopped_session_id: String,
+    },
+}
+
+impl SessionPhase {
+    fn active_lease(&self) -> Option<&ActiveLease> {
+        match self {
+            Self::Active { lease, .. } => Some(lease),
+            Self::Idle | Self::Cooldown { .. } => None,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        matches!(self, Self::Active { .. })
+    }
+
+    fn take_active(&mut self) -> Option<ActiveLease> {
+        match std::mem::take(self) {
+            Self::Active { lease, .. } => Some(lease),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+
+    fn enter_cooldown(&mut self, stopped_at: DateTime<chrono::Utc>, stopped_session_id: String) {
+        *self = Self::Cooldown {
+            stopped_at,
+            stopped_session_id,
+        };
+    }
+
+    fn is_cooldown_active(&self, now: DateTime<chrono::Utc>) -> bool {
+        matches!(
+            self,
+            Self::Cooldown { stopped_at, .. }
+                if now < *stopped_at + chrono::Duration::seconds(EXPLICIT_STOP_COOLDOWN_SECS)
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -59,12 +135,7 @@ struct CachedShot {
 
 #[derive(Default)]
 struct EngineState {
-    lease: Option<ActiveLease>,
-    /// Timestamp of the last explicit user stop (double-Esc, Stop button, or `desktop stop`)
-    /// during an active session, used to prevent racing calls from silently auto-reacquiring.
-    stopped_at: Option<DateTime<chrono::Utc>>,
-    /// Session ID most recently terminated by an explicit user stop.
-    stopped_session_id: Option<String>,
+    phase: SessionPhase,
     last_snapshot: Option<Snapshot>,
     shots_by_display: HashMap<u32, CachedShot>,
     last_display: Option<u32>,
@@ -103,17 +174,17 @@ impl DesktopEngine {
         let now = self.clock.now();
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if st
-            .lease
-            .as_ref()
+            .phase
+            .active_lease()
             .is_some_and(|l| l.client_id == Some(client_id))
         {
-            let lease = st.lease.take().expect("checked above");
+            let lease = st.phase.take_active().expect("checked above");
             let was_stopped =
-                lease.control_armed && self.backend.stop_flag().load(Ordering::Acquire);
+                lease.is_control_armed() && self.backend.stop_flag().load(Ordering::Acquire);
             if was_stopped {
                 let stop_time = self.backend.take_stop_triggered_at().unwrap_or(now);
-                st.stopped_at = Some(stop_time);
-                st.stopped_session_id = Some(lease.info.session_id.clone());
+                st.phase
+                    .enter_cooldown(stop_time, lease.info.session_id.clone());
                 self.backend.stop_flag().store(false, Ordering::Release);
                 self.teardown_lease(&lease, "stopped_by_user");
             } else {
@@ -129,9 +200,9 @@ impl DesktopEngine {
     /// Returns `true` if an expired lease was torn down.
     pub fn reap_expired_lease(&self) -> bool {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let had_lease = st.lease.is_some();
+        let had_lease = st.phase.is_active();
         self.expire_lease_if_needed(&mut st);
-        had_lease && st.lease.is_none()
+        had_lease && !st.phase.is_active()
     }
 
     /// Trigger an immediate external stop (e.g. `desktop stop` CLI or SIGINT).
@@ -139,10 +210,9 @@ impl DesktopEngine {
         let now = self.clock.now();
         self.backend.stop_flag().store(true, Ordering::Release);
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(lease) = st.lease.take() {
+        if let Some(lease) = st.phase.take_active() {
             let _ = self.backend.take_stop_triggered_at();
-            st.stopped_at = Some(now);
-            st.stopped_session_id = Some(lease.info.session_id.clone());
+            st.phase.enter_cooldown(now, lease.info.session_id.clone());
             self.teardown_lease(&lease, "stopped_by_user");
             self.backend.stop_flag().store(false, Ordering::Release);
             drop(st);
@@ -335,8 +405,8 @@ impl DesktopEngine {
         let active_lease = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             self.expire_lease_if_needed(&mut st);
-            st.lease.as_ref().and_then(|l| {
-                if l.control_armed && self.backend.stop_flag().load(Ordering::Acquire) {
+            st.phase.active_lease().and_then(|l| {
+                if l.is_control_armed() && self.backend.stop_flag().load(Ordering::Acquire) {
                     None
                 } else {
                     Some(l.info.clone())
@@ -424,32 +494,43 @@ impl DesktopEngine {
             self.expire_lease_if_needed(&mut st);
 
             // If a previously armed control lease was stopped by double-Esc or the Stop button,
-            // reap it before evaluating lease ownership so an explicit `session_start` can begin
-            // a clean new session immediately while ensuring any in-flight batch for the stopped
-            // session still aborts via `stopped_session_id`.
-            if st.lease.as_ref().is_some_and(|l| l.control_armed)
+            // reap it into `Cooldown` before evaluating lease ownership so an explicit
+            // `session_start` can begin a clean new session immediately while ensuring any
+            // in-flight batch for the stopped session still aborts via
+            // `superseded_stopped_session_id`.
+            if st
+                .phase
+                .active_lease()
+                .is_some_and(ActiveLease::is_control_armed)
                 && self.backend.stop_flag().load(Ordering::Acquire)
             {
-                let stopped = st.lease.take().expect("checked above");
-                let _ = self.backend.take_stop_triggered_at();
-                st.stopped_session_id = Some(stopped.info.session_id.clone());
+                let stopped = st.phase.take_active().expect("checked above");
+                let stop_time = self.backend.take_stop_triggered_at().unwrap_or(now);
+                st.phase
+                    .enter_cooldown(stop_time, stopped.info.session_id.clone());
                 self.backend.stop_flag().store(false, Ordering::Release);
                 self.teardown_lease(&stopped, "stopped_by_user");
                 continue;
             }
 
-            let can_take = match &st.lease {
-                None => true,
-                Some(existing) if client_id.is_some() && existing.client_id == client_id => true,
-                Some(_) => false,
+            let (can_take, reuse_session_id, superseded) = match &st.phase {
+                SessionPhase::Idle => (true, None, None),
+                SessionPhase::Cooldown {
+                    stopped_session_id, ..
+                } => (true, None, Some(stopped_session_id.clone())),
+                SessionPhase::Active {
+                    lease: existing,
+                    superseded_stopped_session_id,
+                } if client_id.is_some() && existing.client_id == client_id => (
+                    true,
+                    Some(existing.info.session_id.clone()),
+                    superseded_stopped_session_id.clone(),
+                ),
+                SessionPhase::Active { .. } => (false, None, None),
             };
 
             if can_take {
-                let session_id = st
-                    .lease
-                    .as_ref()
-                    .map(|l| l.info.session_id.clone())
-                    .unwrap_or_else(|| Uuid::new_v4().to_string());
+                let session_id = reuse_session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
                 let owner = caller.unwrap_or("agent").to_string();
                 let info = LeaseInfo {
                     session_id,
@@ -462,11 +543,14 @@ impl DesktopEngine {
                     info: info.clone(),
                     client_id,
                     scoped_apps: params.apps.clone(),
-                    control_armed: true,
+                    access: SessionAccess::Control,
                 };
-                st.lease = Some(active);
-                // Explicit `session_start` always clears any prior explicit-stop cooldown.
-                st.stopped_at = None;
+                // Explicit `session_start` always clears any prior explicit-stop cooldown while
+                // carrying over any superseded stopped session ID for in-flight aborts.
+                st.phase = SessionPhase::Active {
+                    lease: active,
+                    superseded_stopped_session_id: superseded,
+                };
                 let _ = self.backend.take_stop_triggered_at();
                 self.backend.stop_flag().store(false, Ordering::Release);
                 self.backend.set_display_awake(true);
@@ -484,8 +568,8 @@ impl DesktopEngine {
             }
 
             let holder = st
-                .lease
-                .as_ref()
+                .phase
+                .active_lease()
                 .map(|l| l.info.owner.clone())
                 .unwrap_or_default();
             drop(st);
@@ -523,19 +607,17 @@ impl DesktopEngine {
     ) -> Result<RpcResult, RpcError> {
         let now = self.clock.now();
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let matches = st.lease.as_ref().is_some_and(|l| {
-            session_id.is_some_and(|sid| sid == l.info.session_id)
-                || (client_id.is_some() && l.client_id == client_id)
-                || (session_id.is_none() && client_id.is_none())
+        let matches = st.phase.active_lease().is_some_and(|l| {
+            l.is_owned_by(client_id, session_id) || (session_id.is_none() && client_id.is_none())
         });
         if matches {
-            let lease = st.lease.take().expect("checked above");
+            let lease = st.phase.take_active().expect("checked above");
             let was_stopped =
-                lease.control_armed && self.backend.stop_flag().load(Ordering::Acquire);
+                lease.is_control_armed() && self.backend.stop_flag().load(Ordering::Acquire);
             if was_stopped {
                 let stop_time = self.backend.take_stop_triggered_at().unwrap_or(now);
-                st.stopped_at = Some(stop_time);
-                st.stopped_session_id = Some(lease.info.session_id.clone());
+                st.phase
+                    .enter_cooldown(stop_time, lease.info.session_id.clone());
                 self.backend.stop_flag().store(false, Ordering::Release);
                 self.teardown_lease(&lease, "stopped_by_user");
             } else {
@@ -577,66 +659,73 @@ impl DesktopEngine {
 
         // Only check `stop_flag` against an *existing* armed control lease. Idle Esc presses
         // and standalone read-only observation never trip `[StoppedByUser]`.
-        if st.lease.as_ref().is_some_and(|l| l.control_armed)
+        if st
+            .phase
+            .active_lease()
+            .is_some_and(ActiveLease::is_control_armed)
             && self.backend.stop_flag().load(Ordering::Acquire)
         {
-            let lease = st.lease.take().expect("checked above");
-            let was_owner = session_id.is_some_and(|sid| sid == lease.info.session_id)
-                || (client_id.is_some() && lease.client_id == client_id);
+            let lease = st.phase.take_active().expect("checked above");
+            let was_owner = lease.is_owned_by(client_id, session_id);
             let stop_time = self.backend.take_stop_triggered_at().unwrap_or(now);
-            st.stopped_at = Some(stop_time);
-            st.stopped_session_id = Some(lease.info.session_id.clone());
+            st.phase
+                .enter_cooldown(stop_time, lease.info.session_id.clone());
             self.backend.stop_flag().store(false, Ordering::Release);
             self.teardown_lease(&lease, "stopped_by_user");
             // Always notify the stopped session itself; for an unrelated caller, only reject if
             // the explicit-stop cooldown measured from `stop_time` is still active.
-            if was_owner || now < stop_time + chrono::Duration::seconds(EXPLICIT_STOP_COOLDOWN_SECS)
-            {
+            if was_owner || st.phase.is_cooldown_active(now) {
                 return Err(stopped_by_user_error());
             }
-            st.stopped_at = None;
         }
 
-        if let Some(existing) = &mut st.lease {
-            let owns = session_id.is_some_and(|sid| sid == existing.info.session_id)
-                || (client_id.is_some() && existing.client_id == client_id);
-            if owns {
-                existing.info.expires_at = now + default_lease_ttl();
-                let sid = existing.info.session_id.clone();
-                if !existing.control_armed && access == SessionAccess::Control {
-                    existing.control_armed = true;
-                    let owner = existing.info.owner.clone();
-                    let scope = existing
-                        .scoped_apps
-                        .as_ref()
-                        .map(|a| a.join(", "))
-                        .unwrap_or_else(|| "desktop".into());
-                    let _ = self.backend.take_stop_triggered_at();
-                    self.backend.stop_flag().store(false, Ordering::Release);
-                    self.backend.set_control_active(true);
-                    if policy.overlay {
-                        self.backend
-                            .set_overlay(Some(&format!("{owner} controls: {scope}")));
+        let superseded = match &mut st.phase {
+            SessionPhase::Active {
+                lease: existing, ..
+            } => {
+                if existing.is_owned_by(client_id, session_id) {
+                    existing.info.expires_at = now + default_lease_ttl();
+                    let sid = existing.info.session_id.clone();
+                    if !existing.is_control_armed() && access == SessionAccess::Control {
+                        existing.access = SessionAccess::Control;
+                        let owner = existing.info.owner.clone();
+                        let scope = existing
+                            .scoped_apps
+                            .as_ref()
+                            .map(|a| a.join(", "))
+                            .unwrap_or_else(|| "desktop".into());
+                        let _ = self.backend.take_stop_triggered_at();
+                        self.backend.stop_flag().store(false, Ordering::Release);
+                        self.backend.set_control_active(true);
+                        if policy.overlay {
+                            self.backend
+                                .set_overlay(Some(&format!("{owner} controls: {scope}")));
+                        }
                     }
+                    return Ok(sid);
                 }
-                return Ok(sid);
+                let owner = existing.info.owner.clone();
+                return Err(RpcError::with_next(
+                    ErrorCode::LeaseBusy,
+                    format!("another session ({owner}) currently controls this machine"),
+                    "Call session_start with wait_for_lease_ms or wait for it to release.",
+                ));
             }
-            let owner = existing.info.owner.clone();
-            return Err(RpcError::with_next(
-                ErrorCode::LeaseBusy,
-                format!("another session ({owner}) currently controls this machine"),
-                "Call session_start with wait_for_lease_ms or wait for it to release.",
-            ));
-        }
-
-        // Prevent racing parallel calls from silently auto-reacquiring a new lease immediately
-        // after the user explicitly triggered double-Esc, Stop button, or `desktop stop`.
-        if let Some(stopped_at) = st.stopped_at {
-            if now < stopped_at + chrono::Duration::seconds(EXPLICIT_STOP_COOLDOWN_SECS) {
-                return Err(stopped_by_user_error());
+            // Prevent racing parallel calls from silently auto-reacquiring a new lease immediately
+            // after the user explicitly triggered double-Esc, Stop button, or `desktop stop`.
+            SessionPhase::Cooldown {
+                stopped_at,
+                stopped_session_id,
+            } => {
+                if now < *stopped_at + chrono::Duration::seconds(EXPLICIT_STOP_COOLDOWN_SECS) {
+                    return Err(stopped_by_user_error());
+                }
+                let sid = stopped_session_id.clone();
+                st.phase = SessionPhase::Idle;
+                Some(sid)
             }
-            st.stopped_at = None;
-        }
+            SessionPhase::Idle => None,
+        };
 
         // In default Open mode, auto-acquire a lease on first action/observe call to save a round-trip.
         if policy.mode == PolicyMode::Open {
@@ -650,12 +739,15 @@ impl DesktopEngine {
             };
             let sid = info.session_id.clone();
             let control_armed = access == SessionAccess::Control;
-            st.lease = Some(ActiveLease {
-                info,
-                client_id,
-                scoped_apps: None,
-                control_armed,
-            });
+            st.phase = SessionPhase::Active {
+                lease: ActiveLease {
+                    info,
+                    client_id,
+                    scoped_apps: None,
+                    access,
+                },
+                superseded_stopped_session_id: superseded,
+            };
             // Clear any stale `stop_flag` when auto-starting a brand-new lease (matching `handle_session_start`).
             let _ = self.backend.take_stop_triggered_at();
             self.backend.stop_flag().store(false, Ordering::Release);
@@ -720,46 +812,45 @@ impl DesktopEngine {
     fn check_session_not_stopped(&self, active_sid: &str) -> Result<(), RpcError> {
         let now = self.clock.now();
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let matches_active = st
-            .lease
-            .as_ref()
-            .is_some_and(|l| l.info.session_id == active_sid);
-        let armed = st
-            .lease
-            .as_ref()
-            .is_some_and(|l| l.info.session_id == active_sid && l.control_armed);
-
-        if armed && self.backend.stop_flag().load(Ordering::Acquire) {
-            let lease = st.lease.take().expect("checked above");
-            let stop_time = self.backend.take_stop_triggered_at().unwrap_or(now);
-            st.stopped_at = Some(stop_time);
-            st.stopped_session_id = Some(lease.info.session_id.clone());
-            self.backend.stop_flag().store(false, Ordering::Release);
-            self.teardown_lease(&lease, "stopped_by_user");
-            return Err(stopped_by_user_error());
+        match &st.phase {
+            SessionPhase::Active {
+                lease,
+                superseded_stopped_session_id,
+            } => {
+                if lease.info.session_id == active_sid {
+                    if lease.is_control_armed() && self.backend.stop_flag().load(Ordering::Acquire)
+                    {
+                        let lease = st.phase.take_active().expect("matched Active");
+                        let stop_time = self.backend.take_stop_triggered_at().unwrap_or(now);
+                        st.phase
+                            .enter_cooldown(stop_time, lease.info.session_id.clone());
+                        self.backend.stop_flag().store(false, Ordering::Release);
+                        self.teardown_lease(&lease, "stopped_by_user");
+                        return Err(stopped_by_user_error());
+                    }
+                    Ok(())
+                } else if superseded_stopped_session_id.as_deref() == Some(active_sid) {
+                    Err(stopped_by_user_error())
+                } else {
+                    Ok(())
+                }
+            }
+            SessionPhase::Cooldown { .. } => Err(stopped_by_user_error()),
+            SessionPhase::Idle => Ok(()),
         }
-
-        if !matches_active
-            && (st.stopped_at.is_some() || st.stopped_session_id.as_deref() == Some(active_sid))
-        {
-            return Err(stopped_by_user_error());
-        }
-
-        Ok(())
     }
 
     fn finalize_user_stop(&self, active_sid: &str) {
         let now = self.clock.now();
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if st
-            .lease
-            .as_ref()
+            .phase
+            .active_lease()
             .is_some_and(|l| l.info.session_id == active_sid)
         {
-            let lease = st.lease.take().expect("checked above");
+            let lease = st.phase.take_active().expect("checked above");
             let stop_time = self.backend.take_stop_triggered_at().unwrap_or(now);
-            st.stopped_at = Some(stop_time);
-            st.stopped_session_id = Some(active_sid.to_string());
+            st.phase.enter_cooldown(stop_time, active_sid.to_string());
             self.backend.stop_flag().store(false, Ordering::Release);
             self.teardown_lease(&lease, "stopped_by_user");
         }
@@ -767,13 +858,16 @@ impl DesktopEngine {
 
     fn expire_lease_if_needed(&self, st: &mut EngineState) {
         let now: DateTime<chrono::Utc> = self.clock.now();
-        if st.lease.as_ref().is_some_and(|l| now >= l.info.expires_at)
-            && let Some(lease) = st.lease.take()
+        if st
+            .phase
+            .active_lease()
+            .is_some_and(|l| now >= l.info.expires_at)
+            && let Some(lease) = st.phase.take_active()
         {
-            if lease.control_armed && self.backend.stop_flag().load(Ordering::Acquire) {
+            if lease.is_control_armed() && self.backend.stop_flag().load(Ordering::Acquire) {
                 let stop_time = self.backend.take_stop_triggered_at().unwrap_or(now);
-                st.stopped_at = Some(stop_time);
-                st.stopped_session_id = Some(lease.info.session_id.clone());
+                st.phase
+                    .enter_cooldown(stop_time, lease.info.session_id.clone());
                 self.backend.stop_flag().store(false, Ordering::Release);
                 self.teardown_lease(&lease, "stopped_by_user");
             } else {
@@ -812,7 +906,7 @@ impl DesktopEngine {
         }
         // Also honor optional caller-requested app scope in `session_start(apps: [...])`.
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(scope) = st.lease.as_ref().and_then(|l| l.scoped_apps.as_ref())
+        if let Some(scope) = st.phase.active_lease().and_then(|l| l.scoped_apps.as_ref())
             && !scope.iter().any(|rule| app.matches_policy_rule(rule))
         {
             return Err(RpcError::with_next(
@@ -1838,4 +1932,134 @@ fn short_sha256(bytes: &[u8]) -> String {
         let _ = write!(out, "{b:02x}");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Duration;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::clock::MockClock;
+    use crate::mock::MockBackend;
+
+    #[test]
+    fn session_phase_transitions_through_idle_active_cooldown_and_supersede() {
+        let clock = Arc::new(MockClock::new(chrono::Utc::now()));
+        let backend = Arc::new(MockBackend::with_clock(clock.clone()));
+        let tmp = TempDir::new().unwrap();
+        let engine = DesktopEngine::new(
+            backend.clone(),
+            clock.clone(),
+            PolicyStore::new(tmp.path().join("policy.toml")),
+            AuditLog::new(tmp.path()),
+        );
+
+        // Starts Idle.
+        assert!(matches!(
+            engine.state.lock().unwrap().phase,
+            SessionPhase::Idle
+        ));
+
+        // Read-only observe call transitions Idle -> Active(Observe).
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::Snapshot(SnapshotParams::default()),
+            )
+            .unwrap();
+        let sid1 = match &engine.state.lock().unwrap().phase {
+            SessionPhase::Active {
+                lease,
+                superseded_stopped_session_id,
+            } => {
+                assert_eq!(lease.access, SessionAccess::Observe);
+                assert!(superseded_stopped_session_id.is_none());
+                lease.info.session_id.clone()
+            }
+            other => panic!("expected Active(Observe), got {other:?}"),
+        };
+
+        // Explicit session_start upgrades same client to Active(Control).
+        engine
+            .handle(
+                Some(1),
+                None,
+                Some("agent-1"),
+                RpcMethod::SessionStart(SessionStartParams::default()),
+            )
+            .unwrap();
+        assert!(matches!(
+            &engine.state.lock().unwrap().phase,
+            SessionPhase::Active { lease, .. }
+                if lease.info.session_id == sid1 && lease.access == SessionAccess::Control
+        ));
+
+        // Latch stop_flag and let another client call explicit session_start:
+        // reaps sid1 -> enters Active(Control) for client 2 while retaining superseded sid1.
+        backend.stop_flag().store(true, Ordering::Release);
+        engine
+            .handle(
+                Some(2),
+                None,
+                Some("agent-2"),
+                RpcMethod::SessionStart(SessionStartParams::default()),
+            )
+            .unwrap();
+        let sid2 = match &engine.state.lock().unwrap().phase {
+            SessionPhase::Active {
+                lease,
+                superseded_stopped_session_id,
+            } => {
+                assert_eq!(lease.client_id, Some(2));
+                assert_ne!(lease.info.session_id, sid1);
+                assert_eq!(
+                    superseded_stopped_session_id.as_deref(),
+                    Some(sid1.as_str())
+                );
+                lease.info.session_id.clone()
+            }
+            other => panic!("expected Active(Control) superseding sid1, got {other:?}"),
+        };
+
+        // Any in-flight step from superseded sid1 still aborts with StoppedByUser, while sid2 continues.
+        assert_eq!(
+            engine.check_session_not_stopped(&sid1).unwrap_err().code,
+            ErrorCode::StoppedByUser
+        );
+        assert!(engine.check_session_not_stopped(&sid2).is_ok());
+
+        // Trigger external stop -> transitions Active -> Cooldown.
+        assert!(engine.trigger_stop(Some("user")));
+        assert!(matches!(
+            &engine.state.lock().unwrap().phase,
+            SessionPhase::Cooldown { stopped_session_id, .. } if stopped_session_id == &sid2
+        ));
+        assert_eq!(
+            engine.check_session_not_stopped(&sid2).unwrap_err().code,
+            ErrorCode::StoppedByUser
+        );
+
+        // After cooldown elapses and session ends cleanly, phase returns to Idle.
+        clock.advance(Duration::seconds(EXPLICIT_STOP_COOLDOWN_SECS));
+        engine
+            .handle(
+                Some(3),
+                None,
+                Some("agent-3"),
+                RpcMethod::Snapshot(SnapshotParams::default()),
+            )
+            .unwrap();
+        assert!(matches!(
+            &engine.state.lock().unwrap().phase,
+            SessionPhase::Active { lease, .. } if lease.client_id == Some(3)
+        ));
+        engine.on_client_disconnect(3);
+        assert!(matches!(
+            engine.state.lock().unwrap().phase,
+            SessionPhase::Idle
+        ));
+    }
 }
