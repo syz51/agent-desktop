@@ -64,6 +64,10 @@ struct Conn {
     writer: tokio::net::unix::OwnedWriteHalf,
 }
 
+type FileStamp = (SystemTime, u64);
+type FleetCache = Option<(Option<FileStamp>, FleetConfig)>;
+type TokenCache = HashMap<PathBuf, (FileStamp, String)>;
+
 /// Multi-host RPC client: uses a persistent Unix socket for `"local"` and Tailscale HTTP/JSON-RPC
 /// for named fleet peers in `fleet.toml`.
 pub struct DesktopClient {
@@ -75,9 +79,15 @@ pub struct DesktopClient {
     http: reqwest::Client,
     /// Pooled HTTP clients keyed by `connect_timeout_ms` to preserve TCP keep-alive connections.
     http_pool: Mutex<HashMap<u64, reqwest::Client>>,
-    /// mtime-keyed cache of `fleet.toml` so repeated remote RPCs avoid disk reads and TOML parsing.
-    fleet_cache: Mutex<Option<(Option<SystemTime>, FleetConfig)>>,
-    sessions: Mutex<HashMap<String, String>>,
+    /// `(mtime, byte_len)`-keyed cache of `fleet.toml` so repeated remote RPCs avoid disk reads
+    /// and TOML parsing while noticing manual edits immediately.
+    fleet_cache: Mutex<FleetCache>,
+    /// `(mtime, byte_len)`-keyed cache of bearer token files so remote RPCs avoid reading token
+    /// files on every call while still reloading on rotation.
+    token_cache: Mutex<TokenCache>,
+    /// Tracks active hosts (`Some(session_id)` for explicit sessions, `None` for auto-acquired
+    /// remote sessions that still need `/v1/disconnect` cleanup on exit).
+    sessions: Mutex<HashMap<String, Option<String>>>,
     next_id: AtomicU64,
 }
 
@@ -108,26 +118,75 @@ impl DesktopClient {
             http,
             http_pool: Mutex::new(HashMap::new()),
             fleet_cache: Mutex::new(None),
+            token_cache: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         }
     }
 
     async fn load_fleet_cached(&self) -> Result<FleetConfig, RpcError> {
-        let mtime = std::fs::metadata(&self.fleet_path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        {
+        let stamp = match std::fs::metadata(&self.fleet_path) {
+            Ok(meta) => meta.modified().ok().map(|t| Some((t, meta.len()))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(None),
+            Err(_) => None,
+        };
+        if let Some(current_stamp) = stamp {
             let guard = self.fleet_cache.lock().await;
-            if let Some((cached_mtime, cfg)) = guard.as_ref()
-                && *cached_mtime == mtime
+            if let Some((cached_stamp, cfg)) = guard.as_ref()
+                && *cached_stamp == current_stamp
             {
                 return Ok(cfg.clone());
             }
         }
         let cfg = FleetConfig::load_from(&self.fleet_path)?;
-        *self.fleet_cache.lock().await = Some((mtime, cfg.clone()));
+        if let Some(current_stamp) = stamp {
+            *self.fleet_cache.lock().await = Some((current_stamp, cfg.clone()));
+        }
         Ok(cfg)
+    }
+
+    async fn resolve_token_cached(&self, peer: &PeerHostConfig) -> Result<String, RpcError> {
+        if let Some(inline) = peer
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(inline.to_string());
+        }
+        let home = dirs::home_dir();
+        if let Some(raw_path) = peer
+            .token_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let expanded = desktop_proto::expand_tilde(raw_path, home.as_deref());
+            let stamp = std::fs::metadata(&expanded)
+                .ok()
+                .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+            if let Some(current_stamp) = stamp {
+                let guard = self.token_cache.lock().await;
+                if let Some((cached_stamp, tok)) = guard.get(&expanded)
+                    && *cached_stamp == current_stamp
+                {
+                    return Ok(tok.clone());
+                }
+            }
+            let tok = resolve_token(None, Some(raw_path), home.as_deref())?;
+            if let Some(current_stamp) = stamp {
+                self.token_cache
+                    .lock()
+                    .await
+                    .insert(expanded, (current_stamp, tok.clone()));
+            }
+            return Ok(tok);
+        }
+        resolve_token(
+            peer.token.as_deref(),
+            peer.token_file.as_deref(),
+            home.as_deref(),
+        )
     }
 
     async fn pooled_http(&self, connect_ms: u64) -> reqwest::Client {
@@ -256,11 +315,7 @@ impl DesktopClient {
         let Some(peer) = fleet.hosts.get(alias) else {
             return Ok(());
         };
-        let token = resolve_token(
-            peer.token.as_deref(),
-            peer.token_file.as_deref(),
-            dirs::home_dir().as_deref(),
-        )?;
+        let token = self.resolve_token_cached(peer).await?;
         let url = format!("{}/v1/disconnect", peer.base_url());
         let _ = self
             .http
@@ -274,7 +329,7 @@ impl DesktopClient {
         Ok(())
     }
 
-    /// Release leases on every remote peer this client contacted (called when MCP stdio exits).
+    /// Release leases on every remote peer this client contacted concurrently (called when MCP stdio exits).
     pub async fn disconnect_all_remotes(&self) {
         let remotes: Vec<String> = {
             let guard = self.sessions.lock().await;
@@ -284,9 +339,10 @@ impl DesktopClient {
                 .cloned()
                 .collect()
         };
-        for alias in remotes {
+        join_all(remotes.into_iter().map(|alias| async move {
             let _ = self.disconnect_remote(&alias).await;
-        }
+        }))
+        .await;
     }
 
     async fn call_local(&self, method: RpcMethod) -> Result<RpcResult, RpcError> {
@@ -296,7 +352,12 @@ impl DesktopClient {
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let session_id = self.sessions.lock().await.get("local").cloned();
+        let session_id = self
+            .sessions
+            .lock()
+            .await
+            .get("local")
+            .and_then(Clone::clone);
         let req = RpcRequest {
             id,
             session_id,
@@ -346,11 +407,7 @@ impl DesktopClient {
         method: RpcMethod,
         total_timeout: Option<Duration>,
     ) -> Result<RpcResult, RpcError> {
-        let token = resolve_token(
-            peer.token.as_deref(),
-            peer.token_file.as_deref(),
-            dirs::home_dir().as_deref(),
-        )?;
+        let token = self.resolve_token_cached(peer).await?;
         let connect_ms = peer
             .connect_timeout_ms
             .unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS);
@@ -368,7 +425,7 @@ impl DesktopClient {
                         .lock()
                         .await
                         .entry(alias.to_string())
-                        .or_default();
+                        .or_insert(None);
                     return Ok(RpcResult::Screenshot(Box::new(shot)));
                 }
                 Ok(None) => {
@@ -379,7 +436,7 @@ impl DesktopClient {
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let session_id = self.sessions.lock().await.get(alias).cloned();
+        let session_id = self.sessions.lock().await.get(alias).and_then(Clone::clone);
         let req = RpcRequest {
             id,
             session_id,
@@ -440,7 +497,7 @@ impl DesktopClient {
             .lock()
             .await
             .entry(alias.to_string())
-            .or_default();
+            .or_insert(None);
         self.update_session_cache(alias, &result).await;
         Ok(result)
     }
@@ -454,7 +511,7 @@ impl DesktopClient {
         params: &ScreenshotParams,
         timeout: Duration,
     ) -> Result<Option<ScreenshotResult>, RpcError> {
-        let session_id = self.sessions.lock().await.get(alias).cloned();
+        let session_id = self.sessions.lock().await.get(alias).and_then(Clone::clone);
         let body = serde_json::json!({
             "session_id": session_id,
             "caller": format!("{}@remote", self.caller),
@@ -548,7 +605,7 @@ impl DesktopClient {
                 self.sessions
                     .lock()
                     .await
-                    .insert(alias.to_string(), lease.session_id.clone());
+                    .insert(alias.to_string(), Some(lease.session_id.clone()));
             }
             RpcResult::Released { .. } | RpcResult::Stopped { .. } => {
                 self.sessions.lock().await.remove(alias);
@@ -606,4 +663,88 @@ async fn send_on(conn: &mut Conn, req: &RpcRequest) -> Result<RpcResponse, RpcEr
     }
     serde_json::from_str(&line)
         .map_err(|e| RpcError::new(ErrorCode::Internal, format!("decode response: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn token_cache_reloads_on_file_rotation() {
+        let tmp = TempDir::new().unwrap();
+        let token_path = tmp.path().join("token");
+        std::fs::write(&token_path, "token-v1\n").unwrap();
+
+        let client = DesktopClient::new_with_fleet(
+            tmp.path().join("desktopd.sock"),
+            tmp.path().join("fleet.toml"),
+            "test-agent",
+        );
+        let peer = PeerHostConfig {
+            addr: "127.0.0.1:9999".into(),
+            token: None,
+            token_file: Some(format!(" {} ", token_path.display())),
+            connect_timeout_ms: None,
+        };
+
+        assert_eq!(
+            client.resolve_token_cached(&peer).await.unwrap(),
+            "token-v1"
+        );
+        assert_eq!(
+            client.token_cache.lock().await.len(),
+            1,
+            "trimmed token_file path must populate token_cache"
+        );
+        assert_eq!(
+            client.resolve_token_cached(&peer).await.unwrap(),
+            "token-v1"
+        );
+
+        // Rotating token with a different length invalidates the (mtime, len) cache immediately.
+        std::fs::write(&token_path, "token-v2-rotated\n").unwrap();
+        assert_eq!(
+            client.resolve_token_cached(&peer).await.unwrap(),
+            "token-v2-rotated"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_acquired_session_entry_stays_none_until_explicit_session_result() {
+        let tmp = TempDir::new().unwrap();
+        let client = DesktopClient::new_with_fleet(
+            tmp.path().join("desktopd.sock"),
+            tmp.path().join("fleet.toml"),
+            "test-agent",
+        );
+
+        client
+            .sessions
+            .lock()
+            .await
+            .entry("pro".to_string())
+            .or_insert(None);
+        assert_eq!(
+            client
+                .sessions
+                .lock()
+                .await
+                .get("pro")
+                .and_then(Clone::clone),
+            None,
+            "auto-acquired remote host must send session_id: None, not an empty string"
+        );
+
+        client
+            .update_session_cache(
+                "pro",
+                &RpcResult::Released {
+                    message: "released".into(),
+                },
+            )
+            .await;
+        assert!(!client.sessions.lock().await.contains_key("pro"));
+    }
 }

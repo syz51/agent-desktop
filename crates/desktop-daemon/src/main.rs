@@ -186,9 +186,33 @@ async fn run_with_signals(
         }
     };
 
+    // Periodic lease reaper so abandoned remote HTTP sessions release WarmCaptureStream,
+    // overlay, and PreventUserIdleDisplaySleep promptly on TTL expiry even while idle.
+    let reaper_engine = Arc::clone(&engine);
+    let mut reaper_rx = rx.clone();
+    let reaper_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = reaper_rx.changed() => {
+                    if *reaper_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = tick.tick() => {
+                    let eng = Arc::clone(&reaper_engine);
+                    let _ = tokio::task::spawn_blocking(move || eng.reap_expired_lease()).await;
+                }
+            }
+        }
+    });
+
     let res = serve_uds(socket, engine, rx).await;
+    let _ = tx.send(true);
+    let _ = reaper_task.await;
     if let Some(task) = remote_task {
-        let _ = tx.send(true);
         let _ = task.await;
     }
     #[cfg(target_os = "macos")]
